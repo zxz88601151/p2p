@@ -26,7 +26,7 @@ func TestBlockEncodeDecodeRoundTrip(t *testing.T) {
 	}
 	b := block.NewCandidateBlock([32]byte{0xEE}, pow.MaxTargetBits,
 		[]*transaction.Transaction{cb, tx})
-	pow.Mine(b, 0)
+	pow.Mine(b)
 
 	encoded := b.Encode()
 	if len(encoded) == 0 || len(encoded) != b.Size() {

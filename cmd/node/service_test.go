@@ -103,7 +103,7 @@ func mineOnly(t *testing.T, svc *nodeService) *block.Block {
 	cb := transaction.NewCoinbaseTx(svc.miner.PubKeyHash(), utxo.Subsidy(height), height)
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), svc.chain.CurrentBits(),
 		[]*transaction.Transaction{cb})
-	if found, _ := pow.Mine(candidate, 0); !found {
+	if found, _ := pow.Mine(candidate); !found {
 		t.Fatal("挖矿失败")
 	}
 	if err := svc.chain.AddBlock(candidate); err != nil {

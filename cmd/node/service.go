@@ -54,6 +54,9 @@ type nodeService struct {
 	// mineMu 串行化所有挖矿入口（持续挖矿循环与按需出块），
 	// 保证任一时刻只有一个候选区块在被求解。
 	mineMu sync.Mutex
+
+	// miners 是并行挖矿的 worker 数（<=1 表示单线程，结果确定）。
+	miners int
 }
 
 func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *wallet.Wallet) *nodeService {

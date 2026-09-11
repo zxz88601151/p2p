@@ -14,7 +14,7 @@ func mineValid(t *testing.T, bits uint32) *block.Block {
 	t.Helper()
 	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50, 0)
 	b := block.NewCandidateBlock([32]byte{}, bits, []*transaction.Transaction{cb})
-	found, _ := pow.Mine(b, 0) // 0 = 无限迭代
+	found, _ := pow.Mine(b)
 	if !found {
 		t.Fatalf("Mine returned false with unlimited iterations at bits=%d", bits)
 	}

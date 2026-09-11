@@ -30,7 +30,7 @@ func mineGenesis(t *testing.T, miner *wallet.Wallet) *block.Block {
 	t.Helper()
 	cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), testReward, 0)
 	gb := block.NewCandidateBlock([32]byte{}, pow.MaxTargetBits, []*transaction.Transaction{cb})
-	if found, _ := pow.Mine(gb, 0); !found {
+	if found, _ := pow.Mine(gb); !found {
 		t.Fatal("创世区块挖矿失败")
 	}
 	return gb
@@ -46,7 +46,7 @@ func mineBlock(t *testing.T, bc *blockchain.Blockchain, miner *wallet.Wallet) *b
 	height := bc.Height() + 1
 	cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(height), height)
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), bc.CurrentBits(), []*transaction.Transaction{cb})
-	if found, _ := pow.Mine(candidate, 0); !found {
+	if found, _ := pow.Mine(candidate); !found {
 		t.Fatal("区块挖矿失败")
 	}
 	if err := bc.AddBlock(candidate); err != nil {
@@ -148,7 +148,7 @@ func TestValidateBlockRejectsHeaderTampering(t *testing.T) {
 	wrongBits := block.NewCandidateBlock(tip.Header.Hash(), easierBits, []*transaction.Transaction{
 		transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(1), 1),
 	})
-	if found, _ := pow.Mine(wrongBits, 0); !found {
+	if found, _ := pow.Mine(wrongBits); !found {
 		t.Fatal("低难度挖矿失败")
 	}
 	if err := bc.ValidateBlock(wrongBits); !errors.Is(err, blockchain.ErrUnexpectedBits) {
@@ -158,7 +158,7 @@ func TestValidateBlockRejectsHeaderTampering(t *testing.T) {
 	// ErrTimestampOutOfRange：时间戳早于父块
 	oldTs := newCandidate()
 	oldTs.Header.Timestamp = tip.Header.Timestamp - 1
-	if found, _ := pow.Mine(oldTs, 0); !found {
+	if found, _ := pow.Mine(oldTs); !found {
 		t.Fatal("旧时间戳挖矿失败")
 	}
 	if err := bc.ValidateBlock(oldTs); !errors.Is(err, blockchain.ErrTimestampOutOfRange) {
@@ -167,7 +167,7 @@ func TestValidateBlockRejectsHeaderTampering(t *testing.T) {
 
 	// ErrMerkleMismatch：挖矿后篡改交易列表
 	tampered := newCandidate()
-	if found, _ := pow.Mine(tampered, 0); !found {
+	if found, _ := pow.Mine(tampered); !found {
 		t.Fatal("挖矿失败")
 	}
 	tampered.Transactions[0].Outputs[0].Value = 999 // 头未重算 → Merkle 不匹配
@@ -196,7 +196,7 @@ func TestCoinbaseSpendFlow(t *testing.T) {
 	cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(10), 10)
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), bc.CurrentBits(),
 		[]*transaction.Transaction{cb, spend})
-	if found, _ := pow.Mine(candidate, 0); !found {
+	if found, _ := pow.Mine(candidate); !found {
 		t.Fatal("区块挖矿失败")
 	}
 	if err := bc.AddBlock(candidate); err != nil {
@@ -237,7 +237,7 @@ func TestImmatureCoinbaseSpendRejected(t *testing.T) {
 	cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(3), 3)
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), bc.CurrentBits(),
 		[]*transaction.Transaction{cb, spend})
-	if found, _ := pow.Mine(candidate, 0); !found {
+	if found, _ := pow.Mine(candidate); !found {
 		t.Fatal("区块挖矿失败")
 	}
 	if err := bc.ValidateBlock(candidate); err == nil {
@@ -250,7 +250,7 @@ func TestGenesisBadTransactionRejected(t *testing.T) {
 	// 创世 coinbase 超额 → 链初始化必须失败
 	bad := block.NewCandidateBlock([32]byte{}, pow.MaxTargetBits,
 		[]*transaction.Transaction{transaction.NewCoinbaseTx(miner.PubKeyHash(), testReward+1, 0)})
-	pow.Mine(bad, 0)
+	pow.Mine(bad)
 	if _, err := blockchain.NewBlockchainWithGenesis(bad); err == nil {
 		t.Fatal("超额创世 coinbase 被接受")
 	}

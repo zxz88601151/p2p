@@ -16,7 +16,7 @@ func makeBlock(t *testing.T, prev [32]byte, height int) *block.Block {
 	t.Helper()
 	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50, height)
 	b := block.NewCandidateBlock(prev, pow.MaxTargetBits, []*transaction.Transaction{cb})
-	if found, _ := pow.Mine(b, 0); !found {
+	if found, _ := pow.Mine(b); !found {
 		t.Fatal("挖矿失败")
 	}
 	return b

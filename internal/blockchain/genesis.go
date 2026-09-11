@@ -25,7 +25,7 @@ func NewGenesisBlock() *block.Block {
 	cb := transaction.NewCoinbaseTx(GenesisMinerPubKeyHash, utxo.Subsidy(0), 0)
 	g := block.NewCandidateBlock([32]byte{}, pow.MaxTargetBits, []*transaction.Transaction{cb})
 	g.Header.Timestamp = GenesisTimestamp
-	if found, _ := pow.Mine(g, 0); !found {
+	if found, _ := pow.Mine(g); !found {
 		// MaxTargetBits=20 期望约 2^20 次尝试，理论必然可解；防御性 panic 而非静默返回坏创世
 		panic("创世区块挖矿失败：难度参数可能被改坏")
 	}
