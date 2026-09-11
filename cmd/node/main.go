@@ -11,15 +11,18 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"p2pchain/internal/block"
@@ -60,29 +63,35 @@ type nodeRuntime struct {
 	ctl       *control.Server
 	seeds     []string
 	stopPeer  chan struct{}
+	lock      *storage.DirLock // 数据目录进程独占锁，Close 时释放
 	closeOnce sync.Once
 }
 
 // newNodeRuntime 按配置组装并启动节点（P2P 监听 + 控制接口 + 种子重连）。
 // 返回后节点已可接受连接与查询；不启动挖矿（由调用方决定）。
 func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return nil, fmt.Errorf("创建数据目录失败: %w", err)
+	// 第一步：独占锁定数据目录。失败（含已被占用）直接返回，绝不打开 blocks.dat。
+	lock, err := storage.AcquireDirLock(cfg.DataDir)
+	if err != nil {
+		return nil, err
 	}
 
 	store, err := storage.OpenFileBlockStore(cfg.DataDir)
 	if err != nil {
+		_ = lock.Release()
 		return nil, fmt.Errorf("打开区块存储失败: %w", err)
 	}
 
 	chain, err := blockchain.NewBlockchainFromStore(store)
 	if err != nil {
 		_ = store.Close()
+		_ = lock.Release()
 		return nil, fmt.Errorf("加载区块链失败: %w", err)
 	}
 	tip, err := chain.Tip()
 	if err != nil {
 		_ = store.Close()
+		_ = lock.Release()
 		return nil, fmt.Errorf("读取链尾失败: %w", err)
 	}
 	log.Printf("[node] 本地区块链已就绪: 高度=%d 链尾=%s 数据文件=%s",
@@ -92,6 +101,7 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	nodeWallet, created, err := wallet.LoadOrCreate(walletPath)
 	if err != nil {
 		_ = store.Close()
+		_ = lock.Release()
 		return nil, fmt.Errorf("加载/创建钱包失败: %w", err)
 	}
 	if created {
@@ -109,6 +119,7 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	genesis, err := chain.BlockByHeight(0)
 	if err != nil {
 		_ = store.Close()
+		_ = lock.Release()
 		return nil, fmt.Errorf("读取创世区块失败: %w", err)
 	}
 	p2pNode := p2p.NewNode(cfg.ListenAddr, nodeWallet.Address(), genesis.Header.HashHex(), svc)
@@ -126,6 +137,7 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	if err != nil {
 		p2pNode.Stop()
 		_ = store.Close()
+		_ = lock.Release()
 		return nil, fmt.Errorf("启动控制接口失败: %w", err)
 	}
 	if !isLoopback(actualRPC) {
@@ -135,7 +147,7 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 
 	rt := &nodeRuntime{
 		store: store, chain: chain, pool: pool, svc: svc, p2p: p2pNode, ctl: ctl,
-		seeds: cfg.Seeds, stopPeer: make(chan struct{}),
+		seeds: cfg.Seeds, stopPeer: make(chan struct{}), lock: lock,
 	}
 	rt.connectSeeds() // 首次连接
 	rt.watchSeeds()   // 断线后自动重连
@@ -202,6 +214,9 @@ func (rt *nodeRuntime) Close() {
 		if rt.store != nil {
 			_ = rt.store.Close()
 		}
+		if rt.lock != nil {
+			_ = rt.lock.Release()
+		}
 	})
 }
 
@@ -227,9 +242,26 @@ func runNode(args []string) {
 		Miners:     *miners,
 	})
 	if err != nil {
+		// 数据目录被另一节点占用时给出明确、可执行的用户级错误（与「数据损坏」区分）。
+		if errors.Is(err, storage.ErrDatadirLocked) {
+			log.Fatalf("[node] 数据目录已被另一个节点进程占用，未启动本节点：\n  目录：%s\n  同一数据目录一次只能由一个节点进程使用；请勿删除 blocks.dat，也勿重复启动。",
+				*dataDir)
+		}
 		log.Fatalf("[node] %v", err)
 	}
 	defer rt.Close()
+
+	// 优雅关闭：捕获 SIGINT/SIGTERM 后释放全部资源（含数据目录锁），
+	// 保证被信号终止的节点不会残留 node.lock 导致同目录后续启动被拒。
+	// 注意：这不属于「自动 stale-lock 删除」——此处释放的是本进程自己持有的锁。
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
+		rt.Close()
+		os.Exit(0)
+	}()
 
 	if *mine {
 		runMiner(rt.svc, *maxBlocks)

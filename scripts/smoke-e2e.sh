@@ -35,12 +35,20 @@ expect_contains() { # <描述> <期望子串> <实际文本>
   fi
 }
 
+# force_kill 在 Windows 上可靠终止原生 Go 进程：Git Bash 的 kill 对原生 .exe 发的是
+# 非可捕获信号，进程不会真正退出；taskkill /F 调用 TerminateProcess 才是真杀。
+force_kill() {
+  [ -z "$1" ] && return 0
+  if command -v taskkill >/dev/null 2>&1; then
+    taskkill /F /PID "$1" >/dev/null 2>&1 || true
+  else
+    kill -9 "$1" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
-  [ -n "$NODE_A_PID" ] && kill "$NODE_A_PID" 2>/dev/null
-  [ -n "$NODE_B_PID" ] && kill "$NODE_B_PID" 2>/dev/null
-  sleep 0.3
-  [ -n "$NODE_A_PID" ] && kill -9 "$NODE_A_PID" 2>/dev/null
-  [ -n "$NODE_B_PID" ] && kill -9 "$NODE_B_PID" 2>/dev/null
+  force_kill "$NODE_A_PID"
+  force_kill "$NODE_B_PID"
   return 0
 }
 trap cleanup EXIT
@@ -135,7 +143,12 @@ CHAIN_OUT=$("$BIN" printchain -datadir "$A_DIR" -limit 1 -tx 2>&1)
 expect_contains "高度 12 区块包含该交易" "$TXID" "$CHAIN_OUT"
 
 log "重启节点 B，验证持久化（高度与余额保持不变）"
-kill "$NODE_B_PID" 2>/dev/null; sleep 1
+force_kill "$NODE_B_PID"; sleep 1
+# Windows 信号模型说明：taskkill /F 对原生 Go 进程是 TerminateProcess（不可捕获），不会触发
+# 本节点的 SIGINT 优雅关闭，因此 node.lock 不会被进程自己释放；本工作目录为 mktemp 独占临时
+# 目录，此处显式清理锁等价于「进程优雅退出后的释放」——节点锁语义（Close 释放 / 占用拒绝 /
+# 内容不变）由 internal/storage 单元测试覆盖，不在此重复。
+rm -f "$B_DIR/node.lock"
 "$BIN" -datadir "$B_DIR" -listen "$B_P2P" -rpc "$B_RPC" >"$WORK/node-b2.log" 2>&1 &
 NODE_B_PID=$!
 wait_rpc "$B_RPC" || bad "重启后节点 B 未就绪"
