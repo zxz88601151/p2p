@@ -142,7 +142,10 @@ func TestValidateBlockRejectsHeaderTampering(t *testing.T) {
 	}
 
 	// ErrUnexpectedBits：用更简单的难度挖矿（PoW 合法但难度位不符共识）
-	wrongBits := block.NewCandidateBlock(tip.Header.Hash(), 16, []*transaction.Transaction{
+	// 注意：这里必须相对 MaxTargetBits 取值，不能写死数字——难度常量一旦调整，
+	// 写死的值可能恰好等于共识难度，导致该分支被静默跳过（本用例曾因此失效）。
+	easierBits := uint32(pow.MaxTargetBits - 1)
+	wrongBits := block.NewCandidateBlock(tip.Header.Hash(), easierBits, []*transaction.Transaction{
 		transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(1), 1),
 	})
 	if found, _ := pow.Mine(wrongBits, 0); !found {
@@ -328,4 +331,94 @@ func mustTip(t *testing.T, bc *blockchain.Blockchain) *block.Block {
 		t.Fatalf("获取链尾失败: %v", err)
 	}
 	return tip
+}
+
+// TestBlockByHeight 按高度取块：合法高度返回对应区块，越界返回 ErrUnknownHeight。
+func TestBlockByHeight(t *testing.T) {
+	miner := newTestWallet(t)
+	bc, err := blockchain.NewBlockchainWithGenesis(mineGenesis(t, miner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1 := mineBlock(t, bc, miner)
+	b2 := mineBlock(t, bc, miner)
+
+	for _, c := range []struct {
+		height int
+		want   *block.Block
+	}{
+		{0, mustHeight(t, bc, 0)},
+		{1, b1},
+		{2, b2},
+	} {
+		got, err := bc.BlockByHeight(c.height)
+		if err != nil {
+			t.Fatalf("高度 %d 取块失败: %v", c.height, err)
+		}
+		if got.Header.Hash() != c.want.Header.Hash() {
+			t.Fatalf("高度 %d 取到错误区块", c.height)
+		}
+	}
+
+	for _, bad := range []int{-1, 3, 100} {
+		if _, err := bc.BlockByHeight(bad); !errors.Is(err, blockchain.ErrUnknownHeight) {
+			t.Fatalf("越界高度 %d 未返回 ErrUnknownHeight，实际: %v", bad, err)
+		}
+	}
+}
+
+// TestBlocksFrom 区间取块：含起止边界、数量截断与「已到链尾」标志。
+func TestBlocksFrom(t *testing.T) {
+	miner := newTestWallet(t)
+	bc, err := blockchain.NewBlockchainWithGenesis(mineGenesis(t, miner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mineBlock(t, bc, miner) // 高度 1
+	mineBlock(t, bc, miner) // 高度 2
+	mineBlock(t, bc, miner) // 高度 3
+
+	// 从 1 开始取 2 个 → 高度 1、2；未到链尾
+	got, atTip := bc.BlocksFrom(1, 2)
+	if len(got) != 2 || atTip {
+		t.Fatalf("BlocksFrom(1,2): 数量=%d atTip=%v, want 2/false", len(got), atTip)
+	}
+	if got[0].Header.Hash() != mustHeight(t, bc, 1).Header.Hash() || got[1].Header.Hash() != mustHeight(t, bc, 2).Header.Hash() {
+		t.Fatal("BlocksFrom 返回的区块顺序或内容错误")
+	}
+
+	// 从 2 开始取 10 个 → 只剩高度 2、3；已到链尾
+	got, atTip = bc.BlocksFrom(2, 10)
+	if len(got) != 2 || !atTip {
+		t.Fatalf("BlocksFrom(2,10): 数量=%d atTip=%v, want 2/true", len(got), atTip)
+	}
+
+	// 从链尾取 → 1 个且 atTip
+	got, atTip = bc.BlocksFrom(3, 10)
+	if len(got) != 1 || !atTip {
+		t.Fatalf("BlocksFrom(3,10): 数量=%d atTip=%v, want 1/true", len(got), atTip)
+	}
+
+	// 超出链尾 → 空且 atTip（视为已同步完成，不再请求）
+	got, atTip = bc.BlocksFrom(10, 10)
+	if len(got) != 0 || !atTip {
+		t.Fatalf("BlocksFrom(10,10): 数量=%d atTip=%v, want 0/true", len(got), atTip)
+	}
+
+	// count<=0 → 空切片，不 panic
+	if got, _ := bc.BlocksFrom(1, 0); len(got) != 0 {
+		t.Fatalf("BlocksFrom(1,0) 应返回空切片，实际 %d 个", len(got))
+	}
+	if got, _ := bc.BlocksFrom(1, -5); len(got) != 0 {
+		t.Fatalf("BlocksFrom(1,-5) 应返回空切片，实际 %d 个", len(got))
+	}
+}
+
+func mustHeight(t *testing.T, bc *blockchain.Blockchain, height int) *block.Block {
+	t.Helper()
+	b, err := bc.BlockByHeight(height)
+	if err != nil {
+		t.Fatalf("高度 %d 取块失败: %v", height, err)
+	}
+	return b
 }

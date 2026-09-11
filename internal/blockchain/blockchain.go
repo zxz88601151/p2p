@@ -25,6 +25,7 @@ var (
 	ErrInvalidPrevHash   = errors.New("区块的前置哈希与当前链尾不匹配")
 	ErrInvalidPoW        = errors.New("区块哈希未达到难度目标，工作量证明无效")
 	ErrEmptyChain        = errors.New("链为空")
+	ErrUnknownHeight     = errors.New("请求的区块高度不存在")
 	ErrUnexpectedBits    = errors.New("区块难度位与当前共识难度不一致")
 	ErrTimestampOutOfRange = errors.New("区块时间戳超出允许范围")
 	ErrMerkleMismatch    = errors.New("区块头 Merkle 根与交易列表不匹配")
@@ -131,6 +132,33 @@ func (bc *Blockchain) UTXOSnapshot() *utxo.UTXOSet {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	return bc.utxo.Clone()
+}
+
+// BlockByHeight 按高度取出区块（创世区块高度为 0）。
+func (bc *Blockchain) BlockByHeight(height int) (*block.Block, error) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if height < 0 || height >= len(bc.blocks) {
+		return nil, fmt.Errorf("%w: %d（当前高度 %d）", ErrUnknownHeight, height, len(bc.blocks)-1)
+	}
+	return bc.blocks[height], nil
+}
+
+// BlocksFrom 从 from 高度（含）开始返回最多 count 个区块，并告知是否已到链尾。
+// 供 P2P 同步响应使用；count <= 0 时返回空切片。
+func (bc *Blockchain) BlocksFrom(from, count int) (blocks []*block.Block, atTip bool) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if count <= 0 || from < 0 || from >= len(bc.blocks) {
+		return nil, from >= len(bc.blocks)
+	}
+	end := from + count
+	if end > len(bc.blocks) {
+		end = len(bc.blocks)
+	}
+	out := make([]*block.Block, 0, end-from)
+	out = append(out, bc.blocks[from:end]...)
+	return out, end == len(bc.blocks)
 }
 
 // CurrentBits 返回下一个待挖区块应当使用的难度目标。

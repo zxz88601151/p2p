@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 )
 
 // TxInput 交易输入：引用上一笔交易的某个输出作为本次花费的来源。
@@ -105,4 +106,10 @@ func (tx *Transaction) serializeForHash() []byte {
 // Hash 计算交易 ID（TxID）。
 func (tx *Transaction) Hash() [32]byte {
 	return sha256.Sum256(tx.serializeForHash())
+}
+
+// HashHex 返回十六进制字符串形式的 TxID，便于日志打印与调试。
+func (tx *Transaction) HashHex() string {
+	h := tx.Hash()
+	return hex.EncodeToString(h[:])
 }

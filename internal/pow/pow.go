@@ -6,6 +6,7 @@
 package pow
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"math/big"
@@ -16,7 +17,12 @@ import (
 const (
 	// MaxTargetBits 表示最低难度对应的目标值的前导零位数（可按需调整）。
 	// 数值越小，初始难度越低，适合个人 CPU 挖矿测试网。
-	MaxTargetBits = 20
+	//
+	// 取 16 是测试网调优：期望需枚举 2^16 ≈ 6.5 万次哈希才能出一个区块，
+	// 实测 CPU 约 1.1 M hash/s → 单块 ~60ms，PoW 仍然真实（不是「必中」），
+	// 同时让全量回归测试保持秒级。这是本链的共识参数，改动会改变创世区块哈希，
+	// 因此一旦有节点长期运行就不可随意调整。
+	MaxTargetBits = 16
 
 	// TargetBlockTimeSeconds 期望的平均出块间隔（秒）。
 	// 比特币是 600 秒（10分钟），测试阶段可以设置更短，比如 30-60 秒，便于调试。
@@ -54,11 +60,15 @@ func Validate(h *block.Header) bool {
 // 传 0 表示不限制迭代次数。
 // 返回是否找到解，以及尝试的次数（可用于统计算力）。
 //
-// 性能实现：头序列化长度固定，Nonce 位于末尾 8 字节——预计算前缀后每次迭代
-// 只改写 Nonce 字段并做两次 SHA-256，避免每轮完整的 binary.Write 序列化。
-// 结果与朴素实现完全一致（相同序列化、相同哈希、相同首个满足条件的 Nonce）。
+// 性能实现（两步优化，结果与朴素实现完全一致）：
+//  1. 头序列化长度固定、Nonce 位于末尾 8 字节——预计算前缀后每次迭代只改写 Nonce；
+//  2. 目标值与哈希都用 32 字节大端定长表示，循环内直接做字节序比较，
+//     避免每轮迭代都构造 big.Int（原实现的主要分配热点）。
+//
+// 关键热路径上不做任何堆分配，仅两次 sha256.Sum256（栈上数组）。
 func Mine(b *block.Block, maxIterations uint64) (found bool, attempts uint64) {
 	target := BitsToTarget(b.Header.Bits)
+	targetBytes := targetToBytes(target)
 
 	buf := b.Header.SerializeHeader()
 	nonceOff := len(buf) - 8 // Header.Nonce 为最后一个字段，uint64 小端
@@ -69,13 +79,31 @@ func Mine(b *block.Block, maxIterations uint64) (found bool, attempts uint64) {
 		first := sha256.Sum256(buf)
 		hash := sha256.Sum256(first[:])
 
-		if new(big.Int).SetBytes(hash[:]).Cmp(target) == -1 {
+		// 同为 32 字节定长时，bytes.Compare 的字典序等价于大整数的数值比较
+		if bytes.Compare(hash[:], targetBytes[:]) < 0 {
 			b.Header.Nonce = nonce
 			return true, nonce + 1
 		}
 		nonce++
 	}
 	return false, nonce
+}
+
+// targetToBytes 把难度目标换算为 32 字节大端定长表示，供循环内做无分配比较。
+// bits 过小（目标 ≥ 2^256）时用全 0xff 填充，等价于「任何哈希都满足」，避免 FillBytes panic。
+func targetToBytes(target *big.Int) [32]byte {
+	var out [32]byte
+	if target.Sign() <= 0 {
+		return out // 目标为 0：任何哈希都不满足
+	}
+	if target.BitLen() > 256 {
+		for i := range out {
+			out[i] = 0xff
+		}
+		return out
+	}
+	target.FillBytes(out[:])
+	return out
 }
 
 // AdjustBits 根据最近一个难度调整周期实际耗费的时间，计算下一周期的难度（Bits）。

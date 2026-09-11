@@ -9,7 +9,6 @@ package block
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 
@@ -24,9 +23,10 @@ const (
 	maxScriptLen  = 10_000
 )
 
+// 错误复用 transaction 包的截断/超限语义，便于上层统一处理
 var (
-	ErrDecodeTruncated = errors.New("区块数据被截断")
-	ErrDecodeTooLarge  = errors.New("区块数据超出解码上限")
+	ErrDecodeTruncated = transaction.ErrTxDecodeTruncated
+	ErrDecodeTooLarge  = transaction.ErrTxDecodeTooLarge
 )
 
 // Encode 将区块编码为规范字节流。
@@ -34,7 +34,7 @@ func (b *Block) Encode() []byte {
 	buf := new(bytes.Buffer)
 	buf.Write(b.Header.SerializeHeader())
 
-	writeU32(buf, uint32(len(b.Transactions)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(b.Transactions)))
 	for _, tx := range b.Transactions {
 		encodeTx(buf, tx)
 	}
@@ -99,90 +99,20 @@ func decodeHeader(r io.Reader, h *Header) error {
 	return nil
 }
 
-// ---- 交易 ----
+// ---- 交易 ----（编解码实现位于 transaction 包，区块与网络共用同一格式）
 
 func encodeTx(buf *bytes.Buffer, tx *transaction.Transaction) {
-	writeU32(buf, uint32(len(tx.Inputs)))
-	for _, in := range tx.Inputs {
-		buf.Write(in.PrevTxHash[:])
-		writeU32(buf, in.OutIndex)
-		writeBytes(buf, in.Signature)
-		writeBytes(buf, in.PubKey)
-	}
-	writeU32(buf, uint32(len(tx.Outputs)))
-	for _, out := range tx.Outputs {
-		writeU64(buf, out.Value)
-		buf.Write(out.PubKeyHash[:])
-	}
+	buf.Write(tx.Encode())
 }
 
 func decodeTx(r *bytes.Reader) (*transaction.Transaction, error) {
-	tx := &transaction.Transaction{}
-
-	nIn, err := readU32(r)
-	if err != nil {
-		return nil, err
-	}
-	if nIn > maxInPerTx {
-		return nil, fmt.Errorf("%w: 输入数 %d", ErrDecodeTooLarge, nIn)
-	}
-	if nIn > 0 {
-		tx.Inputs = make([]transaction.TxInput, 0, nIn)
-	}
-	for i := uint32(0); i < nIn; i++ {
-		var in transaction.TxInput
-		if _, err := io.ReadFull(r, in.PrevTxHash[:]); err != nil {
-			return nil, ErrDecodeTruncated
-		}
-		if in.OutIndex, err = readU32(r); err != nil {
-			return nil, err
-		}
-		if in.Signature, err = readBytes(r, maxScriptLen); err != nil {
-			return nil, err
-		}
-		if in.PubKey, err = readBytes(r, maxScriptLen); err != nil {
-			return nil, err
-		}
-		tx.Inputs = append(tx.Inputs, in)
-	}
-
-	nOut, err := readU32(r)
-	if err != nil {
-		return nil, err
-	}
-	if nOut > maxOutPerTx {
-		return nil, fmt.Errorf("%w: 输出数 %d", ErrDecodeTooLarge, nOut)
-	}
-	if nOut > 0 {
-		tx.Outputs = make([]transaction.TxOutput, 0, nOut)
-	}
-	for i := uint32(0); i < nOut; i++ {
-		var out transaction.TxOutput
-		if out.Value, err = readU64(r); err != nil {
-			return nil, err
-		}
-		if _, err := io.ReadFull(r, out.PubKeyHash[:]); err != nil {
-			return nil, ErrDecodeTruncated
-		}
-		tx.Outputs = append(tx.Outputs, out)
-	}
-	return tx, nil
+	return transaction.DecodeTxFrom(r)
 }
 
 // ---- 基础读写 ----
 
-func writeU32(buf *bytes.Buffer, v uint32) {
-	_ = binary.Write(buf, binary.LittleEndian, v)
-}
 
-func writeU64(buf *bytes.Buffer, v uint64) {
-	_ = binary.Write(buf, binary.LittleEndian, v)
-}
 
-func writeBytes(buf *bytes.Buffer, b []byte) {
-	writeU32(buf, uint32(len(b)))
-	buf.Write(b)
-}
 
 func readU32(r *bytes.Reader) (uint32, error) {
 	var v uint32
@@ -192,31 +122,4 @@ func readU32(r *bytes.Reader) (uint32, error) {
 	return v, nil
 }
 
-func readU64(r *bytes.Reader) (uint64, error) {
-	var v uint64
-	if err := binary.Read(r, binary.LittleEndian, &v); err != nil {
-		return 0, ErrDecodeTruncated
-	}
-	return v, nil
-}
 
-func readBytes(r *bytes.Reader, limit uint32) ([]byte, error) {
-	n, err := readU32(r)
-	if err != nil {
-		return nil, err
-	}
-	if n > limit {
-		return nil, fmt.Errorf("%w: 字段长度 %d > %d", ErrDecodeTooLarge, n, limit)
-	}
-	if n == 0 {
-		return nil, nil
-	}
-	if uint32(r.Len()) < n {
-		return nil, ErrDecodeTruncated
-	}
-	b := make([]byte, n)
-	if _, err := io.ReadFull(r, b); err != nil {
-		return nil, ErrDecodeTruncated
-	}
-	return b, nil
-}
