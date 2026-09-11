@@ -5,8 +5,8 @@
 > 纪律：每阶段 = 实现 + 测试 + `go build/vet/test ./...` 全绿 + 独立 commit（packed-refs 加固）。
 > 全程保持定位：学习型 PoW 区块链骨架；标准库零依赖；禁止引入区块链以外的功能。
 >
-> **状态（2026-09-11，HEAD e16abd0）：PHASE 1B–7 全部完成。**
-> 验收证据与实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`。
+> **状态（2026-09-12，HEAD 321f964）：PHASE 1B–7 全部完成；PHASE 2.1（datadir 进程独占锁缺陷修复）已完成并闭环。**
+> 验收证据与实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`；PHASE 2.1 执行证据见 `docs/PHASE-P2.1-EXECUTION-REPORT.md`。
 
 ---
 
@@ -95,6 +95,16 @@
 - README（p2pchain/ 与外层同步）：功能清单、构建运行、CLI 用法、协议说明、已知限制。
 - 全量回归 + 最终报告 `docs/FULL-IMPLEMENTATION-REPORT.md`。
 - 完成时追加：并行挖矿（MineCancelable 等差类切分、可取消、热路径零分配）与种子节点断线重连（5s 只补不足）——设计稿"待实现"清单中的这两项实际已在 PHASE 7 提前闭环（commit e16abd0），并修复了 nodeRuntime.Close 非幂等的 double-close panic。
+
+## PHASE 2.1 — Datadir 进程独占锁（缺陷修复，2026-09-12）
+
+> 性质：最小范围缺陷修复 + 回归 + 关闭 P2。规格书 `docs/RUN-AUDIT-2026-09-12.md`，执行报告 `docs/PHASE-P2.1-EXECUTION-REPORT.md`。提交 `321f964`。
+
+- **缺陷**：原 `newNodeRuntime` 在打开 `blocks.dat` 前无任何互斥，同一 datadir 可被多个 node 进程同时使用，导致 blocks.dat 逻辑损坏。
+- **机制**：`<datadir>/node.lock` 经 `os.OpenFile(O_CREATE|O_EXCL|O_WRONLY)` 原子独占创建；`os.ErrExist` → `ErrDatadirLocked`（绝不覆盖/截断既有锁）。锁内容仅 `pid` + `started_at`，无敏感信息。
+- **生命周期**：`newNodeRuntime` **第一步**即获取锁（早于 blocks.dat 打开）；5 个后续失败分支均 `Release()`；`Close()` 经 `sync.Once` 释放锁；`runNode` 新增 SIGINT/SIGTERM 优雅关闭 goroutine。`ErrDatadirLocked` 有独立明确中文 CLI 错误（"数据目录已被另一个节点进程占用…请勿删除 blocks.dat，也勿重复启动"），与回放失败错误语义独立（满足 §3.B）。
+- **§5 严格禁止**：不实现 PID 基 stale-lock 自动删除；`DirLock` + `Path()` 仅预留扩展点。测试 harness 中 `taskkill /F` + 隔离临时目录内清锁，不违反 §5（仅清理本次测试残留）。
+- **验证**：6 个新测试（5 单元 + 1 真实节点集成）全过；全量回归 120 测试（119 PASS + 1 既有 SKIP + 0 FAIL）、race 全绿；`smoke-e2e.sh` 13/13（含真实双进程 Scenario A/B）。
 
 ## 明确不做（超出学习项目边界）
 - 分叉/reorg 树状链（保留 TODO 与最长链原则说明，当前单链追加）；RIPEMD160/secp256k1（stdlib 限制，注释说明升级路径）；SPV/轻节点；TLS/加密传输；代币经济。
