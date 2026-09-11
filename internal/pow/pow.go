@@ -6,6 +6,8 @@
 package pow
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"math/big"
 
 	"p2pchain/internal/block"
@@ -51,16 +53,24 @@ func Validate(h *block.Header) bool {
 // maxIterations 用于防止死循环（例如需要更新时间戳/交易时提前退出重新组装区块）；
 // 传 0 表示不限制迭代次数。
 // 返回是否找到解，以及尝试的次数（可用于统计算力）。
+//
+// 性能实现：头序列化长度固定，Nonce 位于末尾 8 字节——预计算前缀后每次迭代
+// 只改写 Nonce 字段并做两次 SHA-256，避免每轮完整的 binary.Write 序列化。
+// 结果与朴素实现完全一致（相同序列化、相同哈希、相同首个满足条件的 Nonce）。
 func Mine(b *block.Block, maxIterations uint64) (found bool, attempts uint64) {
 	target := BitsToTarget(b.Header.Bits)
 
+	buf := b.Header.SerializeHeader()
+	nonceOff := len(buf) - 8 // Header.Nonce 为最后一个字段，uint64 小端
+
 	var nonce uint64
 	for maxIterations == 0 || nonce < maxIterations {
-		b.Header.Nonce = nonce
-		hash := b.Header.Hash()
-		hashInt := new(big.Int).SetBytes(hash[:])
+		binary.LittleEndian.PutUint64(buf[nonceOff:], nonce)
+		first := sha256.Sum256(buf)
+		hash := sha256.Sum256(first[:])
 
-		if hashInt.Cmp(target) == -1 {
+		if new(big.Int).SetBytes(hash[:]).Cmp(target) == -1 {
+			b.Header.Nonce = nonce
 			return true, nonce + 1
 		}
 		nonce++

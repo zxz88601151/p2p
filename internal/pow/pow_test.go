@@ -12,7 +12,7 @@ import (
 // mineValid 在给定难度下挖出一个合法区块（单测用，难度调低以加速）。
 func mineValid(t *testing.T, bits uint32) *block.Block {
 	t.Helper()
-	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50)
+	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50, 0)
 	b := block.NewCandidateBlock([32]byte{}, bits, []*transaction.Transaction{cb})
 	found, _ := pow.Mine(b, 0) // 0 = 无限迭代
 	if !found {

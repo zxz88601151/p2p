@@ -55,7 +55,7 @@ func (s *nodeService) OnNewTx(peerAddr string, raw json.RawMessage) {
 
 // buildGenesisBlock 构造创世区块：没有前置区块，直接给出一笔 Coinbase 奖励。
 func buildGenesisBlock(minerPubKeyHash [20]byte) *block.Block {
-	coinbase := transaction.NewCoinbaseTx(minerPubKeyHash, BlockReward)
+	coinbase := transaction.NewCoinbaseTx(minerPubKeyHash, BlockReward, 0)
 	genesis := block.NewCandidateBlock([32]byte{}, pow.MaxTargetBits, []*transaction.Transaction{coinbase})
 
 	// 创世区块也需要真正挖出来，保证哈希满足难度目标，逻辑上和普通区块一致
@@ -74,7 +74,7 @@ func mineLoop(s *nodeService) {
 		}
 
 		// TODO: 这里应该从 Mempool 中挑选手续费最高的一批交易打包，骨架阶段只打包 Coinbase
-		coinbase := transaction.NewCoinbaseTx(s.miner.PubKeyHash(), BlockReward)
+		coinbase := transaction.NewCoinbaseTx(s.miner.PubKeyHash(), BlockReward, s.chain.Height()+1)
 		candidate := block.NewCandidateBlock(tip.Header.Hash(), s.chain.CurrentBits(), []*transaction.Transaction{coinbase})
 
 		log.Printf("[miner] 开始挖矿，高度=%d，难度位数=%d", s.chain.Height()+1, candidate.Header.Bits)
@@ -120,7 +120,10 @@ func main() {
 	log.Printf("[node] 矿工地址（公钥哈希）=%x", minerWallet.PubKeyHash())
 
 	genesis := buildGenesisBlock(minerWallet.PubKeyHash())
-	chain := blockchain.NewBlockchainWithGenesis(genesis)
+	chain, err := blockchain.NewBlockchainWithGenesis(genesis)
+	if err != nil {
+		log.Fatalf("初始化区块链失败: %v", err)
+	}
 	log.Printf("[node] 创世区块哈希=%s", genesis.Header.HashHex())
 
 	svc := &nodeService{chain: chain, miner: minerWallet}

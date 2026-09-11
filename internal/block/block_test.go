@@ -32,7 +32,7 @@ func TestHeaderSerializationDeterminism(t *testing.T) {
 
 // TestBlockHashDeterminism 验证同一区块头的双 SHA-256 哈希稳定。
 func TestBlockHashDeterminism(t *testing.T) {
-	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50)
+	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50, 0)
 	b := block.NewCandidateBlock([32]byte{}, 20, []*transaction.Transaction{cb})
 	if b.Header.Hash() != b.Header.Hash() {
 		t.Fatal("block header hash is not deterministic")
@@ -42,8 +42,8 @@ func TestBlockHashDeterminism(t *testing.T) {
 // TestMerkleRootDeterminism 验证 Merkle 根计算稳定。
 func TestMerkleRootDeterminism(t *testing.T) {
 	txs := []*transaction.Transaction{
-		transaction.NewCoinbaseTx([20]byte{0x01}, 50),
-		transaction.NewCoinbaseTx([20]byte{0x02}, 50),
+		transaction.NewCoinbaseTx([20]byte{0x01}, 50, 0),
+		transaction.NewCoinbaseTx([20]byte{0x02}, 50, 0),
 	}
 	if block.ComputeMerkleRoot(txs) != block.ComputeMerkleRoot(txs) {
 		t.Fatal("Merkle root is not deterministic")
@@ -52,7 +52,7 @@ func TestMerkleRootDeterminism(t *testing.T) {
 
 // TestMerkleRootNonZero 验证单笔交易也能得到非零 Merkle 根。
 func TestMerkleRootNonZero(t *testing.T) {
-	tx := transaction.NewCoinbaseTx([20]byte{0x01}, 50)
+	tx := transaction.NewCoinbaseTx([20]byte{0x01}, 50, 0)
 	if block.ComputeMerkleRoot([]*transaction.Transaction{tx}) == ([32]byte{}) {
 		t.Fatal("expected non-zero Merkle root for a single transaction")
 	}
@@ -61,7 +61,7 @@ func TestMerkleRootNonZero(t *testing.T) {
 // TestNewCandidateBlockSetsPrevHash 验证候选区块正确写入父哈希与交易列表。
 func TestNewCandidateBlockSetsPrevHash(t *testing.T) {
 	prev := [32]byte{0x99}
-	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50)
+	cb := transaction.NewCoinbaseTx([20]byte{0x01}, 50, 0)
 	b := block.NewCandidateBlock(prev, 20, []*transaction.Transaction{cb})
 	if b.Header.PrevBlockHash != prev {
 		t.Fatalf("PrevBlockHash = %x, want %x", b.Header.PrevBlockHash, prev)

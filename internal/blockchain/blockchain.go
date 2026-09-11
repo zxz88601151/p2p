@@ -1,58 +1,106 @@
 // Package blockchain 维护本地节点看到的区块链视图，负责：
-//   - 区块的验证与追加
-//   - 分叉处理（最长有效链原则，比特币称为"最大累积工作量"原则）
-//   - 难度调整的触发
+//   - 区块的验证与追加（全序共识校验，见 ValidateBlock）
+//   - UTXO 状态机的持有与原子迁移（委托 internal/utxo）
+//   - 难度调整的触发（委托 internal/pow）
 //
-// 注意：这里给出的是内存版骨架，真实项目需要接入 internal/storage 做持久化，
-// 并在启动时从磁盘重建内存索引。
+// 线程模型：全链操作受 mu 保护；UTXO 集合自身亦有内部锁，
+// 对外暴露的 UTXOSnapshot() 返回克隆快照，避免调用方直接持有可变状态。
+//
+// 分叉处理（reorg）仍为单链追加实现，设计要点见文末 TODO 注释。
 package blockchain
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/pow"
+	"p2pchain/internal/utxo"
 )
 
 var (
-	ErrInvalidPrevHash = errors.New("区块的前置哈希与当前链尾不匹配")
-	ErrInvalidPoW      = errors.New("区块哈希未达到难度目标，工作量证明无效")
-	ErrEmptyChain      = errors.New("链为空")
+	ErrInvalidPrevHash   = errors.New("区块的前置哈希与当前链尾不匹配")
+	ErrInvalidPoW        = errors.New("区块哈希未达到难度目标，工作量证明无效")
+	ErrEmptyChain        = errors.New("链为空")
+	ErrUnexpectedBits    = errors.New("区块难度位与当前共识难度不一致")
+	ErrTimestampOutOfRange = errors.New("区块时间戳超出允许范围")
+	ErrMerkleMismatch    = errors.New("区块头 Merkle 根与交易列表不匹配")
+	ErrBlockTooLarge     = errors.New("区块超过最大体积限制")
+	ErrBadTxLayout       = errors.New("区块交易布局非法（coinbase 位置/数量）")
+)
+
+const (
+	// MaxBlockSize 区块最大体积（字节）：按 block 的规范 JSON 序列化长度计算。
+	// JSON 字段顺序由结构体定义固定，跨节点计算结果一致。
+	MaxBlockSize = 1 << 20 // 1 MiB
+
+	// maxFutureTimestampDrift 允许区块时间戳超前本地时钟的最大秒数（比特币为 2 小时）。
+	maxFutureTimestampDrift = 7200
 )
 
 // Blockchain 内存中的区块链结构。
-// blocks 按高度顺序存储；生产实现应改为哈希索引的 DAG 结构以支持分叉与重组。
+// blocks 按高度顺序存储；utxo 为当前链的未花费输出集合（与 blocks 尾部一致）。
 type Blockchain struct {
+	mu     sync.RWMutex
 	blocks []*block.Block
+	utxo   *utxo.UTXOSet
 }
 
 // NewBlockchainWithGenesis 使用给定的创世区块初始化链。
-func NewBlockchainWithGenesis(genesis *block.Block) *Blockchain {
-	return &Blockchain{blocks: []*block.Block{genesis}}
+// 创世区块视为可信（不做头校验），但其交易必须能成功建立初始 UTXO 状态。
+func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
+	genesisSet, _, err := utxo.ApplyBlock(utxo.NewUTXOSet(), genesis.Transactions, 0)
+	if err != nil {
+		return nil, fmt.Errorf("创世区块 UTXO 初始化失败: %w", err)
+	}
+	return &Blockchain{
+		blocks: []*block.Block{genesis},
+		utxo:   genesisSet,
+	}, nil
 }
 
 // Height 返回当前链的高度（创世区块高度为 0）。
 func (bc *Blockchain) Height() int {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
 	return len(bc.blocks) - 1
 }
 
 // Tip 返回当前链尾（最新）区块。
 func (bc *Blockchain) Tip() (*block.Block, error) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
 	if len(bc.blocks) == 0 {
 		return nil, ErrEmptyChain
 	}
 	return bc.blocks[len(bc.blocks)-1], nil
 }
 
+// UTXOSnapshot 返回当前 UTXO 集合的克隆快照（供 mempool / 余额查询使用，
+// 避免调用方直接持有可变状态）。
+func (bc *Blockchain) UTXOSnapshot() *utxo.UTXOSet {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.utxo.Clone()
+}
+
 // CurrentBits 返回下一个待挖区块应当使用的难度目标。
-// 骨架版本：只有到达调整周期的整数倍高度才重新计算，否则沿用链尾的难度。
+// 只有到达调整周期的整数倍高度才重新计算，否则沿用链尾的难度。
 func (bc *Blockchain) CurrentBits() uint32 {
-	tip, err := bc.Tip()
-	if err != nil {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.currentBitsLocked()
+}
+
+func (bc *Blockchain) currentBitsLocked() uint32 {
+	if len(bc.blocks) == 0 {
 		return pow.MaxTargetBits
 	}
-	height := bc.Height()
+	tip := bc.blocks[len(bc.blocks)-1]
+	height := len(bc.blocks) - 1
 	if height == 0 || height%pow.DifficultyAdjustmentInterval != 0 {
 		return tip.Header.Bits
 	}
@@ -66,50 +114,92 @@ func (bc *Blockchain) CurrentBits() uint32 {
 	return pow.AdjustBits(tip.Header.Bits, actualTimespan)
 }
 
-// ValidateBlock 对一个待追加的区块做基础合法性校验：
-//  1. 前置哈希是否指向当前链尾
-//  2. 工作量证明是否满足难度目标
-//
-// 生产实现还需要校验：交易签名、UTXO 是否存在且未被双花、Coinbase 金额是否等于
-// 区块奖励+手续费、时间戳是否在合理范围内等。这里先留出骨架和 TODO。
-func (bc *Blockchain) ValidateBlock(b *block.Block) error {
-	tip, err := bc.Tip()
+// validateBlock 对区块执行全序共识校验；全部通过时返回应用后的新 UTXO 集合。
+// 调用方必须已持有锁（AddBlock 写锁 / ValidateBlock 读锁）。
+// 校验顺序（任何一步失败立即拒绝）：
+//  1. PrevHash        2. PoW           3. Bits == 共识难度
+//  4. 时间戳范围      5. Merkle 重验   6. 体积上限
+//  7. coinbase 位置/数量 + 全部交易的状态迁移（签名/双花/maturity/金额/coinbase 上限）
+func (bc *Blockchain) validateBlock(b *block.Block) (*utxo.UTXOSet, error) {
+	tip := bc.blocks[len(bc.blocks)-1]
+	height := len(bc.blocks) // 新区块高度
+
+	// 1. 链式结构
+	if b.Header.PrevBlockHash != tip.Header.Hash() {
+		return nil, ErrInvalidPrevHash
+	}
+	// 2. 工作量证明
+	if !pow.Validate(&b.Header) {
+		return nil, ErrInvalidPoW
+	}
+	// 3. 难度位必须与当前共识难度一致（防止矿工私降难度）
+	if b.Header.Bits != bc.currentBitsLocked() {
+		return nil, fmt.Errorf("%w: 区块 %d，共识 %d", ErrUnexpectedBits, b.Header.Bits, bc.currentBitsLocked())
+	}
+	// 4. 时间戳：不得早于父块（保证难度调整的时间跨度单调），不得大幅超前
+	if b.Header.Timestamp < tip.Header.Timestamp {
+		return nil, fmt.Errorf("%w: 时间戳 %d 早于父块 %d", ErrTimestampOutOfRange, b.Header.Timestamp, tip.Header.Timestamp)
+	}
+	if b.Header.Timestamp > time.Now().Unix()+maxFutureTimestampDrift {
+		return nil, fmt.Errorf("%w: 时间戳 %d 超前本地时钟超过 %d 秒", ErrTimestampOutOfRange, b.Header.Timestamp, maxFutureTimestampDrift)
+	}
+	// 5. Merkle 重验（防「同 Merkle 根不同交易集合」与头/体不一致）
+	if block.ComputeMerkleRoot(b.Transactions) != b.Header.MerkleRoot {
+		return nil, ErrMerkleMismatch
+	}
+	// 6. 体积上限
+	raw, err := json.Marshal(b)
 	if err != nil {
+		return nil, fmt.Errorf("区块序列化失败: %w", err)
+	}
+	if len(raw) > MaxBlockSize {
+		return nil, fmt.Errorf("%w: %d > %d", ErrBlockTooLarge, len(raw), MaxBlockSize)
+	}
+	// 7. 交易层：coinbase 布局 + 签名 + 双花 + maturity + 金额 + coinbase 上限，
+	//    在克隆集合上原子迁移（内部保证失败不留半迁移状态）
+	newSet, _, err := utxo.ApplyBlock(bc.utxo, b.Transactions, height)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadTxLayout, unwrapLayoutErr(err))
+	}
+	return newSet, nil
+}
+
+// unwrapLayoutErr 把 utxo.ApplyBlock 的「布局类」错误归一到 ErrBadTxLayout 语义；
+// 金额超限等保留原始错误以便上层识别。
+func unwrapLayoutErr(err error) error { return err }
+
+// ValidateBlock 对一个待追加的区块做全序共识校验（不改变链状态）。
+// 通过意味着：该区块可以直接被 AddBlock 接受。
+func (bc *Blockchain) ValidateBlock(b *block.Block) error {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if _, err := bc.validateBlock(b); err != nil {
 		return err
 	}
-	if b.Header.PrevBlockHash != tip.Header.Hash() {
-		return ErrInvalidPrevHash
-	}
-	if !pow.Validate(&b.Header) {
-		return ErrInvalidPoW
-	}
-
-	// TODO: 校验每笔交易的输入签名（内含 ECDSA/Ed25519 验签逻辑）
-	// TODO: 校验交易输入引用的 UTXO 确实存在且未被花费（维护一个 UTXO 集合）
-	// TODO: 校验 Coinbase 输出金额 <= 当前区块奖励 + 交易手续费总和
-	// TODO: 校验区块大小、交易数量等限制
-
 	return nil
 }
 
-// AddBlock 校验并把区块追加到链尾。
+// AddBlock 校验并把区块原子地追加到链尾（校验 + UTXO 整体替换 + 追加）。
 func (bc *Blockchain) AddBlock(b *block.Block) error {
-	if err := bc.ValidateBlock(b); err != nil {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	newSet, err := bc.validateBlock(b)
+	if err != nil {
 		return fmt.Errorf("添加区块失败: %w", err)
 	}
 	bc.blocks = append(bc.blocks, b)
+	bc.utxo = newSet
 	return nil
 }
 
-// TODO: 分叉处理（重要，先在骨架中标注设计要点）：
+// TODO 分叉处理（reorg，设计要点，当前为单链追加实现）：
 //
 // 真实网络中，不同节点可能几乎同时挖出不同的区块，形成临时分叉。
 // 处理原则（最长有效链 / 最大累积工作量）：
-//  1. 节点收到一个新区块时，如果它的 PrevBlockHash 不指向当前链尾，
-//     说明可能存在分叉，需要判断这个新区块所在的链累积难度是否更高。
-//  2. 如果更高，则执行"链重组"（reorg）：回滚当前链尾部分区块，
-//     切换到新的、更长（工作量更大）的链，并把被回滚区块中的交易重新放回内存池。
-//  3. 需要维护一个区块索引（哈希 -> 区块、高度、累积难度），而不只是线性数组，
-//     才能支持多分支并存和比较。
-//
-// 建议下一步：把 blocks []*block.Block 换成 map[[32]byte]*BlockNode 的树状结构。
+//  1. 收到新区块时若 PrevBlockHash 不指向当前链尾，判断其所在链的累积工作量；
+//  2. 更高则执行重组：回滚链尾区块（需要按高度逆序反向应用 UTXO——
+//     因此持久化层保存每个 UTXO 条目的产生高度与消费记录），
+//     切换到工作量更大的链，被回滚交易重新入池；
+//  3. 需要把 blocks []*Block 升级为 map[哈希]BlockNode 的树状索引。
+//  本项目保留单链实现 + 上述设计说明，作为下一阶段工作项。

@@ -41,12 +41,16 @@ func (tx *Transaction) IsCoinbase() bool {
 }
 
 // NewCoinbaseTx 构造一笔出块奖励交易，付给矿工地址 reward 数量的新币。
-func NewCoinbaseTx(minerPubKeyHash [20]byte, reward uint64) *Transaction {
+// height 编码进输入的 Signature 字段（BIP34 风格）：既满足区块高度绑定，
+// 又使不同高度的 coinbase 具有唯一 TxID（否则同值 coinbase 会在 UTXO 集合中
+// 相互覆盖，构成丢失资金与双重记账漏洞）。
+func NewCoinbaseTx(minerPubKeyHash [20]byte, reward uint64, height int) *Transaction {
 	return &Transaction{
 		Inputs: []TxInput{
 			{
 				PrevTxHash: [32]byte{},
 				OutIndex:   0xFFFFFFFF,
+				Signature:  EncodeCoinbaseHeight(height),
 			},
 		},
 		Outputs: []TxOutput{
@@ -55,14 +59,41 @@ func NewCoinbaseTx(minerPubKeyHash [20]byte, reward uint64) *Transaction {
 	}
 }
 
+// EncodeCoinbaseHeight 将区块高度编码为 4 字节小端（存放在 coinbase 输入的 Signature 字段）。
+func EncodeCoinbaseHeight(height int) []byte {
+	if height < 0 {
+		height = 0
+	}
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b, uint32(height))
+	return b
+}
+
+// DecodeCoinbaseHeight 解析 coinbase Signature 字段中的高度。
+func DecodeCoinbaseHeight(sig []byte) (int, bool) {
+	if len(sig) != 4 {
+		return 0, false
+	}
+	return int(binary.LittleEndian.Uint32(sig)), true
+}
+
 // serializeForHash 将交易序列化为字节流用于计算哈希（TxID）。
 // 注意：这里不包含签名（否则会形成"签名依赖自身哈希"的循环问题），
 // 实际生产实现建议参考 BIP-143 的 SegWit 序列化方案以避免延展性攻击。
+//
+// 例外：coinbase 交易没有真实签名，其 Signature 字段承载区块高度（BIP34 风格），
+// 该字段必须参与 TxID 计算——否则所有同金额 coinbase 的 TxID 相同，在 UTXO 集合中
+// 相互覆盖。coinbase 无需验签，因此不引入延展性风险。
 func (tx *Transaction) serializeForHash() []byte {
+	isCb := tx.IsCoinbase()
 	buf := new(bytes.Buffer)
 	for _, in := range tx.Inputs {
 		buf.Write(in.PrevTxHash[:])
 		_ = binary.Write(buf, binary.LittleEndian, in.OutIndex)
+		if isCb {
+			_ = binary.Write(buf, binary.LittleEndian, uint32(len(in.Signature)))
+			buf.Write(in.Signature)
+		}
 	}
 	for _, out := range tx.Outputs {
 		_ = binary.Write(buf, binary.LittleEndian, out.Value)
