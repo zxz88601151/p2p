@@ -24,6 +24,16 @@ type Wallet struct {
 	PublicKey  []byte // 未压缩格式公钥字节：0x04 || X || Y
 }
 
+// SignatureSize 签名字节长度：r、s 各按 32 字节大端定长编码后拼接。
+//
+// 定长是必须的（曾经的缺陷）：r/s 是大整数，若最高位字节为 0，big.Int.Bytes() 返回的
+// 长度会小于 32 甚至只有 31 字节。此时若按「变长拼接 + 从中间切分」来验签，
+// 切分位置就会错位，导致约 1/128 的签名随机验不过——表现为极难复现的偶发失败。
+const SignatureSize = 64
+
+// ErrBadSignatureLength 签名长度不等于 SignatureSize。
+var ErrBadSignatureLength = errors.New("签名长度非法（应为 64 字节定长 r||s）")
+
 // NewWallet 生成一个新的密钥对。
 func NewWallet() (*Wallet, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -34,9 +44,10 @@ func NewWallet() (*Wallet, error) {
 	return &Wallet{PrivateKey: priv, PublicKey: pub}, nil
 }
 
-// PubKeyHash 计算公钥哈希（简化版地址核心内容）。
-// TODO: 生产实现请替换为 RIPEMD160(SHA256(pubkey))，并加上版本号 + 校验和做 Base58Check 编码，
-// 这样地址就能像比特币一样直接肉眼分辨、且能检测出输入错误。
+// PubKeyHash 计算公钥哈希（地址的核心内容）。取 SHA256(pubkey) 前 20 字节。
+// 地址的「版本号 + 校验和 + Base58Check 编码」在 address.go / base58.go 中实现。
+//
+// TODO: 与比特币完全兼容需改为 RIPEMD160(SHA256(pubkey))（标准库无内置 RIPEMD160）。
 func (w *Wallet) PubKeyHash() [20]byte {
 	sum := sha256.Sum256(w.PublicKey)
 	var hash [20]byte
@@ -44,14 +55,29 @@ func (w *Wallet) PubKeyHash() [20]byte {
 	return hash
 }
 
-// Sign 对任意消息哈希做 ECDSA 签名，返回 (r, s) 拼接后的字节。
+// Sign 对任意消息哈希做 ECDSA 签名，返回定长 64 字节的 r||s。
 func (w *Wallet) Sign(msgHash [32]byte) ([]byte, error) {
 	r, s, err := ecdsa.Sign(rand.Reader, w.PrivateKey, msgHash[:])
 	if err != nil {
 		return nil, err
 	}
-	sig := append(r.Bytes(), s.Bytes()...)
-	return sig, nil
+	return encodeSignature(r, s), nil
+}
+
+// encodeSignature 把 (r, s) 编码为 64 字节定长字节串（各 32 字节大端，左侧补零）。
+func encodeSignature(r, s *big.Int) []byte {
+	sig := make([]byte, SignatureSize)
+	r.FillBytes(sig[:32])
+	s.FillBytes(sig[32:])
+	return sig
+}
+
+// decodeSignature 从 64 字节定长字节串还原 (r, s)。
+func decodeSignature(sig []byte) (r, s *big.Int, err error) {
+	if len(sig) != SignatureSize {
+		return nil, nil, ErrBadSignatureLength
+	}
+	return new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:]), nil
 }
 
 // Verify 用给定公钥字节验证签名是否有效。
@@ -62,8 +88,13 @@ func Verify(pubKeyBytes []byte, msgHash [32]byte, sig []byte) (bool, error) {
 	}
 	pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 
-	half := len(sig) / 2
-	r := new(big.Int).SetBytes(sig[:half])
-	s := new(big.Int).SetBytes(sig[half:])
+	r, s, err := decodeSignature(sig)
+	if err != nil {
+		return false, err
+	}
+	// r/s 为 0 时签名必然无效，显式拒绝（避免进入 ecdsa.Verify 的边界分支）
+	if r.Sign() == 0 || s.Sign() == 0 {
+		return false, nil
+	}
 	return ecdsa.Verify(pub, msgHash[:], r, s), nil
 }
