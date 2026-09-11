@@ -7,6 +7,7 @@ import (
 	"p2pchain/internal/block"
 	"p2pchain/internal/blockchain"
 	"p2pchain/internal/pow"
+	"p2pchain/internal/storage"
 	"p2pchain/internal/transaction"
 	"p2pchain/internal/utxo"
 	"p2pchain/internal/wallet"
@@ -54,29 +55,38 @@ func mineBlock(t *testing.T, bc *blockchain.Blockchain, miner *wallet.Wallet) *b
 	return candidate
 }
 
-// buildSpendTx 消费属于 spender 的第一个金额匹配的输出，构造已签名交易。
-// 不做 maturity 过滤——「花费未成熟 coinbase」用例依赖这一点构造非法区块。
+// buildSpendTx 消费属于 spender 的「已成熟且金额匹配」的第一个输出，构造已签名交易。
+// map 迭代无序 → 必须显式过滤未成熟 coinbase，否则选币结果不确定。
 func buildSpendTx(t *testing.T, snap *utxo.UTXOSet, spender *wallet.Wallet, to [20]byte, amount, height int) *transaction.Transaction {
 	t.Helper()
 	for op, e := range snap.AllEntries() {
 		if e.PubKeyHash != spender.PubKeyHash() || e.Value != uint64(amount) {
 			continue
 		}
-		tx := &transaction.Transaction{
-			Inputs:  []transaction.TxInput{{PrevTxHash: op.Hash, OutIndex: op.Index}},
-			Outputs: []transaction.TxOutput{{Value: e.Value, PubKeyHash: to}},
+		if e.IsCoinbase && height-e.Height < utxo.CoinbaseMaturity {
+			continue
 		}
-		h := tx.Hash()
-		sig, err := spender.Sign(h)
-		if err != nil {
-			t.Fatalf("签名失败: %v", err)
-		}
-		tx.Inputs[0].Signature = sig
-		tx.Inputs[0].PubKey = spender.PublicKey
-		return tx
+		return spendFrom(t, op, spender, to, e.Value)
 	}
-	t.Fatal("没有满足条件的可用 UTXO")
+	t.Fatal("没有满足条件（成熟且金额匹配）的可用 UTXO")
 	return nil
+}
+
+// spendFrom 显式消费指定输出（不做 maturity 过滤，供非法区块构造用例使用）。
+func spendFrom(t *testing.T, op utxo.OutPoint, spender *wallet.Wallet, to [20]byte, value uint64) *transaction.Transaction {
+	t.Helper()
+	tx := &transaction.Transaction{
+		Inputs:  []transaction.TxInput{{PrevTxHash: op.Hash, OutIndex: op.Index}},
+		Outputs: []transaction.TxOutput{{Value: value, PubKeyHash: to}},
+	}
+	h := tx.Hash()
+	sig, err := spender.Sign(h)
+	if err != nil {
+		t.Fatalf("签名失败: %v", err)
+	}
+	tx.Inputs[0].Signature = sig
+	tx.Inputs[0].PubKey = spender.PublicKey
+	return tx
 }
 
 // ---- 用例 ----
@@ -218,7 +228,9 @@ func TestImmatureCoinbaseSpendRejected(t *testing.T) {
 	mineBlock(t, bc, miner)
 
 	tip, _ := bc.Tip()
-	spend := buildSpendTx(t, bc.UTXOSnapshot(), miner, receiver.PubKeyHash(), testReward, bc.Height()+1)
+	// 显式消费创世 coinbase（高度 0，在高度 3 处必然未成熟）
+	genesisOP := utxo.OutPoint{Hash: genesis.Transactions[0].Hash(), Index: 0}
+	spend := spendFrom(t, genesisOP, miner, receiver.PubKeyHash(), testReward)
 	cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(3), 3)
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), bc.CurrentBits(),
 		[]*transaction.Transaction{cb, spend})
@@ -239,4 +251,81 @@ func TestGenesisBadTransactionRejected(t *testing.T) {
 	if _, err := blockchain.NewBlockchainWithGenesis(bad); err == nil {
 		t.Fatal("超额创世 coinbase 被接受")
 	}
+}
+
+// ---- 持久化与确定性创世（PHASE 4）----
+
+// TestGenesisDeterministic 两次生成的创世区块必须字节级一致。
+func TestGenesisDeterministic(t *testing.T) {
+	g1 := blockchain.NewGenesisBlock()
+	g2 := blockchain.NewGenesisBlock()
+	if g1.Header.Hash() != g2.Header.Hash() {
+		t.Fatal("创世区块不确定（哈希不同）")
+	}
+	if g1.Header.Timestamp != blockchain.GenesisTimestamp {
+		t.Fatalf("创世时间戳 = %d, want %d", g1.Header.Timestamp, blockchain.GenesisTimestamp)
+	}
+	if g1.Header.PrevBlockHash != ([32]byte{}) {
+		t.Fatal("创世区块的父哈希必须为零")
+	}
+	if !pow.Validate(&g1.Header) {
+		t.Fatal("创世区块 PoW 无效")
+	}
+}
+
+// TestChainPersistsAcrossRestart 链重启后高度、链尾与 UTXO 余额一致。
+func TestChainPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.OpenFileBlockStore(dir)
+	if err != nil {
+		t.Fatalf("打开存储失败: %v", err)
+	}
+
+	bc, err := blockchain.NewBlockchainFromStore(store)
+	if err != nil {
+		t.Fatalf("从存储加载链失败: %v", err)
+	}
+	if bc.Height() != 0 {
+		t.Fatalf("空库应只有创世，高度 = %d", bc.Height())
+	}
+	miner := newTestWallet(t)
+	// 直接在确定性创世之上挖 2 个区块（矿工另建钱包以拥有可花费输出）
+	for i := 0; i < 2; i++ {
+		mineBlock(t, bc, miner)
+	}
+	tipHash := mustTip(t, bc).Header.Hash()
+	heightBefore := bc.Height()
+	balBefore := bc.UTXOSnapshot().Balance(miner.PubKeyHash(), heightBefore, true)
+	if err := store.Close(); err != nil {
+		t.Fatalf("关闭存储失败: %v", err)
+	}
+
+	// 重开并加载
+	store2, err := storage.OpenFileBlockStore(dir)
+	if err != nil {
+		t.Fatalf("重开存储失败: %v", err)
+	}
+	defer store2.Close()
+	bc2, err := blockchain.NewBlockchainFromStore(store2)
+	if err != nil {
+		t.Fatalf("重启加载链失败: %v", err)
+	}
+	if bc2.Height() != heightBefore {
+		t.Fatalf("重启后高度 = %d, want %d", bc2.Height(), heightBefore)
+	}
+	if mustTip(t, bc2).Header.Hash() != tipHash {
+		t.Fatal("重启后链尾哈希不一致")
+	}
+	if got := bc2.UTXOSnapshot().Balance(miner.PubKeyHash(), heightBefore, true); got != balBefore {
+		t.Fatalf("重启后余额 = %d, want %d", got, balBefore)
+	}
+}
+
+func mustTip(t *testing.T, bc *blockchain.Blockchain) *block.Block {
+	t.Helper()
+	tip, err := bc.Tip()
+	if err != nil {
+		t.Fatalf("获取链尾失败: %v", err)
+	}
+	return tip
 }

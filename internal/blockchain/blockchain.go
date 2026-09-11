@@ -10,7 +10,6 @@
 package blockchain
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -18,6 +17,7 @@ import (
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/pow"
+	"p2pchain/internal/storage"
 	"p2pchain/internal/utxo"
 )
 
@@ -43,13 +43,15 @@ const (
 
 // Blockchain 内存中的区块链结构。
 // blocks 按高度顺序存储；utxo 为当前链的未花费输出集合（与 blocks 尾部一致）。
+// store 非空时，每次成功追加都会同步落盘，启动时从磁盘重建。
 type Blockchain struct {
 	mu     sync.RWMutex
 	blocks []*block.Block
 	utxo   *utxo.UTXOSet
+	store  storage.BlockStore
 }
 
-// NewBlockchainWithGenesis 使用给定的创世区块初始化链。
+// NewBlockchainWithGenesis 使用给定的创世区块初始化链（不持久化，供测试/临时链使用）。
 // 创世区块视为可信（不做头校验），但其交易必须能成功建立初始 UTXO 状态。
 func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 	genesisSet, _, err := utxo.ApplyBlock(utxo.NewUTXOSet(), genesis.Transactions, 0)
@@ -60,6 +62,50 @@ func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 		blocks: []*block.Block{genesis},
 		utxo:   genesisSet,
 	}, nil
+}
+
+// NewBlockchainFromStore 从持久化存储加载链；空库时创建确定性创世并落盘。
+//
+// 启动回放策略（证据优先）：逐块按高度重新执行完整共识校验（AddBlock），
+// 任何一块不合法即拒绝启动——避免带着损坏数据继续运行。
+func NewBlockchainFromStore(store storage.BlockStore) (*Blockchain, error) {
+	h, err := store.Height()
+	if err != nil {
+		return nil, fmt.Errorf("读取存储高度失败: %w", err)
+	}
+
+	if h < 0 {
+		genesis := NewGenesisBlock()
+		if err := store.SaveBlock(genesis); err != nil {
+			return nil, fmt.Errorf("创世区块落盘失败: %w", err)
+		}
+		bc, err := NewBlockchainWithGenesis(genesis)
+		if err != nil {
+			return nil, err
+		}
+		bc.store = store
+		return bc, nil
+	}
+
+	first, err := store.GetBlockByHeight(0)
+	if err != nil {
+		return nil, fmt.Errorf("读取创世区块失败: %w", err)
+	}
+	bc, err := NewBlockchainWithGenesis(first)
+	if err != nil {
+		return nil, err
+	}
+	bc.store = store
+	for i := 1; i <= h; i++ {
+		b, err := store.GetBlockByHeight(i)
+		if err != nil {
+			return nil, fmt.Errorf("读取高度 %d 区块失败: %w", i, err)
+		}
+		if err := bc.AddBlock(b); err != nil {
+			return nil, fmt.Errorf("回放高度 %d 区块失败（数据可能损坏）: %w", i, err)
+		}
+	}
+	return bc, nil
 }
 
 // Height 返回当前链的高度（创世区块高度为 0）。
@@ -148,12 +194,8 @@ func (bc *Blockchain) validateBlock(b *block.Block) (*utxo.UTXOSet, error) {
 		return nil, ErrMerkleMismatch
 	}
 	// 6. 体积上限
-	raw, err := json.Marshal(b)
-	if err != nil {
-		return nil, fmt.Errorf("区块序列化失败: %w", err)
-	}
-	if len(raw) > MaxBlockSize {
-		return nil, fmt.Errorf("%w: %d > %d", ErrBlockTooLarge, len(raw), MaxBlockSize)
+	if size := b.Size(); size > MaxBlockSize {
+		return nil, fmt.Errorf("%w: %d > %d", ErrBlockTooLarge, size, MaxBlockSize)
 	}
 	// 7. 交易层：coinbase 布局 + 签名 + 双花 + maturity + 金额 + coinbase 上限，
 	//    在克隆集合上原子迁移（内部保证失败不留半迁移状态）
@@ -179,7 +221,7 @@ func (bc *Blockchain) ValidateBlock(b *block.Block) error {
 	return nil
 }
 
-// AddBlock 校验并把区块原子地追加到链尾（校验 + UTXO 整体替换 + 追加）。
+// AddBlock 校验并把区块原子地追加到链尾（校验 + UTXO 整体替换 + 追加 + 落盘）。
 func (bc *Blockchain) AddBlock(b *block.Block) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -187,6 +229,12 @@ func (bc *Blockchain) AddBlock(b *block.Block) error {
 	newSet, err := bc.validateBlock(b)
 	if err != nil {
 		return fmt.Errorf("添加区块失败: %w", err)
+	}
+	// 先落盘再更新内存状态：落盘失败则内存状态不变，保证两者一致
+	if bc.store != nil {
+		if err := bc.store.SaveBlock(b); err != nil {
+			return fmt.Errorf("区块持久化失败: %w", err)
+		}
 	}
 	bc.blocks = append(bc.blocks, b)
 	bc.utxo = newSet
