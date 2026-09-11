@@ -97,8 +97,12 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 		return MaxTargetBits
 	}
 
-	// 将 newTarget 换算回近似的 bits：找到使 2^(256-bits) 最接近 newTarget 的 bits
-	newBits := uint32(256 - newTarget.BitLen())
+	// 将 newTarget 换算回近似的 bits：找到使 2^(256-bits) 最接近 newTarget 的 bits。
+	// 逆变换用 257-BitLen：T(b)=2^(256-b) 的 BitLen 恰为 257-b，
+	// 因此 257-BitLen 可让 target→bits→target 在 2 的幂处精确还原（均衡态难度不变）；
+	// 对一般 target 则向下保守取整（T(bits') ≤ newTarget，永不比计算值更易）。
+	// 旧公式 256-BitLen 会在均衡态把 bits 低估 1（如 20→19），造成每周期难度系统性变易。
+	newBits := uint32(257 - newTarget.BitLen())
 	if newBits < 1 {
 		newBits = 1
 	}
