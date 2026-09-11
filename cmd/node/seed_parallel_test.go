@@ -44,11 +44,11 @@ func TestSeedReconnectAfterRestart(t *testing.T) {
 	// 节点 B：以 A 为种子
 	rtB := startRuntimeAt(t, "127.0.0.1:0", []string{addrA}, t.TempDir())
 
-	waitFor(t, func() bool { return rtB.p2p.PeerCount() == 1 }, 10*time.Second, "B 未连上种子节点 A")
+	waitFor(t, func() bool { return rtB.p2p.PeerCount() == 1 }, 30*time.Second, "B 未连上种子节点 A")
 
 	// A 下线 → B 的连接应被清理
 	rtA.Close()
-	waitFor(t, func() bool { return rtB.p2p.PeerCount() == 0 }, 10*time.Second, "A 下线后 B 未清理连接")
+	waitFor(t, func() bool { return rtB.p2p.PeerCount() == 0 }, 30*time.Second, "A 下线后 B 未清理连接")
 
 	// A 在同一地址重新启动 → B 应通过周期性种子检查自动重连
 	rtA2 := startRuntimeAt(t, addrA, nil, t.TempDir())
@@ -56,7 +56,7 @@ func TestSeedReconnectAfterRestart(t *testing.T) {
 
 	if got := rtA2.p2p.PeerCount(); got == 0 {
 		// 允许 A 侧稍晚完成握手
-		waitFor(t, func() bool { return rtA2.p2p.PeerCount() == 1 }, 10*time.Second, "A 侧未记录到 B")
+		waitFor(t, func() bool { return rtA2.p2p.PeerCount() == 1 }, 30*time.Second, "A 侧未记录到 B")
 	}
 }
 

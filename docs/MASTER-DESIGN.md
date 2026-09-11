@@ -4,6 +4,9 @@
 > 本文档是剩余全部阶段的设计决策记录（Design Decisions Record），实现以本文档为准。
 > 纪律：每阶段 = 实现 + 测试 + `go build/vet/test ./...` 全绿 + 独立 commit（packed-refs 加固）。
 > 全程保持定位：学习型 PoW 区块链骨架；标准库零依赖；禁止引入区块链以外的功能。
+>
+> **状态（2026-09-11，HEAD e16abd0）：PHASE 1B–7 全部完成。**
+> 验收证据与实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`。
 
 ---
 
@@ -91,6 +94,8 @@
 
 - README（p2pchain/ 与外层同步）：功能清单、构建运行、CLI 用法、协议说明、已知限制。
 - 全量回归 + 最终报告 `docs/FULL-IMPLEMENTATION-REPORT.md`。
+- 完成时追加：并行挖矿（MineCancelable 等差类切分、可取消、热路径零分配）与种子节点断线重连（5s 只补不足）——设计稿"待实现"清单中的这两项实际已在 PHASE 7 提前闭环（commit e16abd0），并修复了 nodeRuntime.Close 非幂等的 double-close panic。
 
 ## 明确不做（超出学习项目边界）
 - 分叉/reorg 树状链（保留 TODO 与最长链原则说明，当前单链追加）；RIPEMD160/secp256k1（stdlib 限制，注释说明升级路径）；SPV/轻节点；TLS/加密传输；代币经济。
+- 注：设计稿曾列入待办的「多核并行挖矿」「节点发现与断线重连」两项已于 PHASE 7 实现（见上），不在本清单内。

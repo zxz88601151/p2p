@@ -48,6 +48,7 @@ const usageText = `p2pchain 节点与钱包工具
   -datadir <目录>              数据目录（默认 ~/.p2pchain）
   -mine                        启用挖矿
   -maxblocks <整数>            挖矿上限区块数，0 表示不限
+  -miners  <整数>              并行挖矿 worker 数（默认等于 CPU 核数，1 为单线程）
 
 在线命令选项:
   -rpc     127.0.0.1:6689     节点控制接口地址
