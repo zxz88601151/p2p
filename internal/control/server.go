@@ -1,0 +1,302 @@
+// Package control 提供节点的本地控制接口（JSON over HTTP），供命令行工具
+// 查询状态、查看余额与提交交易。
+//
+// 设计取舍：
+//   - 只做本机控制，不做远程钱包服务。默认绑定 127.0.0.1，且没有任何鉴权，
+//     因此绝不可绑定到公网地址（需要远程访问时应加 TLS + 认证，属本阶段范围外）。
+//   - 本包不依赖 blockchain / mempool / utxo——它只声明一个 Node 接口，
+//     由 cmd/node 侧的节点服务实现（消费方定义接口）。这样协议与业务状态解耦，
+//     本包可以用假实现独立测试。
+package control
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// ErrAddressRequired 请求缺少 address 参数。
+var ErrAddressRequired = errors.New("缺少 address 参数")
+
+// Node 是控制接口所需的节点能力（由节点服务实现）。
+type Node interface {
+	// Status 返回节点运行状态。
+	Status() (StatusInfo, error)
+	// Balance 按地址查询余额（spendable 排除未成熟 coinbase）。
+	Balance(address string) (BalanceInfo, error)
+	// UTXOs 列出某地址当前未花费输出。
+	UTXOs(address string) ([]UTXOInfo, error)
+	// Send 用节点钱包构造、签名并广播一笔支付交易，返回交易 ID。
+	Send(to string, amount, fee uint64) (SendResponse, error)
+	// BlockHex 按高度返回区块的规范编码（十六进制）。
+	BlockHex(height int) (string, error)
+	// Mine 按需立即挖出 count 个区块（测试网/开发用，对标 bitcoind 的 generatetoaddress）。
+	// 若节点正在持续挖矿（-mine）则返回错误，避免两个挖矿路径互相干扰。
+	Mine(count int) (MineResponse, error)
+}
+
+// StatusInfo 节点状态。
+type StatusInfo struct {
+	Height      int      `json:"height"`
+	TipHash     string   `json:"tip_hash"`
+	Peers       []string `json:"peers"`
+	MempoolSize int      `json:"mempool_size"`
+	Mining      bool     `json:"mining"`
+	Address     string   `json:"address"` // 节点钱包地址
+}
+
+// BalanceInfo 地址余额。
+type BalanceInfo struct {
+	Address   string `json:"address"`
+	Spendable uint64 `json:"spendable"` // 可花费（已成熟）
+	Total     uint64 `json:"total"`     // 含未成熟 coinbase
+	UTXOCount int    `json:"utxo_count"`
+	Height    int    `json:"height"`
+}
+
+// UTXOInfo 单个未花费输出。
+type UTXOInfo struct {
+	OutPoint   string `json:"outpoint"` // txid:index
+	Value      uint64 `json:"value"`
+	Height     int    `json:"height"`
+	IsCoinbase bool   `json:"is_coinbase"`
+	Mature     bool   `json:"mature"`
+}
+
+// SendRequest 转账请求。
+type SendRequest struct {
+	To     string `json:"to"`
+	Amount uint64 `json:"amount"`
+	Fee    uint64 `json:"fee"`
+}
+
+// SendResponse 转账结果。
+type SendResponse struct {
+	TxID     string `json:"txid"`
+	Fee      uint64 `json:"fee"`
+	Amount   uint64 `json:"amount"`
+	To       string `json:"to"`
+	InputNum int    `json:"input_num"`
+}
+
+// MineRequest 按需出块请求。
+type MineRequest struct {
+	Count int `json:"count"`
+}
+
+// MineResponse 按需出块结果。
+type MineResponse struct {
+	Mined  int `json:"mined"`
+	Height int `json:"height"`
+}
+
+// errorResponse 统一错误体。
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+// Server 控制接口服务端。
+type Server struct {
+	node Node
+	http *http.Server
+	ln   net.Listener
+	mu   sync.Mutex
+}
+
+// NewServer 创建服务端。
+func NewServer(node Node) *Server { return &Server{node: node} }
+
+// Handler 返回路由（便于测试直接挂到 httptest）。
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/balance", s.handleBalance)
+	mux.HandleFunc("/utxos", s.handleUTXOs)
+	mux.HandleFunc("/send", s.handleSend)
+	mux.HandleFunc("/mine", s.handleMine)
+	mux.HandleFunc("/block", s.handleBlock)
+	return mux
+}
+
+// Start 在 addr 上启动服务，返回实际监听地址（addr 端口为 0 时由系统分配）。
+func (s *Server) Start(addr string) (string, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", fmt.Errorf("控制接口监听失败: %w", err)
+	}
+	s.mu.Lock()
+	s.ln = ln
+	s.http = &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+	}
+	s.mu.Unlock()
+
+	go func() { _ = s.http.Serve(ln) }()
+	return ln.Addr().String(), nil
+}
+
+// Addr 返回实际监听地址（Start 之前为空）。
+func (s *Server) Addr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return ""
+	}
+	return s.ln.Addr().String()
+}
+
+// Stop 关闭控制接口。
+func (s *Server) Stop() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.http == nil {
+		return nil
+	}
+	err := s.http.Close()
+	s.http = nil
+	s.ln = nil
+	return err
+}
+
+// ---- 处理函数 ----
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	info, err := s.node.Status()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	addr := r.URL.Query().Get("address")
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, ErrAddressRequired)
+		return
+	}
+	info, err := s.node.Balance(addr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) handleUTXOs(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	addr := r.URL.Query().Get("address")
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, ErrAddressRequired)
+		return
+	}
+	list, err := s.node.UTXOs(addr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if list == nil {
+		list = []UTXOInfo{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req SendRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败: %w", err))
+		return
+	}
+	resp, err := s.node.Send(req.To, req.Amount, req.Fee)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	raw := r.URL.Query().Get("height")
+	height, err := strconv.Atoi(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("height 参数非法: %q", raw))
+		return
+	}
+	encoded, err := s.node.BlockHex(height)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"height": height, "encoded": encoded})
+}
+
+func (s *Server) handleMine(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	// 请求体可省略：默认挖 1 个区块
+	req := MineRequest{Count: 1}
+	if r.Body != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败: %w", err))
+			return
+		}
+	}
+	if req.Count <= 0 || req.Count > MaxMineCount {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("count 必须在 1..%d 之间，实际 %d", MaxMineCount, req.Count))
+		return
+	}
+	resp, err := s.node.Mine(req.Count)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// MaxMineCount 单次按需出块的上限，避免一次请求长时间占用节点。
+const MaxMineCount = 1000
+
+// requireMethod 校验请求方法；不符时写 405 并返回 false。
+func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method != method {
+		w.Header().Set("Allow", method)
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("仅支持 %s", method))
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, code int, err error) {
+	writeJSON(w, code, errorResponse{Error: err.Error()})
+}

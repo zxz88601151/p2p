@@ -22,15 +22,15 @@ import (
 )
 
 var (
-	ErrInvalidPrevHash   = errors.New("区块的前置哈希与当前链尾不匹配")
-	ErrInvalidPoW        = errors.New("区块哈希未达到难度目标，工作量证明无效")
-	ErrEmptyChain        = errors.New("链为空")
-	ErrUnknownHeight     = errors.New("请求的区块高度不存在")
-	ErrUnexpectedBits    = errors.New("区块难度位与当前共识难度不一致")
+	ErrInvalidPrevHash     = errors.New("区块的前置哈希与当前链尾不匹配")
+	ErrInvalidPoW          = errors.New("区块哈希未达到难度目标，工作量证明无效")
+	ErrEmptyChain          = errors.New("链为空")
+	ErrUnknownHeight       = errors.New("请求的区块高度不存在")
+	ErrUnexpectedBits      = errors.New("区块难度位与当前共识难度不一致")
 	ErrTimestampOutOfRange = errors.New("区块时间戳超出允许范围")
-	ErrMerkleMismatch    = errors.New("区块头 Merkle 根与交易列表不匹配")
-	ErrBlockTooLarge     = errors.New("区块超过最大体积限制")
-	ErrBadTxLayout       = errors.New("区块交易布局非法（coinbase 位置/数量）")
+	ErrMerkleMismatch      = errors.New("区块头 Merkle 根与交易列表不匹配")
+	ErrBlockTooLarge       = errors.New("区块超过最大体积限制")
+	ErrBadTxLayout         = errors.New("区块交易布局非法（coinbase 位置/数量）")
 )
 
 const (

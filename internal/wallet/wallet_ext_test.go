@@ -3,8 +3,8 @@ package wallet_test
 import (
 	"crypto/sha256"
 	"os"
-	"runtime"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"p2pchain/internal/wallet"

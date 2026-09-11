@@ -1,8 +1,8 @@
 package storage
 
 import (
-	"errors"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +15,9 @@ import (
 // ErrCorruptStore 表示数据文件损坏（截断或解码失败）。
 var ErrCorruptStore = errors.New("区块数据文件损坏")
 
+// ErrReadOnlyStore 以只读方式打开的存储上执行了写操作。
+var ErrReadOnlyStore = errors.New("存储以只读方式打开，不允许写入")
+
 // FileBlockStore 基于单一追加文件（blocks.dat）的区块存储。
 //
 // 文件格式：连续的记录，每条 = 4 字节小端长度 + 区块规范编码（block.Encode）。
@@ -23,15 +26,16 @@ var ErrCorruptStore = errors.New("区块数据文件损坏")
 //
 // 并发：所有公开方法受互斥保护。写入为追加语义，天然满足「只增不改」的链特性。
 type FileBlockStore struct {
-	mu      sync.RWMutex
-	dir     string
-	path    string
-	file    *os.File
+	mu       sync.RWMutex
+	dir      string
+	path     string
+	file     *os.File
+	readOnly bool
 	byHeight []*block.Block
-	byHash  map[[32]byte]int // 哈希 → 高度
+	byHash   map[[32]byte]int // 哈希 → 高度
 }
 
-// OpenFileBlockStore 打开（或创建）目录下的区块存储，并重建索引。
+// OpenFileBlockStore 打开（或创建）目录下的区块存储，并重建索引（可写）。
 func OpenFileBlockStore(dir string) (*FileBlockStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
@@ -52,6 +56,25 @@ func OpenFileBlockStore(dir string) (*FileBlockStore, error) {
 		return nil, fmt.Errorf("打开区块数据文件失败: %w", err)
 	}
 	s.file = f
+	return s, nil
+}
+
+// OpenFileBlockStoreReadOnly 只读打开已有区块存储（不创建文件，不持有写句柄）。
+// 供离线命令（如 printchain）在节点运行期间安全读取链数据。
+func OpenFileBlockStoreReadOnly(dir string) (*FileBlockStore, error) {
+	path := filepath.Join(dir, "blocks.dat")
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("区块数据文件不存在（%s）: %w", path, err)
+	}
+	s := &FileBlockStore{
+		dir:      dir,
+		path:     path,
+		readOnly: true,
+		byHash:   make(map[[32]byte]int),
+	}
+	if err := s.loadIndex(); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -97,6 +120,10 @@ func (s *FileBlockStore) loadIndex() error {
 func (s *FileBlockStore) SaveBlock(b *block.Block) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.file == nil {
+		return ErrReadOnlyStore
+	}
 
 	expected := len(s.byHeight)
 	if b.Header.PrevBlockHash != ([32]byte{}) && expected > 0 {

@@ -19,7 +19,7 @@ import (
 
 // Header 区块头，挖矿时反复哈希的就是这部分内容序列化后的字节。
 type Header struct {
-	Version       uint32 // 协议版本号，用于未来升级共识规则
+	Version       uint32   // 协议版本号，用于未来升级共识规则
 	PrevBlockHash [32]byte // 前一个区块头的哈希，构成链式结构
 	MerkleRoot    [32]byte // 本区块所有交易的 Merkle 根
 	Timestamp     int64    // 出块时间（Unix 秒）

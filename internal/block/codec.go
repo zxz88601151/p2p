@@ -111,9 +111,6 @@ func decodeTx(r *bytes.Reader) (*transaction.Transaction, error) {
 
 // ---- 基础读写 ----
 
-
-
-
 func readU32(r *bytes.Reader) (uint32, error) {
 	var v uint32
 	if err := binary.Read(r, binary.LittleEndian, &v); err != nil {
@@ -121,5 +118,3 @@ func readU32(r *bytes.Reader) (uint32, error) {
 	}
 	return v, nil
 }
-
-

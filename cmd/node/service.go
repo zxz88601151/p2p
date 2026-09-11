@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/blockchain"
@@ -45,6 +46,14 @@ type nodeService struct {
 	// tipChanged 为容量 1 的信号通道：链尾变化时通知挖矿循环放弃当前候选区块。
 	// 用缓冲通道 + 非阻塞发送实现「合并多次通知为一次唤醒」。
 	tipChanged chan struct{}
+
+	// mining 表示本节点是否正在挖矿（供 /status 查询）。原子读写即可，
+	// 避免为一次状态展示引入锁竞争。
+	mining atomic.Bool
+
+	// mineMu 串行化所有挖矿入口（持续挖矿循环与按需出块），
+	// 保证任一时刻只有一个候选区块在被求解。
+	mineMu sync.Mutex
 }
 
 func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *wallet.Wallet) *nodeService {
@@ -61,6 +70,14 @@ func (s *nodeService) notifyTipChanged() {
 	select {
 	case s.tipChanged <- struct{}{}:
 	default: // 已有未消费的通知，无需重复投递
+	}
+}
+
+// drainTipChanged 丢弃尚未消费的链尾变化通知（开始新一轮挖矿前调用）。
+func drainTipChanged(s *nodeService) {
+	select {
+	case <-s.tipChanged:
+	default:
 	}
 }
 
