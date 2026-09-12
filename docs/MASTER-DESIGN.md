@@ -5,8 +5,11 @@
 > 纪律：每阶段 = 实现 + 测试 + `go build/vet/test ./...` 全绿 + 独立 commit（packed-refs 加固）。
 > 全程保持定位：学习型 PoW 区块链骨架；标准库零依赖；禁止引入区块链以外的功能。
 >
-> **状态（2026-09-12，HEAD 6c0ced8）：PHASE 1B–7、PHASE 2.1 全部完成；PHASE FINAL 收口完成 → `PROJECT STATUS = COMPLETE`。**
-> 全量验收证据与未决项分级见 **`docs/PROJECT-COMPLETION-REPORT.md`**（当前权威交付文档）；
+> **状态（2026-09-12，HEAD 7926ed5）：PHASE 1B–7、PHASE 2.1 全部完成；PHASE FINAL 收口完成；PHASE BRAND-0D.3-COMMIT 基线冻结完成 → `PROJECT STATUS = COMPLETE`。**
+> **基线冻结提交**：`7926ed5 feat(console): 冻结 P2PChain Developer Console 产品基线（PHASE BRAND-0D.3-COMMIT）`（32 文件，parent `6c0ced8`）。
+> 本环境 git ref 加固：`.git/packed-refs` 已同步指向 `7926ed5`（防 loose ref 丢失后回退）。
+> P3.1（锁生命周期）并行工作**未纳入**该提交，仍保留在工作区。
+> 全量验收证据与未决项分级见 **`docs/PROJECT-COMPLETION-REPORT.md`**（当前权威交付文档）；本阶段审计见 `docs/PHASE-BRAND-0D.3-COMMIT-AUDIT.md`；
 > 各阶段实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`；PHASE 2.1 执行证据见 `docs/PHASE-P2.1-EXECUTION-REPORT.md`；
 > 文档分级与命名错位对照见 `docs/README.md`。
 

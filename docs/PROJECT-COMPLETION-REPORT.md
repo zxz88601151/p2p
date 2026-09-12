@@ -299,14 +299,32 @@ python check_console.py                                            # ✅ RESULT 
 
 ## 12. 版本控制状态
 
-| 项 | 值 |
+> **以下为「收口阶段」的时点快照；其后 `PHASE BRAND-0D.3-COMMIT` 已完成基线冻结提交（见本节末）。**
+
+| 项 | 值（收口阶段时点） |
 |---|---|
 | 分支 | `main` |
 | HEAD | `6c0ced873b11569021ac2efded78d8d82596bd04` |
 | 暂存区 | 空 |
-| 本轮 Git **写**操作 | **0**（无 `add` / `commit` / `push` / `tag` / `merge`） |
+| 收口阶段 Git **写**操作 | **0**（无 `add` / `commit` / `push` / `tag` / `merge`） |
 
-> 本轮的代码与文档改动均**留在工作区**，交由中哥决定提交时机与粒度。历史提交纪律（每阶段独立 `commit` + packed-refs 加固）见 `MASTER-DESIGN.md`。
+> 收口阶段不改动版本历史，改动全部留在工作区。历史提交纪律（每阶段独立 `commit` + packed-refs 加固）见 `MASTER-DESIGN.md`。
+
+### 12.1 基线冻结提交（PHASE BRAND-0D.3-COMMIT）
+
+| 项 | 值 |
+|---|---|
+| Commit | **`7926ed569d15eccff871d41677de9b97bb45c9d4`** |
+| 信息 | `feat(console): 冻结 P2PChain Developer Console 产品基线（PHASE BRAND-0D.3-COMMIT）` |
+| Parent | `6c0ced8`（线性历史，非 root commit） |
+| 规模 | 32 files changed, **8917 insertions(+), 38 deletions(-)** |
+| 组成 | 13 修改 + 19 新增（Console 实现/测试/页面 6 + 文档 13） |
+| 排除（未纳入） | `datalock.go`、`datalock_p3_test.go`、`lock_lifecycle_test.go`、`RUN-AUDIT-2026-09-12.md`、`design/stale-lock-options.md`（P3.1 并行工作） |
+| ref 加固 | `.git/packed-refs` 同步指向 `7926ed5`（防 loose ref 丢失回退） |
+| POST-COMMIT 验证 | 在**提交树**（`git archive HEAD`）上独立复跑：build/vet exit 0；`go test ./...` 12/12 ok；`-race` 12/12 ok / 0 竞态；`smoke-e2e.sh` 15/15 |
+
+> 详尽的提交前审计（逐文件分类、STOP 判定证据）与提交后验证见 **`docs/PHASE-BRAND-0D.3-COMMIT-AUDIT.md`**。
+> 已知同行项：`cmd/node/main.go` 与 `internal/control/server.go` 中的 P3.1 代码随该提交进入基线（因与 Console 改动同文件同 hunk、按文件不可切分），已在提交信息中显式声明。
 
 ---
 

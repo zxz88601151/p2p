@@ -393,11 +393,106 @@ bash scripts/smoke-e2e.sh
 §12 BUILD / VET ................... PASS
 §13 SMOKE E2E ..................... PASS（15/15，非空转重启证明）
 §14+ 规格 ......................... MISSING（正文止于 §13）
-§9  COMMIT ........................ BLOCKED（文件粒度不可切分，需裁决 → §12 方案 A/B）
+§9  COMMIT ........................ 审计时为 BLOCKED → 经中哥裁决采纳方案 A，已执行（见 §15）
 ```
 
-**FINAL DECISION = AUDIT PASS / COMMIT BLOCKED**（依 §0：STOP → REPORT → 不实施）
+**FINAL DECISION = AUDIT PASS / COMMIT EXECUTED（方案 A）** —— 见 §15–§16。
 
 ---
 
-**审计结束。**
+## 15. 提交执行（方案 A）
+
+**裁决**：中哥于本阶段选择 **方案 A —— 冻结整包基线**（接受 `main.go` / `server.go` 中的 P3.1 代码同行）。
+
+### 15.1 暂存（显式逐路径，未使用 `git add -A`）
+
+```
+staged_count = 32
+```
+
+| 排除项 | staged |
+|---|---|
+| `internal/storage/datalock.go` | **0** |
+| `internal/storage/datalock_p3_test.go` | **0** |
+| `cmd/node/lock_lifecycle_test.go` | **0** |
+| `docs/RUN-AUDIT-2026-09-12.md` | **0** |
+| `docs/design/stale-lock-options.md` | **0** |
+
+### 15.2 提交
+
+```
+[main 7926ed5] feat(console): 冻结 P2PChain Developer Console 产品基线（PHASE BRAND-0D.3-COMMIT）
+ 32 files changed, 8917 insertions(+), 38 deletions(-)
+```
+
+| 项 | 值 |
+|---|---|
+| Commit | `7926ed569d15eccff871d41677de9b97bb45c9d4` |
+| Parent | `6c0ced873b11569021ac2efded78d8d82596bd04`（= HEAD^，线性历史，**非 root commit**） |
+| 分支 | `main` |
+| 作者 | `p2pchain-baseline <baseline@p2pchain.local>`（既有本机配置，**未改动**） |
+| 新增文件（19） | `logring.go` `logring_test.go` `openurl.go` `console.go` `console_test.go` `logs.go` `web/console.html` + 12 个 docs |
+| 修改文件（13） | `README.md` `cli.go` `main.go` `nodeapi.go` `blockchain_test.go` `control/client.go` `control/server.go` `pow.go` `pow_test.go` `smoke-e2e.sh` + `FULL-IMPLEMENTATION-REPORT.md` `MASTER-DESIGN.md` `PHASE-P2.1-EXECUTION-REPORT.md` |
+
+### 15.3 ref 加固（本环境已知风险）
+
+本环境存在 **git ref 写入被外部机制回退** 的已知问题（loose ref 消失时会回退到 `packed-refs`）。
+提交后核验发现 `packed-refs` 仍指向旧 SHA，遂按既定加固规程直接从 reflog 纯文本取 40 位 SHA 重写：
+
+```
+# pack-refs with: peeled fully-peeled sorted
+7926ed569d15eccff871d41677de9b97bb45c9d4 refs/heads/main
+```
+
+（本仓库**无 remote**，故不写 `refs/remotes/origin/*` 行。）
+加固后复核：`git rev-parse HEAD` = `git rev-parse main` = `7926ed5…` ✔
+
+### 15.4 提交后工作区
+
+`git status --short` 恰好剩余 **5 项排除项**（3 M + 2 ??，其中 `docs/design/` 为目录）：
+
+```
+ M docs/RUN-AUDIT-2026-09-12.md
+ M internal/storage/datalock.go
+?? cmd/node/lock_lifecycle_test.go
+?? docs/design/
+?? internal/storage/datalock_p3_test.go
+```
+
+⇒ 提交**精确捕获了意图集合**，P3.1 并行工作完好保留在工作区，未被触碰。
+
+---
+
+## 16. POST-COMMIT 验证（在**提交树**上执行，非工作区）
+
+**为什么必须单独验证提交树**：`internal/storage/datalock.go` 的工作区改动**未**进入提交，
+因此「已提交的树」≠「我此前测试的工作区」。若只复跑工作区，无法证明提交树本身可编译。
+故用只读的 `git archive HEAD` 导出到临时目录后独立验证：
+
+```bash
+git archive HEAD | tar -x -C "$TEMP/headcheck-7926ed5"     # 81 个文件
+```
+
+| 检查 | 提交树结果 |
+|---|---|
+| 提交树是否含被排除文件 | `datalock_p3_test.go` **NO**、`lock_lifecycle_test.go` **NO**、`design/stale-lock-options.md` **NO** ✔ |
+| `docs/RUN-AUDIT-2026-09-12.md` | **存在** —— 正确：它是既有跟踪文件，本提交只是**未纳入其修改**（保留 HEAD^ 旧版），非删除 ✔ |
+| `datalock.go` 是否与 HEAD^ 同版 | sha256 完全相同（`0283dea3…`）⇒ P3.1 对其改动**未进入提交** ✔ |
+| `go build ./...` | **exit 0** |
+| `go vet ./...` | **exit 0** |
+| `go test -count=1 ./...` | **12/12 包 ok，exit 0** |
+| `go test -count=1 -race ./...` | **12/12 包 ok，0 竞态，exit 0** |
+| `bash scripts/smoke-e2e.sh` | **15/15 PASS，exit 0**（旧原生 pid 1364 已终止 → 新 pid 19388 抢锁） |
+
+### 16.1 方案 A 的两项已知后果（诚实披露）
+
+1. **提交树携带 P3.1 代码**：`cmd/node/main.go`（`initDone` + 最外层 defer 释放兜底、
+   `DATADIR_LOCKED` 引导文案、`os.Interrupt`、`testPanicAtStart`、最外层 `defer rt.Close()`）
+   与 `internal/control/server.go`（`Start()` 的 nil-deref 修复）随本提交进入基线。
+2. **`testPanicAtStart` 在提交树中是「无消费者的钩子」**：其唯一使用者 `lock_lifecycle_test.go`
+   被排除，故基线中该变量仅被定义、不被使用（Go 允许，`go vet` 通过）。
+   P3.1 工作流收口后提交其测试时，该钩子即获得消费者。**不建议**为此改动生产代码。
+
+---
+
+**审计与提交结束。**
