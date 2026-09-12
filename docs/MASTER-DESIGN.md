@@ -5,17 +5,17 @@
 > 纪律：每阶段 = 实现 + 测试 + `go build/vet/test ./...` 全绿 + 独立 commit（packed-refs 加固）。
 > 全程保持定位：学习型 PoW 区块链骨架；标准库零依赖；禁止引入区块链以外的功能。
 >
-> **状态（2026-09-12，HEAD 7926ed5）：PHASE 1B–7、PHASE 2.1 全部完成；PHASE FINAL 收口完成；PHASE BRAND-0D.3-COMMIT 基线冻结完成 → `PROJECT STATUS = COMPLETE`。**
+> **状态（2026-09-12，HEAD 535edb7（P3.1 CLOSED 叠加于既有 7926ed5 基线之上）：PHASE 1B–7、PHASE 2.1 全部完成；PHASE FINAL 收口完成；PHASE BRAND-0D.3-COMMIT 基线冻结完成 → `PROJECT STATUS = COMPLETE`。**
 > **基线冻结提交**：`7926ed5 feat(console): 冻结 P2PChain Developer Console 产品基线（PHASE BRAND-0D.3-COMMIT）`（32 文件，parent `6c0ced8`）。
-> 本环境 git ref 加固：`.git/packed-refs` 已同步指向 `7926ed5`（防 loose ref 丢失后回退）。
-> P3.1（锁生命周期）并行工作**未纳入**该提交，仍保留在工作区。
+> 当前 main HEAD = 535edb7（P3.1 CLOSED 后叠加于既有 7926ed5 基线之上）。
+> P3.1（Data Lock Lifecycle）已于 535edb7 CLOSED 并完成独立提交。
 > 全量验收证据与未决项分级见 **`docs/PROJECT-COMPLETION-REPORT.md`**（当前权威交付文档）；本阶段审计见 `docs/PHASE-BRAND-0D.3-COMMIT-AUDIT.md`；
 > 各阶段实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`；PHASE 2.1 执行证据见 `docs/PHASE-P2.1-EXECUTION-REPORT.md`；
 > 文档分级与命名错位对照见 `docs/README.md`。
 
 ---
 
-## 现状（HEAD 0d69b30）
+## 历史现状快照（HEAD 0d69b30，早期）
 
 - 已有：block（头/双 SHA256/Merkle 单 SHA256）、pow（含 0.1 修复）、transaction（UTXO 模型）、wallet（P-256 签名/验签）、blockchain（仅 PrevHash+PoW 校验）、p2p（换行分隔 JSON、哈希广播桩）、storage（接口 + 内存实现，未接入）、config、cmd/node（单文件骨架）。
 - 已知缺口：无 UTXO 状态、无交易校验、无签名接入、无 Coinbase 校验、无 Merkle 重验、无持久化接入、无 mempool、P2P 不传播真实数据、无地址格式、无交易构建、无 CLI。
@@ -119,7 +119,7 @@
 - **F-1（P2，按设计关闭）：难度钳制意图显式化。** 新增具名常量 `pow.MaxDifficultyBits = MaxTargetBits`（**零行为变更**），把「难度上限 = 初始最低难度」从隐含语义变成显式设计；补 `pow` 3 个单元测试（含对 `bits ∈ [1, MaxDifficultyBits]` × 11 种跨度穷举、单调性）与 `blockchain` 1 个**链级 runtime** 测试（`expectedNextBits` 独立重算 + 高度 20/40 逐点核对 + 40 块逐高度断言）。实测两条钳制路径：确定性创世 → 下限路径；现挖创世 → 上限路径，均钉在 16。
 - **产品面诚实化。** README 共识参数表加「难度上限 / 难度动态范围」两行与「难度为何不浮动」小节；控制台披露卡加「难度语义」段与 `Difficulty` tooltip；新增 `TestConsoleHasNoMarkdownLeak` 防回归；新增 `docs/README.md` 文档索引。
 - **验收**：`go build` / `go vet` 通过；`go test -count=1 ./...` 与 `-race` 各 **12/12 包 ok、0 FAIL、0 竞态**（159 个顶层用例 + 1 个条件 SKIP）；`smoke-e2e.sh` **15/15**；控制台真实浏览器 **109/109**；静态完整性 `RESULT = PASS`。
-- **边界**：未引入任何区块链以外的功能；未触碰并行工作流的 `internal/storage/datalock.go`、`cmd/node/lock_lifecycle_test.go`、`docs/RUN-AUDIT-2026-09-12.md`；`gofmt` 对 `cmd/node/main.go`、`cmd/node/lock_lifecycle_test.go` 报的 2 处差异经核实为纯对齐空白（属并行工作流，不动）。
+- **边界**：未引入任何区块链以外的功能；P3.1（535edb7）已扩展 `internal/storage/datalock.go` 的 PID ownership / Release lifecycle，并新增 `cmd/node/lock_lifecycle_test.go`；`docs/RUN-AUDIT-2026-09-12.md` 亦由 P3.1 更新；`gofmt` 对 `cmd/node/main.go`、`cmd/node/lock_lifecycle_test.go` 报的 2 处差异经核实为纯对齐空白（属并行工作流，不动）。
 
 ## 明确不做（超出学习项目边界）
 - 分叉/reorg 树状链（保留 TODO 与最长链原则说明，当前单链追加）；RIPEMD160/secp256k1（stdlib 限制，注释说明升级路径）；SPV/轻节点；TLS/加密传输；代币经济。
