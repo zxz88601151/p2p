@@ -3,7 +3,7 @@
 > 性质：**FINAL BASELINE COMMIT / COMPLETION FREEZE / AUDIT**。
 > 本阶段**不开发任何新功能**，仅把已完成并通过「真实节点 + 真实浏览器」验证的 P2PChain Developer Console 固化为可信 Git baseline，并完成最终项目状态记录。
 > 执行依据：完整规格 §0–§31（本次会话提供的权威版本）。
-> 写入状态：**本文件为工作区新增，未提交**（理由见 §22 / §27：基线提交 `7926ed5` 已在先前授权会话建立；本文件为 §25 要求的最终阶段报告，单独提交需另行授权）。
+> 写入状态：**已提交**（commit `0c29b33`，中哥显式授权「仅提交 §25 最终报告」）。基线提交 `7926ed5` 已在先前授权会话建立；本文件为 §25 要求的最终阶段报告，按授权以独立文档提交。
 
 ---
 
@@ -220,7 +220,7 @@ CLI(`node status`) = API(`/status`) = UI(`console.html`) 三方在 height=5 逐�
 
 本判定不代表 P2PChain 永久停止开发，仅代表**当前 Developer Console 产品范围已完成并形成可信工程基线**。任何未来能力（如 `PHASE CONSENSUS-DIFFICULTY-*`、`PHASE DEVELOPER-CONSOLE-*`、`PHASE NETWORK-*`、`PHASE NODE-*`）必须由新的明确授权启动。本阶段严格遵守 §27：**无 push / tag / merge / rebase / amend / squash / 发布打包 / 部署**，仅建立 local trusted baseline。
 
-> 提交边界说明：基线提交 `7926ed5`（满足 §22「ONE baseline commit」）已在先前授权会话建立；本文件为 §25 要求的最终阶段报告，按 §22/§27 与既有 NO-COMMIT 姿态**未提交**。若需将本报告与 FRESH-VERIFICATION 补充报告纳入版本库，需中哥另行授权一个独立的文档提交（不在本阶段自动执行）。
+> 提交边界说明：基线提交 `7926ed5`（满足 §22「ONE baseline commit」）已在先前授权会话建立；本文件为 §25 要求的最终阶段报告，经中哥显式授权「仅提交 §25 最终报告」已作为独立文档提交 `0c29b33`（仅本文件，未触碰任何 P3.1 排除项，也未提交 FRESH-VERIFICATION 补充报告）。
 
 ---
 
