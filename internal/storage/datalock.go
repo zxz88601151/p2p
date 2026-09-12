@@ -3,8 +3,11 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -65,8 +68,14 @@ func AcquireDirLock(dir string) (*DirLock, error) {
 
 // Release 释放数据目录锁（关闭并删除 node.lock）。
 //
-// 必须仅由成功持有该锁的进程调用——本阶段不实现 stale-lock 自动恢复，异常退出残留的
-// lock 不会被静默删除。并发调用安全。
+// 幂等：重复调用不会报错，也不会误删他人重新获取的锁。
+//
+// PID 校验（§2.2 / §5）：删除前先校验 node.lock 内容记录的 pid 是否等于本进程 pid，
+// 仅当匹配时才删除；不匹配（说明本进程崩溃后该同名锁已被另一个进程重新持有）则静默跳过，
+// 绝不误删他人的锁。读取或解析失败时保守跳过删除——绝不删除无法确认归属的锁。
+//
+// 必须仅由成功持有该锁的进程调用。本阶段不实现 stale-lock 自动恢复，异常退出残留的
+// lock 不会被静默删除；此处的 pid 校验是防御手段，不得被用作「检测后自动删除」的通道。
 func (l *DirLock) Release() error {
 	if l == nil {
 		return nil
@@ -76,15 +85,52 @@ func (l *DirLock) Release() error {
 	if l.f == nil { // 已释放（或从未持有）
 		return nil
 	}
-	var firstErr error
-	if err := l.f.Close(); err != nil {
-		firstErr = err
-	}
-	if err := os.Remove(l.path); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	// 先关闭文件句柄：Windows 下以 O_WRONLY 独占打开的文件在句柄未关闭时无法被读取。
+	_ = l.f.Close()
 	l.f = nil
-	return firstErr
+
+	if !ownsLockFile(l.path) {
+		// 锁内容 pid 不匹配本进程（或无法解析）——这是「他人/Crash 残留」信号，跳过删除。
+		log.Printf("[datalock] node.lock 的 pid 不匹配本进程或无法解析，跳过删除（不误删他人锁）: %s", l.path)
+		return nil
+	}
+	if err := os.Remove(l.path); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ownsLockFile 判断 path 处的 node.lock 是否由本进程持有（内容记录的 pid == 本进程 pid）。
+// 文件不存在 / 无法读取 / 内容无法解析 pid 时均返回 false（保守：不确认归属就不删）。
+func ownsLockFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	pid, err := parseLockPID(data)
+	if err != nil {
+		return false
+	}
+	return pid == os.Getpid()
+}
+
+// parseLockPID 从 node.lock 内容（形如 "pid=N\nstarted_at=...\n"）解析 pid 字段。
+// 缺少 pid= 前缀、首行非整数、空内容均视为解析失败。
+func parseLockPID(data []byte) (int, error) {
+	s := string(data)
+	if !strings.HasPrefix(s, "pid=") {
+		return 0, fmt.Errorf("lock 内容缺少 pid= 前缀")
+	}
+	rest := s[len("pid="):]
+	line := rest
+	if i := strings.IndexByte(rest, '\n'); i >= 0 {
+		line = rest[:i]
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return 0, fmt.Errorf("lock 内容 pid 字段为空")
+	}
+	return strconv.Atoi(line)
 }
 
 // Path 返回锁文件路径（诊断/日志用）。
