@@ -22,7 +22,7 @@ B_RPC=127.0.0.1:16691
 
 PASS=0
 FAIL=0
-NODE_A_PID=""
+NODE_A_PID=""   # 原生 PID（取自 node.lock，非 bash $!）
 NODE_B_PID=""
 
 log()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -35,21 +35,51 @@ expect_contains() { # <描述> <期望子串> <实际文本>
   fi
 }
 
-# force_kill 在 Windows 上可靠终止原生 Go 进程：Git Bash 的 kill 对原生 .exe 发的是
-# 非可捕获信号，进程不会真正退出；taskkill /F 调用 TerminateProcess 才是真杀。
-force_kill() {
-  [ -z "$1" ] && return 0
+# 终止进程的正确姿势（Windows / Git Bash）：
+#   1. Git Bash 的 kill 对原生 .exe 发的是非可捕获信号，进程不会真退出；
+#      taskkill /F 调 TerminateProcess 才是真杀。
+#   2. **绝不能用 bash 的 $! 当 PID**：MSYS/Git Bash 下 $! 是 MSYS 伪 PID，
+#      taskkill /F /PID <$!> 会报「没有找到进程」，进程照样活着——这会让
+#      「重启后仍能查到余额」这类断言变成**空转**（答的是没被杀掉的旧进程）。
+#      节点把自身**原生 Windows PID** 写进 <datadir>/node.lock（`pid=NNNN`），
+#      这是唯一权威来源，必须从那里取。
+native_pid() { # <datadir> -> 打印原生 PID（无则空）
+  sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$1/node.lock" 2>/dev/null | tr -d '\r'
+}
+
+force_kill() { # <原生 pid>
+  [ -z "${1:-}" ] && return 0
   if command -v taskkill >/dev/null 2>&1; then
-    taskkill /F /PID "$1" >/dev/null 2>&1 || true
+    MSYS_NO_PATHCONV=1 taskkill /F /PID "$1" >/dev/null 2>&1 || true
   else
     kill -9 "$1" 2>/dev/null || true
   fi
+}
+
+# 删除残留锁：仅用于本脚本独占的临时工作目录。
+# taskkill /F 是 TerminateProcess，不会触发节点自身的优雅关闭，故锁不会自动释放，
+# 必须显式清理（等价于「进程优雅退出后的释放」）。用 POSIX 规范化路径：
+# mktemp -d 在 Git Bash 下可能返回含反斜杠的 Windows 路径，直接拼给 rm 会被环境的
+# 安全删除垫片误判为非法路径而 fail-closed，导致删除静默失败。
+unlock() { # <datadir>
+  local lk
+  lk="$(cygpath -u "$1/node.lock" 2>/dev/null || printf '%s' "$1/node.lock")"
+  rm -f "$lk" 2>/dev/null || true
 }
 
 cleanup() {
   force_kill "$NODE_A_PID"
   force_kill "$NODE_B_PID"
   return 0
+}
+
+# 轮询直到 RPC 不再响应（证明进程确实已终止，而非「断言答的是旧进程」）
+wait_rpc_down() { # <rpc地址>
+  for _ in $(seq 1 30); do
+    "$BIN" status -rpc "$1" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  return 1
 }
 trap cleanup EXIT
 
@@ -79,15 +109,15 @@ echo "  工作目录: $WORK"
 
 log "启动节点 A（P2P $A_P2P / RPC $A_RPC）"
 "$BIN" -datadir "$A_DIR" -listen "$A_P2P" -rpc "$A_RPC" >"$WORK/node-a.log" 2>&1 &
-NODE_A_PID=$!
 wait_rpc "$A_RPC" || { bad "节点 A 未就绪"; tail -20 "$WORK/node-a.log"; exit 1; }
-ok "节点 A 已就绪（pid=$NODE_A_PID）"
+NODE_A_PID=$(native_pid "$A_DIR")
+ok "节点 A 已就绪（原生 pid=${NODE_A_PID:-?}）"
 
 log "启动节点 B 并指定种子节点 A（P2P $B_P2P / RPC $B_RPC）"
 "$BIN" -datadir "$B_DIR" -listen "$B_P2P" -rpc "$B_RPC" -seed "$A_P2P" >"$WORK/node-b.log" 2>&1 &
-NODE_B_PID=$!
 wait_rpc "$B_RPC" || { bad "节点 B 未就绪"; tail -20 "$WORK/node-b.log"; exit 1; }
-ok "节点 B 已就绪（pid=$NODE_B_PID）"
+NODE_B_PID=$(native_pid "$B_DIR")
+ok "节点 B 已就绪（原生 pid=${NODE_B_PID:-?}）"
 
 log "两个节点应拥有相同创世区块"
 HASH_A=$("$BIN" status -rpc "$A_RPC" | awk '/^链尾哈希/{print $NF}')
@@ -143,15 +173,28 @@ CHAIN_OUT=$("$BIN" printchain -datadir "$A_DIR" -limit 1 -tx 2>&1)
 expect_contains "高度 12 区块包含该交易" "$TXID" "$CHAIN_OUT"
 
 log "重启节点 B，验证持久化（高度与余额保持不变）"
-force_kill "$NODE_B_PID"; sleep 1
+PID_B_BEFORE=$(native_pid "$B_DIR")
+force_kill "$PID_B_BEFORE"
+# 先证明旧进程真的死了，否则下面的「重启后仍有余额」只是在问旧进程，断言空转。
+if wait_rpc_down "$B_RPC"; then
+  ok "旧节点 B 已终止（原生 pid=${PID_B_BEFORE:-?}）"
+else
+  bad "旧节点 B 未被终止，重启持久化断言将无效"
+fi
 # Windows 信号模型说明：taskkill /F 对原生 Go 进程是 TerminateProcess（不可捕获），不会触发
 # 本节点的 SIGINT 优雅关闭，因此 node.lock 不会被进程自己释放；本工作目录为 mktemp 独占临时
 # 目录，此处显式清理锁等价于「进程优雅退出后的释放」——节点锁语义（Close 释放 / 占用拒绝 /
-# 内容不变）由 internal/storage 单元测试覆盖，不在此重复。
-rm -f "$B_DIR/node.lock"
+# 内容不变）由 internal/storage 与 cmd/node 单元测试覆盖，不在此重复。
+unlock "$B_DIR"
 "$BIN" -datadir "$B_DIR" -listen "$B_P2P" -rpc "$B_RPC" >"$WORK/node-b2.log" 2>&1 &
-NODE_B_PID=$!
 wait_rpc "$B_RPC" || bad "重启后节点 B 未就绪"
+NODE_B_PID=$(native_pid "$B_DIR")
+# 重启后必须是**新进程**重新抢到了锁：原生 PID 与旧值不同，才算真的重启过。
+if [ -n "$NODE_B_PID" ] && [ "$NODE_B_PID" != "$PID_B_BEFORE" ]; then
+  ok "重启后为新进程重新获取锁（原生 pid=$NODE_B_PID ≠ $PID_B_BEFORE）"
+else
+  bad "重启后原生 pid 未变化（$NODE_B_PID），重启断言可能空转"
+fi
 BAL_B2=$("$BIN" balance -rpc "$B_RPC" -address "$ADDR_B")
 RECV_B2=$(printf '%s' "$BAL_B2" | awk '/^可花费余额/{print $NF}')
 if [ "$RECV_B2" = "10" ]; then ok "重启后余额仍为 10"; else bad "重启后余额 = $RECV_B2, want 10"; fi

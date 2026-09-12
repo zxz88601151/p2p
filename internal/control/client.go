@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -37,6 +38,21 @@ func (c *Client) Status() (*StatusInfo, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// Logs 查询节点最近的运行日志（tail 为最大行数，<=0 时使用服务端默认值）。
+//
+// 日志来源在节点侧属于可选能力：未接入时返回空切片，而不是错误。
+func (c *Client) Logs(tail int) ([]LogEntry, error) {
+	var out []LogEntry
+	var q map[string]string
+	if tail > 0 {
+		q = map[string]string{"tail": strconv.Itoa(tail)}
+	}
+	if err := c.get("/logs", q, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Balance 查询地址余额。

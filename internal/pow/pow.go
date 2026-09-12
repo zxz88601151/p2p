@@ -33,6 +33,23 @@ const (
 	// DifficultyAdjustmentInterval 每隔多少个区块重新计算一次难度。
 	// 比特币是 2016，个人项目初期建议设置得小一些（如 20~50）以便更快看到难度变化效果。
 	DifficultyAdjustmentInterval = 20
+
+	// MaxDifficultyBits 是本链难度（bits）的上限，等价于 MaxTargetBits —— 即「难度上限 = 初始最低难度」。
+	//
+	// 这是一项**有意的测试网设计**，不是遗留缺陷：本链以 CPU 毫秒级出块为目标
+	// （见 MaxTargetBits 注释），实际出块间隔远小于 TargetBlockTimeSeconds。若允许难度
+	// 按公式自由上升，每个周期会 +2 bits（如 16→18→20…），约 200 块后单块需枚举 2^36 次哈希，
+	// 单块耗时从毫秒级升到小时级，学习/回归价值随之消失。
+	//
+	// 因此 AdjustBits 的输出被钳制在 [1, MaxDifficultyBits]；又因本链起点即为 MaxTargetBits，
+	// 链上可达的 bits 被**固定**在 MaxDifficultyBits。效果与测试网预期一致：
+	// 难度不浮动，但「实际用时 vs 期望用时 → 更难/更易」的推导过程完整保留、可单测验证。
+	//
+	// 若将来需要难度真正浮动，必须重设 clamp 带宽（并把 MaxDifficultyBits 抬到预期上限），
+	// 这属于**独立的共识参数阶段**——因为难度是共识真值，改动会致老节点拒绝新区块。
+	// 详见 docs/PHASE-0.1-GATE-A-R-POW-DIFFICULTY-REMEDIATION-REPORT.md §17 与
+	// docs/PROJECT-COMPLETION-REPORT.md 的「难度语义」一节。
+	MaxDifficultyBits = MaxTargetBits
 )
 
 // BitsToTarget 将压缩格式的难度（Bits）还原为大整数目标值。
@@ -212,6 +229,14 @@ func isCancelled(cancel <-chan struct{}) bool {
 //   - 若实际用时比期望用时长（矿工太少/算力下降），降低难度（减小 bits）
 //
 // 为避免难度剧烈波动，比特币将单次调整幅度限制在 4 倍以内，这里同样做了限制。
+//
+// 输出随后经过两层**有意的**钳制（见 MaxDifficultyBits 的说明）：
+//   - 难度下限：target 不得超过 T(MaxTargetBits)，即 bits 不得小于 MaxTargetBits；
+//   - 难度上限：bits 不得超过 MaxDifficultyBits（本链 == MaxTargetBits，故难度固定）。
+//
+// 注意：方向推导（newTarget ∝ actualTimespan）在钳制前在数学上是正确且无分支的，
+// 钳制只压缩「链上可达的动态范围」，不改变推导本身。该语义由
+// TestAdjustBitsDirection / TestDifficultyAdjustmentBounds 与本包的链级测试共同锁定。
 func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 	expected := int64(TargetBlockTimeSeconds * DifficultyAdjustmentInterval)
 
@@ -229,7 +254,7 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 	newTarget := new(big.Int).Mul(currentTarget, big.NewInt(actualTimespanSeconds))
 	newTarget.Div(newTarget, big.NewInt(expected))
 
-	// 难度不能低于初始最低难度（即 target 不能超过 MaxTarget）
+	// 难度下限钳制：难度不能低于初始最低难度（即 target 不能超过 MaxTarget）。
 	if newTarget.Cmp(MaxTarget()) == 1 {
 		return MaxTargetBits
 	}
@@ -243,8 +268,11 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 	if newBits < 1 {
 		newBits = 1
 	}
-	if newBits > MaxTargetBits {
-		newBits = MaxTargetBits
+	// 难度上限钳制：本链 MaxDifficultyBits == MaxTargetBits，因此难度被固定在最低值。
+	// 这是测试网的有意设计（见常量注释），不是把「下限常量」误用作上限。
+	if newBits > MaxDifficultyBits {
+		newBits = MaxDifficultyBits
 	}
 	return newBits
+
 }

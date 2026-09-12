@@ -49,6 +49,13 @@ type StatusInfo struct {
 	MempoolSize int      `json:"mempool_size"`
 	Mining      bool     `json:"mining"`
 	Address     string   `json:"address"` // 节点钱包地址
+
+	// Bits 是「下一个待挖区块」的难度目标（前导零位数语义，见 pow.BitsToTarget）。
+	// 这是共识真值，UI 展示难度必须以此为准。
+	Bits uint32 `json:"bits"`
+	// Difficulty 是相对最低难度（pow.MaxTargetBits）的倍数：2^(Bits-MaxTargetBits)。
+	// 纯展示用派生量，不参与任何共识判断；位宽 <= 53 时 float64 可精确表示。
+	Difficulty float64 `json:"difficulty"`
 }
 
 // BalanceInfo 地址余额。
@@ -107,6 +114,8 @@ type Server struct {
 	http *http.Server
 	ln   net.Listener
 	mu   sync.Mutex
+	// logs 是可选的日志来源；未注入时 /logs 返回空数组（诚实空态，不伪造日志）。
+	logs LogProvider
 }
 
 // NewServer 创建服务端。
@@ -121,6 +130,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/send", s.handleSend)
 	mux.HandleFunc("/mine", s.handleMine)
 	mux.HandleFunc("/block", s.handleBlock)
+	mux.HandleFunc("/logs", s.handleLogs)
+	// 根路径提供本机 Developer Console 页面（单页、零外部资源）。
+	// 放在最后注册：ServeMux 以「最长前缀」匹配，不会遮蔽上面的精确路由。
+	mux.HandleFunc("/", s.handleConsole)
 	return mux
 }
 
@@ -130,17 +143,24 @@ func (s *Server) Start(addr string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("控制接口监听失败: %w", err)
 	}
-	s.mu.Lock()
-	s.ln = ln
-	s.http = &http.Server{
+	srv := &http.Server{
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
 	}
+	s.mu.Lock()
+	s.ln = ln
+	s.http = srv
 	s.mu.Unlock()
 
-	go func() { _ = s.http.Serve(ln) }()
+	// 关键：后台 serve goroutine 必须捕获「局部」 srv，而非读取字段 s.http。
+	// Stop() 会在关闭后将 s.http 置为 nil；若此处读字段，则 Stop 与 goroutine 存在
+	// 数据竞争，且 goroutine 可能在字段被置 nil 后才执行 Serve，触发 nil 解引用崩溃
+	// （表现为 net/http.(*Server).Serve(0x0, ...) 的并发 panic，会打断调用方的清理链）。
+	// 捕获局部变量后，goroutine 永远持有有效 *http.Server，Stop 经同一指针 Close 即可让
+	// Serve 干净返回，无竞争、无崩溃。
+	go func() { _ = srv.Serve(ln) }()
 	return ln.Addr().String(), nil
 }
 

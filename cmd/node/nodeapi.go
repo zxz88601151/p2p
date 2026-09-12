@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 
 	"p2pchain/internal/control"
+	"p2pchain/internal/pow"
 	"p2pchain/internal/txbuild"
 	"p2pchain/internal/utxo"
 	"p2pchain/internal/wallet"
@@ -31,6 +33,7 @@ func (s *nodeService) Status() (control.StatusInfo, error) {
 	if err != nil {
 		return control.StatusInfo{}, err
 	}
+	bits := s.chain.CurrentBits()
 	return control.StatusInfo{
 		Height:      s.chain.Height(),
 		TipHash:     tip.Header.HashHex(),
@@ -38,7 +41,22 @@ func (s *nodeService) Status() (control.StatusInfo, error) {
 		MempoolSize: s.pool.Len(),
 		Mining:      s.mining.Load(),
 		Address:     s.miner.Address(),
+		Bits:        bits,
+		Difficulty:  relativeDifficulty(bits),
 	}, nil
+}
+
+// relativeDifficulty 把难度位（前导零位数）换算为「相对最低难度的倍数」。
+//
+// 依据 pow.BitsToTarget：target = 1 << (256-bits)，而 pow.MaxTargetBits 是最低难度，
+// 因此 倍数 = MaxTarget / Target = 2^(bits-MaxTargetBits)。
+// 这是纯展示用的派生量，不参与任何共识判断——共识始终以 Bits 为准。
+// bits-MaxTargetBits <= 53 时 float64 可精确表示（本项目难度范围远小于此）。
+func relativeDifficulty(bits uint32) float64 {
+	if bits < pow.MaxTargetBits {
+		return 0
+	}
+	return math.Pow(2, float64(bits-pow.MaxTargetBits))
 }
 
 // Balance 查询地址余额。

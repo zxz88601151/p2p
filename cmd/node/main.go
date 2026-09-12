@@ -75,6 +75,15 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 防御：若后续初始化中途 panic（而非返回 error），保证本进程持有的锁被释放。
+	// 正常/错误返回路径由各分支显式 Release 处理；此处仅兜底 panic 与未覆盖路径，
+	// 不吞 panic——defer 释放后 panic 继续向上传播，进程以非零码退出。
+	var initDone bool
+	defer func() {
+		if !initDone {
+			_ = lock.Release()
+		}
+	}()
 
 	store, err := storage.OpenFileBlockStore(cfg.DataDir)
 	if err != nil {
@@ -151,6 +160,7 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	}
 	rt.connectSeeds() // 首次连接
 	rt.watchSeeds()   // 断线后自动重连
+	initDone = true  // 初始化完成：上面的 defer 释放兜底不再触发
 	return rt, nil
 }
 
@@ -220,8 +230,20 @@ func (rt *nodeRuntime) Close() {
 	})
 }
 
+// testPanicAtStart 仅供测试注入 panic（生产代码恒为 nil，零副作用，非后门功能）。
+// 用于在 runtime start 阶段注入 panic，验证「最外层 defer 在 panic 路径释放锁」的契约
+// （PHASE P3.1 §6 Test 7）。任何生产路径都不会设置它。
+var testPanicAtStart func()
+
 // runNode 启动一个完整节点（P2P + 控制接口 + 可选挖矿），阻塞至进程退出。
-func runNode(args []string) {
+func runNode(args []string) { startNode(args, false) }
+
+// runNodeUI 与 runNode 完全同源，区别只有一个：控制接口就绪后，
+// 用系统默认浏览器打开 Developer Console 页面（`node ui` 子命令）。
+func runNodeUI(args []string) { startNode(args, true) }
+
+// startNode 是 runNode / runNodeUI 的共同实现。
+func startNode(args []string, openConsole bool) {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	listenAddr := fs.String("listen", ":6688", "本节点监听地址")
 	rpcAddr := fs.String("rpc", control.DefaultAddr, "控制接口监听地址（仅本机，无鉴权）")
@@ -232,7 +254,21 @@ func runNode(args []string) {
 	miners := fs.Int("miners", runtime.NumCPU(), "并行挖矿的 worker 数，1 表示单线程")
 	_ = fs.Parse(args)
 
-	rt, err := newNodeRuntime(nodeConfig{
+	// 最外层 defer（cmd 层级，§2.1）：无论正常返回、收到信号、还是初始化/运行期 panic，
+	// 只要 rt 已成功构建，就通过 rt.Close() 释放全部资源（含数据目录锁，幂等 + pid 校验）。
+	// rt 为 nil 时（newNodeRuntime 在返回前已自行释放锁并报错）此处不动作。
+	// 在组装节点之前接入日志环形缓冲：这样从「本地区块链已就绪」起的全部日志
+	// 都能被控制台读到。终端输出行为完全不变（仍是同一份字节写到 stderr）。
+	logRing := installLogRing()
+
+	var rt *nodeRuntime
+	defer func() {
+		if rt != nil {
+			rt.Close()
+		}
+	}()
+
+	rt2, err := newNodeRuntime(nodeConfig{
 		ListenAddr: *listenAddr,
 		RPCAddr:    *rpcAddr,
 		Seeds:      splitSeeds(*seedAddrs),
@@ -244,19 +280,32 @@ func runNode(args []string) {
 	if err != nil {
 		// 数据目录被另一节点占用时给出明确、可执行的用户级错误（与「数据损坏」区分）。
 		if errors.Is(err, storage.ErrDatadirLocked) {
-			log.Fatalf("[node] 数据目录已被另一个节点进程占用，未启动本节点：\n  目录：%s\n  同一数据目录一次只能由一个节点进程使用；请勿删除 blocks.dat，也勿重复启动。",
-				*dataDir)
+			log.Fatalf("[node] 数据目录已被另一个节点进程占用，未启动本节点：\n  目录：%s\n  同一数据目录一次只能由一个节点进程使用；请勿删除 blocks.dat，也勿重复启动。\n  如果确认没有其他节点进程在运行，请手动删除 %s 后重新启动。",
+				*dataDir, filepath.Join(*dataDir, "node.lock"))
 		}
 		log.Fatalf("[node] %v", err)
 	}
-	defer rt.Close()
+	rt = rt2
+	// 把日志来源交给控制接口，使 GET /logs 能返回真实日志（未接入时返回空数组）。
+	rt.ctl.SetLogProvider(logRing)
+
+	if openConsole {
+		openConsolePage(rt.ctl.Addr())
+	}
+
+	// 测试钩子（生产恒为 nil，零副作用，非后门功能）：用于在 runtime start 注入 panic，
+	// 验证「最外层 defer 在 panic 路径释放锁」的契约（PHASE P3.1 §6 Test 7）。
+	if testPanicAtStart != nil {
+		testPanicAtStart()
+	}
 
 	// 优雅关闭：捕获 SIGINT/SIGTERM 后释放全部资源（含数据目录锁），
 	// 保证被信号终止的节点不会残留 node.lock 导致同目录后续启动被拒。
-	// 注意：这不属于「自动 stale-lock 删除」——此处释放的是本进程自己持有的锁。
+	// 注意：这不属于「自动 stale-lock 删除」——此处释放的是本进程自己持有的锁；
+	// SIGINT/SIGTERM 复用与正常关闭完全相同的 rt.Close 链（§2.3），不为信号单独写释放逻辑。
 	go func() {
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
 		log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
 		rt.Close()
@@ -269,6 +318,20 @@ func runNode(args []string) {
 	}
 	log.Printf("[node] 以全节点模式运行（未启用挖矿）；可用 `node status` 查看状态")
 	select {}
+}
+
+// openConsolePage 打印并尝试打开 Developer Console 页面（`node ui`）。
+//
+// 失败不致命：即使系统没有可用浏览器，用户仍可按打印出的地址手动访问。
+func openConsolePage(addr string) {
+	if addr == "" {
+		return
+	}
+	url := "http://" + addr + "/"
+	log.Printf("[ui] Developer Console 已就绪: %s", url)
+	if err := openBrowser(url); err != nil {
+		log.Printf("[ui] 自动打开浏览器失败，请手动访问上面的地址: %v", err)
+	}
 }
 
 // splitSeeds 解析逗号分隔的种子地址列表，忽略空项与空白。

@@ -422,3 +422,124 @@ func mustHeight(t *testing.T, bc *blockchain.Blockchain, height int) *block.Bloc
 	}
 	return b
 }
+
+// ---- 难度方向：链级 runtime 验证（PHASE 0.1 §17 caveat #2 的闭环） ----
+
+// expectedNextBits 按共识规则**独立重算**「链尾之后下一块应使用的 bits」。
+// 与 Blockchain.currentBitsLocked 是两套独立实现：链级值若与它一致，说明
+// 「周期起点选择 + 实际跨度计算 + AdjustBits 调用」的接线正确（非空断言）。
+func expectedNextBits(t *testing.T, bc *blockchain.Blockchain, tipHeight, interval int) uint32 {
+	t.Helper()
+	tip, err := bc.Tip()
+	if err != nil {
+		t.Fatalf("读取链尾失败: %v", err)
+	}
+	if tipHeight == 0 || tipHeight%interval != 0 {
+		return tip.Header.Bits
+	}
+	startHeight := tipHeight - interval
+	if startHeight < 0 {
+		startHeight = 0
+	}
+	periodStart, err := bc.BlockByHeight(startHeight)
+	if err != nil {
+		t.Fatalf("读取周期起点高度 %d 失败: %v", startHeight, err)
+	}
+	return pow.AdjustBits(tip.Header.Bits, tip.Header.Timestamp-periodStart.Header.Timestamp)
+}
+
+// TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries 是
+// PHASE 0.1 §17 caveat #2「未通过 runtime 验证完整难度方向」的 runtime 闭环。
+//
+// 真实挖出跨过 ≥2 个难度调整周期（高度 20、40）的链，验证两条**不同的** clamp 路径
+// 都会把链上难度固定在设计上限（= 最低难度 MaxTargetBits）：
+//
+//	路径① 下限 clamp：确定性创世的固定时间戳（2023-11-14）使首周期实际跨度为数年，
+//	        远大于 maxTimespan(=expected×4) → target×4 > MaxTarget → 回落 MaxTargetBits。
+//	路径② 上限 clamp：新创世的时间戳为当下，首周期跨度极短（< expected/4 = minTimespan）
+//	        → 原始方向是「更难」（bits 本应为 MaxTargetBits+2）→ 被 MaxDifficultyBits 钳回。
+//
+// 因此本链难度**不浮动是有意设计**（测试网毫秒级出块优先），而非方向推导错误：
+// 方向推导本身由 pow.TestAdjustBitsDirectionIsMonotonicBeforeClamp 单测锁定。
+func TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries(t *testing.T) {
+	interval := pow.DifficultyAdjustmentInterval
+	expected := int64(pow.TargetBlockTimeSeconds) * int64(interval)
+	lastBoundary := 2 * interval // 高度 40
+
+	cases := []struct {
+		name         string
+		genesis      func(t *testing.T) *block.Block
+		expectSpanGt bool // 首周期跨度是否应 > maxTimespan（下限 clamp 路径）
+	}{
+		{
+			name:         "确定性创世(固定 2023 时间戳) → 下限 clamp 路径",
+			genesis:      func(t *testing.T) *block.Block { return blockchain.NewGenesisBlock() },
+			expectSpanGt: true,
+		},
+		{
+			name:         "测试创世(时间戳为当下) → 上限 clamp 路径",
+			genesis:      func(t *testing.T) *block.Block { return mineGenesis(t, newTestWallet(t)) },
+			expectSpanGt: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			miner := newTestWallet(t)
+			genesis := tc.genesis(t)
+			bc, err := blockchain.NewBlockchainWithGenesis(genesis)
+			if err != nil {
+				t.Fatalf("初始化链失败: %v", err)
+			}
+			if got := bc.CurrentBits(); got != pow.MaxDifficultyBits {
+				t.Fatalf("创世后 CurrentBits=%d, want %d", got, pow.MaxDifficultyBits)
+			}
+
+			for h := 1; h <= lastBoundary; h++ {
+				mineBlock(t, bc, miner)
+
+				tip, err := bc.Tip()
+				if err != nil {
+					t.Fatalf("高度 %d 读取链尾失败: %v", h, err)
+				}
+				// 全链 bits 恒为设计上限：任何高度都不允许偏离
+				if tip.Header.Bits != pow.MaxDifficultyBits {
+					t.Fatalf("高度 %d 的区块 bits=%d，偏离设计上限 %d：本链难度不应浮动",
+						h, tip.Header.Bits, pow.MaxDifficultyBits)
+				}
+
+				if h%interval != 0 {
+					continue
+				}
+				// 边界高度：链级 CurrentBits 必须等于独立重算值，且等于设计上限
+				want := expectedNextBits(t, bc, h, interval)
+				if got := bc.CurrentBits(); got != want {
+					t.Fatalf("高度 %d 边界：链级 CurrentBits=%d，独立重算=%d（接线不一致）", h, got, want)
+				}
+				if got := bc.CurrentBits(); got != pow.MaxDifficultyBits {
+					t.Fatalf("高度 %d 边界：CurrentBits=%d, want %d", h, got, pow.MaxDifficultyBits)
+				}
+
+				if h != interval {
+					continue // 只对首周期校验 clamp 路径，后续周期起点已是真实区块
+				}
+				periodStart, err := bc.BlockByHeight(0)
+				if err != nil {
+					t.Fatalf("读取创世失败: %v", err)
+				}
+				span := tip.Header.Timestamp - periodStart.Header.Timestamp
+				isFloorPath := span > expected*4
+				if tc.expectSpanGt != isFloorPath {
+					t.Fatalf("首周期跨度 %d 秒未落在预期 clamp 路径上（want 下限路径=%v, got=%v）",
+						span, tc.expectSpanGt, isFloorPath)
+				}
+			}
+
+			if bc.Height() != lastBoundary {
+				t.Fatalf("链高 = %d, want %d", bc.Height(), lastBoundary)
+			}
+			t.Logf("链高 %d：全链 bits 恒为 %d（期望跨度 %d 秒）",
+				bc.Height(), pow.MaxDifficultyBits, expected)
+		})
+	}
+}

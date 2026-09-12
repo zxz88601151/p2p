@@ -165,3 +165,65 @@ func TestAdjustBitsDirection(t *testing.T) {
 		}
 	}
 }
+
+// TestMaxDifficultyBitsIsTheDesignedCeiling 固化本链「难度上限 = 初始最低难度」这一
+// **有意设计**（测试网毫秒级出块优先于难度浮动）。
+//
+// 该常量不是把「下限常量」误用作上限：AdjustBits 的下限 clamp 用 MaxTarget/MaxTargetBits
+// 表达，上限 clamp 用 MaxDifficultyBits 表达。二者在当前共识参数下取值相同，
+// 但语义分离，将来若要开放难度浮动只需调整 MaxDifficultyBits 与 clamp 带宽
+// （属独立共识参数阶段，见常量注释）。
+func TestMaxDifficultyBitsIsTheDesignedCeiling(t *testing.T) {
+	if pow.MaxDifficultyBits != pow.MaxTargetBits {
+		t.Fatalf("MaxDifficultyBits=%d 与 MaxTargetBits=%d 不一致："+
+			"本链设计为难度固定在最低值，若此处被改动必须同步更新 README/控制台文案与共识说明",
+			pow.MaxDifficultyBits, pow.MaxTargetBits)
+	}
+	if pow.MaxDifficultyBits >= 256 {
+		t.Fatalf("MaxDifficultyBits=%d 非法：BitsToTarget 在 bits>=256 时目标失去意义", pow.MaxDifficultyBits)
+	}
+}
+
+// TestAdjustBitsNeverExceedsDesignedCeiling 穷举 [1, MaxDifficultyBits] 的全部合法输入难度
+// × 各类时间跨度（含 0、负数、极小、均衡、极大、极端），断言输出恒落在 [1, MaxDifficultyBits]。
+//
+// 这是「难度不浮动」的**代数级**保证：不论算力多强、时间跨度多极端，链上难度都不会越过设计上限。
+func TestAdjustBitsNeverExceedsDesignedCeiling(t *testing.T) {
+	expected := int64(pow.TargetBlockTimeSeconds) * int64(pow.DifficultyAdjustmentInterval)
+	spans := []int64{
+		-1 << 40, -1, 0, 1,
+		expected / 4, expected/4 - 1, expected,
+		expected * 4, expected*4 + 1,
+		1 << 20, 1 << 40,
+	}
+	for b := uint32(1); b <= pow.MaxDifficultyBits; b++ {
+		for _, span := range spans {
+			got := pow.AdjustBits(b, span)
+			if got < 1 || got > pow.MaxDifficultyBits {
+				t.Fatalf("AdjustBits(%d, %d) = %d，越出设计区间 [1, %d]",
+					b, span, got, pow.MaxDifficultyBits)
+			}
+		}
+	}
+}
+
+// TestAdjustBitsDirectionIsMonotonicBeforeClamp 验证「方向推导」本身正确：
+// 时间跨度越短，结果越难（bits 越大，或至少相等）；越长则越易。
+// 钳制只压缩可达范围，不允许出现方向反转。
+func TestAdjustBitsDirectionIsMonotonicBeforeClamp(t *testing.T) {
+	expected := int64(pow.TargetBlockTimeSeconds) * int64(pow.DifficultyAdjustmentInterval)
+	prev := uint32(0)
+	for _, span := range []int64{
+		expected / 4, // 封顶（最短允许跨度）
+		expected / 2, // 更快于期望
+		expected,     // 均衡
+		expected * 2, // 慢于期望
+		expected * 4, // 触底（最长允许跨度）
+	} {
+		got := pow.AdjustBits(pow.MaxTargetBits, span)
+		if prev != 0 && got > prev {
+			t.Fatalf("时间跨度变长时难度反而上升：prev=%d got=%d（span=%d）", prev, got, span)
+		}
+		prev = got
+	}
+}

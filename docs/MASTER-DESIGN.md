@@ -5,8 +5,10 @@
 > 纪律：每阶段 = 实现 + 测试 + `go build/vet/test ./...` 全绿 + 独立 commit（packed-refs 加固）。
 > 全程保持定位：学习型 PoW 区块链骨架；标准库零依赖；禁止引入区块链以外的功能。
 >
-> **状态（2026-09-12，HEAD 321f964）：PHASE 1B–7 全部完成；PHASE 2.1（datadir 进程独占锁缺陷修复）已完成并闭环。**
-> 验收证据与实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`；PHASE 2.1 执行证据见 `docs/PHASE-P2.1-EXECUTION-REPORT.md`。
+> **状态（2026-09-12，HEAD 6c0ced8）：PHASE 1B–7、PHASE 2.1 全部完成；PHASE FINAL 收口完成 → `PROJECT STATUS = COMPLETE`。**
+> 全量验收证据与未决项分级见 **`docs/PROJECT-COMPLETION-REPORT.md`**（当前权威交付文档）；
+> 各阶段实现细节见 `docs/FULL-IMPLEMENTATION-REPORT.md`；PHASE 2.1 执行证据见 `docs/PHASE-P2.1-EXECUTION-REPORT.md`；
+> 文档分级与命名错位对照见 `docs/README.md`。
 
 ---
 
@@ -105,6 +107,16 @@
 - **生命周期**：`newNodeRuntime` **第一步**即获取锁（早于 blocks.dat 打开）；5 个后续失败分支均 `Release()`；`Close()` 经 `sync.Once` 释放锁；`runNode` 新增 SIGINT/SIGTERM 优雅关闭 goroutine。`ErrDatadirLocked` 有独立明确中文 CLI 错误（"数据目录已被另一个节点进程占用…请勿删除 blocks.dat，也勿重复启动"），与回放失败错误语义独立（满足 §3.B）。
 - **§5 严格禁止**：不实现 PID 基 stale-lock 自动删除；`DirLock` + `Path()` 仅预留扩展点。测试 harness 中 `taskkill /F` + 隔离临时目录内清锁，不违反 §5（仅清理本次测试残留）。
 - **验证**：6 个新测试（5 单元 + 1 真实节点集成）全过；全量回归 120 测试（119 PASS + 1 既有 SKIP + 0 FAIL）、race 全绿；`smoke-e2e.sh` 13/13（含真实双进程 Scenario A/B）。
+
+## PHASE FINAL — 收口（2026-09-12）
+
+> 性质：**不加新功能**的收口阶段 —— 缺陷修复 + 证据补齐 + 文档诚实化。无 commit。
+
+- **F-3（P1，测试有效性缺陷）：修复并证明。** `scripts/smoke-e2e.sh` 用 `taskkill /F /PID "$!"` 终止节点，而 Git Bash 的 `$!` 是 **MSYS 伪 PID**，杀不掉原生进程 → 「重启持久化」两条断言**空转**（答的是同一个存活进程）。修复：PID 改从节点自身写入的 `<datadir>/node.lock`（`pid=NNNN`）取得；新增「旧进程已终止（RPC 不再响应）」「重启后原生 PID 与旧值不同」两条断言；`unlock()` 用 `cygpath -u` 规范化路径（`mktemp -d` 在本机返回含反斜杠路径，会被安全删除垫片 fail-closed）。复跑 **15/15**，反向对照成立。受影响的 `PHASE-P2.1` 与 `FULL-IMPLEMENTATION` 两处表述已加**更正批注**。
+- **F-1（P2，按设计关闭）：难度钳制意图显式化。** 新增具名常量 `pow.MaxDifficultyBits = MaxTargetBits`（**零行为变更**），把「难度上限 = 初始最低难度」从隐含语义变成显式设计；补 `pow` 3 个单元测试（含对 `bits ∈ [1, MaxDifficultyBits]` × 11 种跨度穷举、单调性）与 `blockchain` 1 个**链级 runtime** 测试（`expectedNextBits` 独立重算 + 高度 20/40 逐点核对 + 40 块逐高度断言）。实测两条钳制路径：确定性创世 → 下限路径；现挖创世 → 上限路径，均钉在 16。
+- **产品面诚实化。** README 共识参数表加「难度上限 / 难度动态范围」两行与「难度为何不浮动」小节；控制台披露卡加「难度语义」段与 `Difficulty` tooltip；新增 `TestConsoleHasNoMarkdownLeak` 防回归；新增 `docs/README.md` 文档索引。
+- **验收**：`go build` / `go vet` 通过；`go test -count=1 ./...` 与 `-race` 各 **12/12 包 ok、0 FAIL、0 竞态**（159 个顶层用例 + 1 个条件 SKIP）；`smoke-e2e.sh` **15/15**；控制台真实浏览器 **109/109**；静态完整性 `RESULT = PASS`。
+- **边界**：未引入任何区块链以外的功能；未触碰并行工作流的 `internal/storage/datalock.go`、`cmd/node/lock_lifecycle_test.go`、`docs/RUN-AUDIT-2026-09-12.md`；`gofmt` 对 `cmd/node/main.go`、`cmd/node/lock_lifecycle_test.go` 报的 2 处差异经核实为纯对齐空白（属并行工作流，不动）。
 
 ## 明确不做（超出学习项目边界）
 - 分叉/reorg 树状链（保留 TODO 与最长链原则说明，当前单链追加）；RIPEMD160/secp256k1（stdlib 限制，注释说明升级路径）；SPV/轻节点；TLS/加密传输；代币经济。

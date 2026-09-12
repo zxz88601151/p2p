@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2PChain Developer Console</title>
+<style>
+:root{
+  --bg:#f5f5f4;
+  --surface:#ffffff;
+  --border:#e3e3e3;
+  --t1:#1a1a1a;
+  --t2:#4d4d4d;
+  --t3:#8c8c8c;
+  --t4:#b8b8b8;
+  --fill:#f2f2f2;
+  --ok:#2e9e5b;
+  --warn:#b8862b;
+  --err:#c0392b;
+  --off:#8c8c8c;
+  --ok-bg:rgba(46,158,91,.10);
+  --warn-bg:rgba(184,134,43,.12);
+  --err-bg:rgba(192,57,43,.10);
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --mono:"SF Mono",Consolas,"Courier New",monospace;
+  --r:8px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--t1);
+  font-family:var(--sans);font-size:13px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+button{font:inherit;color:inherit}
+/* [hidden] 必须真正隐藏：浏览器 UA 样式表的 [hidden]{display:none} 会被作者样式里
+   任何 display 声明覆盖（如 .grid3{display:grid} 会被赋予 #panels），
+   导致 offlineCard.hidden / panels.hidden 的互斥切换失效——节点离线时
+   指标面板依旧可见，与 offline 卡片同时出现。这里统一兜底，不加任何新样式，
+   只让 hidden 语义可靠。 */
+[hidden]{display:none !important}
+:focus-visible{outline:2px solid var(--t1);outline-offset:2px}
+.shell{max-width:1680px;margin:0 auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r)}
+.mono{font-family:var(--mono)}
+.num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+
+/* ---------- header ---------- */
+.hdr{display:flex;align-items:center;gap:10px;padding:11px 14px}
+.brand{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;letter-spacing:.2px}
+.brand svg{color:var(--t2)}
+.sub{color:var(--t3);font-weight:400;font-size:12px}
+.spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid transparent;white-space:nowrap}
+.pill .dot{width:7px;height:7px;border-radius:50%;flex:none}
+.pill.on{color:var(--ok);background:var(--ok-bg);border-color:rgba(46,158,91,.25)}
+.pill.on .dot{background:var(--ok)}
+.pill.off{color:var(--off);background:var(--fill);border-color:var(--border)}
+.pill.off .dot{background:var(--off)}
+.pill.warn{color:var(--warn);background:var(--warn-bg);border-color:rgba(184,134,43,.28)}
+.pill.warn .dot{background:var(--warn)}
+.pill.err{color:var(--err);background:var(--err-bg);border-color:rgba(192,57,43,.25)}
+.pill.err .dot{background:var(--err)}
+
+/* ---------- toolbar ---------- */
+.bar{display:flex;align-items:center;gap:8px;padding:9px 14px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--surface);
+     border-radius:6px;padding:6px 12px;font-size:12.5px;cursor:pointer;color:var(--t2)}
+.btn:hover:not(:disabled){background:var(--fill)}
+.btn:disabled{cursor:not-allowed;color:var(--t4);background:var(--surface)}
+.btn.primary{background:var(--t1);border-color:var(--t1);color:#fff}
+.btn.primary:hover:not(:disabled){background:#000}
+.btn.primary:disabled{background:var(--t4);border-color:var(--t4);color:#fff}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--t3)}
+.btn.ghost:hover:not(:disabled){background:var(--fill)}
+.hint{font-size:12px;color:var(--t3)}
+.note{font-size:11.5px;color:var(--t3)}
+.err-text{font-size:12px;color:var(--err)}
+
+/* ---------- metrics ---------- */
+.metrics{display:grid;grid-template-columns:repeat(5,1fr)}
+.metric{padding:12px 14px;border-right:1px solid var(--border);min-width:0}
+.metric:last-child{border-right:none}
+.metric .k{font-size:11.5px;color:var(--t3);text-transform:uppercase;letter-spacing:.4px;display:flex;align-items:center;gap:5px}
+.metric .v{font-size:23px;font-weight:600;margin-top:3px;line-height:1.2}
+.metric .v .u{font-size:12px;font-weight:400;color:var(--t3);margin-left:3px}
+.metric .s{font-size:11.5px;color:var(--t3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---------- grid ---------- */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid3{display:grid;grid-template-columns:1.05fr 1fr 1fr;gap:10px}
+.ph{display:flex;align-items:center;gap:7px;padding:9px 14px;border-bottom:1px solid var(--border)}
+.ph .t{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:6px}
+.ph svg{color:var(--t3)}
+.pb{padding:10px 14px}
+
+/* ---------- rows ---------- */
+.row{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-bottom:1px dashed var(--border)}
+.row:last-child{border-bottom:none}
+.row .lab{width:96px;flex:none;color:var(--t3);font-size:12px}
+.row .val{flex:1;min-width:0;color:var(--t2);word-break:break-all}
+.row .val.m{font-family:var(--mono);font-size:12px}
+.un{color:var(--t4);font-style:italic;font-size:12px}
+.un::after{content:" ·";color:var(--fill)}
+.copy{border:none;background:transparent;color:var(--t3);cursor:pointer;padding:0 3px;font-size:11px;border-radius:4px;flex:none}
+.copy:hover{background:var(--fill);color:var(--t2)}
+.copy.ok{color:var(--ok)}
+
+/* ---------- states ---------- */
+.state{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:var(--t2)}
+.state .dot{width:7px;height:7px;border-radius:50%;margin-top:5px;flex:none;background:var(--off)}
+.state.ok .dot{background:var(--ok)}
+.state.warn .dot{background:var(--warn)}
+.state.err .dot{background:var(--err)}
+.state b{font-weight:600}
+
+/* ---------- log ---------- */
+#log{font-family:var(--mono);font-size:11.5px;line-height:1.75;max-height:230px;overflow:auto;
+     background:var(--surface);border-radius:0 0 var(--r) var(--r)}
+.ln{display:flex;gap:8px;padding:1px 14px;white-space:pre-wrap;word-break:break-word}
+.ln:hover{background:#fafafa}
+.ln .tm{color:var(--t4);flex:none}
+.ln .lv{flex:none;width:42px}
+.ln .lv.INFO{color:var(--t3)}
+.ln .lv.WARN{color:var(--warn)}
+.ln .lv.ERROR{color:var(--err)}
+.ln .cp{flex:none;width:46px;color:var(--t2)}
+.ln .ms{color:var(--t2);flex:1}
+.empty{padding:16px 14px;color:var(--t3);font-size:12.5px}
+
+/* ---------- offline ---------- */
+.offline{padding:28px 14px;display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center}
+.offline .t{font-size:15px;font-weight:600}
+.offline .d{color:var(--t3);font-size:12.5px;max-width:460px}
+.offline code{font-family:var(--mono);font-size:12px;background:var(--fill);padding:1px 5px;border-radius:4px;color:var(--t2)}
+
+/* ---------- footer ---------- */
+.ft{display:flex;flex-wrap:wrap;gap:8px 20px;padding:10px 14px;font-size:11.5px;color:var(--t3);align-items:center}
+.ft b{color:var(--t2);font-weight:500}
+.ft .mono{font-family:var(--mono)}
+.ft .sep{flex:1}
+.disclosure{font-size:11.5px;color:var(--t3);padding:0 14px 10px;line-height:1.6}
+
+@media (max-width:1100px){
+  .grid,.grid3{grid-template-columns:1fr}
+  .metrics{grid-template-columns:repeat(2,1fr)}
+  .metric{border-bottom:1px solid var(--border)}
+  .metric:last-child{border-bottom:none}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ================= HEADER ================= -->
+  <header class="card hdr">
+    <span class="brand">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M12 2.8 20.2 7v10L12 21.2 3.8 17V7L12 2.8Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+        <path d="M12 7.4v9.2M7.6 9.9l8.8 5.1M16.4 9.9l-8.8 5.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+      P2PChain Developer Console
+    </span>
+    <span class="sub">本机节点控制台</span>
+    <span class="spacer"></span>
+
+    <span class="pill off" id="nodePill" role="status" aria-live="polite">
+      <span class="dot"></span><span id="nodeStateText">连接中…</span>
+    </span>
+    <span class="hint mono" id="endpointLabel">同源控制接口</span>
+  </header>
+
+  <!-- ================= PRIMARY CONTROL ================= -->
+  <section class="card bar" aria-label="节点运行控制">
+    <button class="btn primary" id="mineBtn" disabled aria-label="按需立即挖出一个区块">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <span id="mineBtnText">立即出块</span>
+    </button>
+    <button class="btn" id="refreshBtn" aria-label="立即刷新全部数据">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M20 11a8 8 0 1 0-2.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M20 4.6V11h-6.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      刷新
+    </button>
+    <span class="hint" id="mineHint"></span>
+    <span class="spacer"></span>
+    <span class="err-text" id="mineErr" role="alert"></span>
+    <span class="note mono num" id="lastSync">—</span>
+  </section>
+
+  <!-- ================= CORE METRICS ================= -->
+  <section class="card" aria-label="核心指标">
+    <div class="metrics">
+      <div class="metric">
+        <div class="k">Block Height</div>
+        <div class="v num" id="mHeight">—</div>
+        <div class="s" id="sHeight">链高（最高区块索引）</div>
+      </div>
+      <div class="metric">
+        <div class="k" title="本链难度按设计固定在最低难度（pow.MaxDifficultyBits = pow.MaxTargetBits）：AdjustBits 的方向推导完整，但输出被上下两层 clamp 限幅。放开难度浮动属独立共识参数阶段。">Difficulty</div>
+        <div class="v num" id="mDiff">—</div>
+        <div class="s num" id="sDiff">—</div>
+      </div>
+      <div class="metric">
+        <div class="k">Peers</div>
+        <div class="v num" id="mPeers">—</div>
+        <div class="s" id="sPeers">已连接对等节点</div>
+      </div>
+      <div class="metric">
+        <div class="k">Mempool</div>
+        <div class="v num" id="mPool">—</div>
+        <div class="s" id="sPool">待确认交易数</div>
+      </div>
+      <div class="metric">
+        <div class="k">Mining</div>
+        <div class="v" id="mMining">—</div>
+        <div class="s" id="sMining">—</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= OFFLINE ================= -->
+  <section class="card" id="offlineCard" hidden aria-label="节点离线">
+    <div class="offline">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true" style="color:var(--off)">
+        <path d="M12 3v9" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+        <path d="M6.5 6.8a8 8 0 1 0 11 0" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+      </svg>
+      <div class="t" id="offlineTitle">Node Offline</div>
+      <div class="d" id="offlineDetail">本机节点未运行，或控制接口不可达。</div>
+      <button class="btn" id="retryBtn" aria-label="重试连接本机节点">
+        重试连接
+      </button>
+      <div class="note">启动节点：<code>node -mine -datadir &lt;目录&gt;</code>　·　带控制台启动：<code>node ui -mine</code></div>
+    </div>
+  </section>
+
+  <!-- ================= PANELS ================= -->
+  <div class="grid3" id="panels">
+
+    <!-- Blockchain -->
+    <section class="card" aria-label="区块链状态">
+      <div class="ph">
+        <span class="t">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <rect x="3.5" y="4.5" width="17" height="6" rx="1.6" stroke="currentColor" stroke-width="1.6"/>
+            <rect x="3.5" y="13.5" width="17" height="6" rx="1.6" stroke="currentColor" stroke-width="1.6"/>
+          </svg>
+          Blockchain
+        </span>
+      </div>
+      <div class="pb">
+        <div class="row"><span class="lab">Block Height</span><span class="val num" id="bHeight">—</span></div>
+        <div class="row"><span class="lab">Chain Tip</span><span class="val m" id="bTip">—</span><button class="copy" id="cpTip" hidden aria-label="复制链尾哈希">复制</button></div>
+        <div class="row"><span class="lab">Difficulty</span><span class="val num" id="bDiff">—</span></div>
+        <div class="row"><span class="lab">Block Time</span><span class="val" id="bTime"></span></div>
+        <div class="row"><span class="lab">Sync State</span><span class="val" id="bSync"></span></div>
+      </div>
+    </section>
+
+    <!-- Network -->
+    <section class="card" aria-label="网络状态">
+      <div class="ph">
+        <span class="t">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M12 3.5v5.3M12 15.2v5.3M3.5 12h5.3M15.2 12h5.3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+          Network
+        </span>
+      </div>
+      <div class="pb">
+        <div class="row"><span class="lab">Peers</span><span class="val" id="nPeers"></span></div>
+        <div class="row"><span class="lab">Inbound</span><span class="val" id="nIn"></span></div>
+        <div class="row"><span class="lab">Outbound</span><span class="val" id="nOut"></span></div>
+        <div class="row"><span class="lab">Latency</span><span class="val" id="nLat"></span></div>
+        <div class="row"><span class="lab">Protocol</span><span class="val" id="nProto"></span></div>
+        <div class="row"><span class="lab">Peer List</span><span class="val m" id="nList"></span></div>
+      </div>
+    </section>
+
+    <!-- Mining / Hardware -->
+    <section class="card" aria-label="挖矿与硬件">
+      <div class="ph">
+        <span class="t">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 18V9M9 18V5M14 18v-6M19 18v-9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+          Mining / Hardware
+        </span>
+      </div>
+      <div class="pb">
+        <div class="row"><span class="lab">Mining</span><span class="val" id="hMining"></span></div>
+        <div class="row"><span class="lab">On-demand</span><span class="val" id="hOnDemand"></span></div>
+        <div class="row"><span class="lab">Hashrate</span><span class="val" id="hHash"></span></div>
+        <div class="row"><span class="lab">Device</span><span class="val" id="hDevice"></span></div>
+        <div class="row"><span class="lab">Temperature</span><span class="val" id="hTemp"></span></div>
+        <div class="row"><span class="lab">Power / Fan</span><span class="val" id="hPwr"></span></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ================= LOG ================= -->
+  <section class="card" aria-label="节点日志">
+    <div class="ph">
+      <span class="t">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 6h16M4 11h16M4 16h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        Node Log
+      </span>
+      <span class="spacer"></span>
+      <span class="note" id="logMeta">—</span>
+      <button class="btn ghost" id="logPauseBtn" aria-label="暂停或继续日志自动刷新">暂停</button>
+    </div>
+    <div id="log" role="log" aria-live="off"></div>
+  </section>
+
+  <!-- ================= FOOTER ================= -->
+  <footer class="card ft" aria-label="技术配置">
+    <span>算法 <b class="mono">SHA-256d</b></span>
+    <span>签名 <b class="mono">ECDSA P-256</b></span>
+    <span>难度 <b class="mono num" id="fBits">—</b></span>
+    <span>Node ID <b class="mono" id="fNode">—</b></span>
+    <span>数据目录 <b id="fDir"></b></span>
+    <span>协议版本 <b id="fProto"></b></span>
+  </footer>
+
+  <div class="card disclosure">
+    <b>数据来源与诚实边界</b>：本页所有数值均由浏览器直接读取本机控制接口
+    <span class="mono">/status</span>、<span class="mono">/logs</span>，页面自身不产生任何数据
+    （无随机数、无硬编码运行时状态）。节点当前未暴露的字段一律显示为
+    <span class="un">Unavailable</span>，绝不填充 0 或占位值。
+    另：日志等级（INFO/WARN/ERROR）由日志文本按关键词推断，非节点原生字段。
+    <b>难度语义</b>：本链难度按设计固定在最低难度（<span class="mono">pow.MaxDifficultyBits = pow.MaxTargetBits</span>）——
+    难度调整的方向推导完整（实际跨度短→更难、长→更易），但输出被上下两层 clamp 限幅，
+    因此 Difficulty 恒为 <span class="mono num">×1</span>。这<b>不是</b>故障：测试网优先保证毫秒级出块；
+    放开难度浮动需重设 clamp 带宽，属独立的共识参数阶段（详见 README「难度为何不浮动」）。
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ============================================================
+   约定：本文件不含 Math.random / 无硬编码运行时数据。
+   一切数值只来自同源接口；取不到就渲染 Unavailable。
+   ============================================================ */
+
+var API = ""; // 同源
+var $ = function(id){ return document.getElementById(id); };
+
+var UN = {}; // 每处 Unavailable 的原因（title 提示用）
+var online = false, lastStatus = null, logsPaused = false, mining = false, busy = false;
+
+function unavail(el, reason){
+  el.innerHTML = '<span class="un" title="' + String(reason).replace(/"/g,'&quot;') + '">Unavailable</span>';
+}
+function setText(el, txt){ el.textContent = txt; }
+/* 有限数值判定：null / undefined / NaN / Infinity / 字符串一律不算数值。
+   §14 硬约束：这类值绝不允许被当作正常状态渲染——页面里不允许出现字面
+   "null" / "undefined" / "NaN"。 */
+function isNum(n){ return typeof n === "number" && isFinite(n); }
+function fmtNum(n){
+  return isNum(n) ? n.toLocaleString("en-US") : "—";
+}
+/* 数值型字段统一渲染：取不到就显式 Unavailable + 原因，绝不显示 0 或字面 null。 */
+function setNum(el, n, reason){
+  if (isNum(n)){ setText(el, fmtNum(n)); return true; }
+  unavail(el, reason);
+  return false;
+}
+/* 数组字段统一渲染：缺失或类型不符按空数组处理，不抛异常、不显示 "undefined"。 */
+function asArray(v){ return Array.isArray(v) ? v : []; }
+/* 形状校验失败用的错误：与非网络错误区分，用于选择 Error 态的文案。 */
+function shapeError(msg){ var e = new Error(msg); e.shape = true; return e; }
+function fmtDifficulty(x){
+  if (typeof x !== "number" || !isFinite(x) || x <= 0) return null;
+  if (x < 1000) return "×" + (Math.round(x * 100) / 100);
+  if (x < 1e6) return "×" + Math.round(x).toLocaleString("en-US");
+  return "×" + x.toExponential(2);
+}
+function nowTime(){
+  var d = new Date();
+  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")+":"+String(d.getSeconds()).padStart(2,"0");
+}
+
+/* 控制接口读取超时：本机回环接口的正常响应是毫秒级。没有超时的 fetch 在
+   「连接已建立但迟迟不回」时会永久挂起；由于轮询采用单飞去重，那一次挂起的
+   请求会让之后所有 tick 都返回同一个未落定的 Promise，轮询就此停摆，UI 会
+   永久停留在陈旧的 Online 状态——这正是 §11 明令禁止的 stale status。
+   超时后统一降级为失败态。出块在后台 goroutine 中求解、/status 只取读锁，
+   不会被挖矿阻塞，故该超时不会在出块期间造成误判离线。
+   注意：仅用于 /status 与 /logs 这类快速读取；/mine 出块耗时不确定，不加超时。 */
+var REQ_TIMEOUT_MS = 4000;
+async function jget(path){
+  var ctl = (typeof AbortController === "function") ? new AbortController() : null;
+  var timer = ctl ? setTimeout(function(){ ctl.abort(); }, REQ_TIMEOUT_MS) : null;
+  var r;
+  try {
+    r = await fetch(API + path, ctl
+      ? { cache:"no-store", headers:{ "Accept":"application/json" }, signal: ctl.signal }
+      : { cache:"no-store", headers:{ "Accept":"application/json" } });
+  } catch(e0){
+    if (ctl && e0 && e0.name === "AbortError"){
+      throw new Error("控制接口 " + REQ_TIMEOUT_MS + "ms 内无响应");
+    }
+    throw e0;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (!r.ok){
+    var msg = "HTTP " + r.status;
+    try { var eb = await r.json(); if (eb && eb.error) msg = eb.error; } catch(_){}
+    var err = new Error(msg); err.status = r.status; throw err;
+  }
+  /* 200 但正文不是 JSON：节点可达、响应不合法 —— 归为「响应格式非法」而不是离线。 */
+  try {
+    return await r.json();
+  } catch(e1){
+    throw shapeError("响应不是合法 JSON：" + String(e1.message || e1));
+  }
+}
+
+/* ---------------- 连接与状态 ---------------- */
+function setOnline(v){
+  online = v;
+  var pill = $("nodePill");
+  pill.className = "pill " + (v ? "on" : "off");
+  setText($("nodeStateText"), v ? "Online" : "Offline");
+  $("offlineCard").hidden = v;
+  $("panels").hidden = !v;
+  $("mineBtn").disabled = !v || mining || busy;
+  $("refreshBtn").disabled = false;
+  markStale(!v);
+}
+
+/* 离线时核心指标行不得继续以「实时值」的面貌呈现（§11 禁止 stale status）：
+   数值位退化为 —，同时把最后一次成功读数降级到副标题，保留可诊断信息。 */
+var lastGood = null;
+function snapshotMetrics(st){ lastGood = st; }
+function markStale(stale){
+  var box = document.querySelector(".metrics");
+  if (!box) return;
+  box.style.opacity = stale ? "0.55" : "";
+  box.title = stale ? "节点当前不可达：以下数值已降级，副标题为最后一次成功读数" : "";
+  if (!stale) return;
+  var g = lastGood;
+  setText($("mHeight"), "—");
+  setText($("mDiff"), "—");
+  setText($("mPeers"), "—");
+  setText($("mPool"), "—");
+  setText($("mMining"), "—");
+  $("mMining").style.color = "";
+  setText($("sHeight"), g && isNum(g.height) ? ("最后读数 height=" + g.height) : "链高（最高区块索引）");
+  setText($("sDiff"),   g && isNum(g.bits) ? ("最后读数 bits=" + g.bits) : "—");
+  setText($("sPeers"),  g ? ("最后读数 peers=" + asArray(g.peers).length) : "已连接对等节点");
+  setText($("sPool"),   g && isNum(g.mempool_size) ? ("最后读数 mempool=" + g.mempool_size) : "待确认交易数");
+  setText($("sMining"), g ? ("最后读数 " + (g.mining ? "ACTIVE" : "IDLE")) : "—");
+}
+/* 节点状态形状校验：形状非法一律按 Error 态处理，绝不把畸形响应当成 Online。 */
+function validateStatus(st){
+  if (!st || typeof st !== "object" || Array.isArray(st)) return "响应不是 JSON 对象";
+  if (!isNum(st.height)) return "缺少数值型 height";
+  if (!isNum(st.mempool_size)) return "缺少数值型 mempool_size";
+  if (typeof st.mining !== "boolean") return "缺少布尔型 mining";
+  if (!Array.isArray(st.peers)) return "缺少数组型 peers";
+  return null;
+}
+/* 三种失败态共用同一张卡片，只换文案（不新增视觉风格）：
+   Node Offline（连不上） / 控制接口错误（HTTP 非 2xx） / 响应格式非法（形状不符）。 */
+function setFailureState(e){
+  var ep = $("endpointLabel").textContent;
+  var title = $("offlineTitle"), detail = $("offlineDetail");
+  if (e && e.shape){
+    setText(title, "响应格式非法");
+    setText(detail, "控制接口 " + ep + " 的 /status 响应不符合契约：" + String(e.message || e));
+  } else if (e && typeof e.status === "number"){
+    setText(title, "控制接口错误");
+    setText(detail, "控制接口 " + ep + " 返回 HTTP " + e.status + "：" + String(e.message || e));
+  } else {
+    setText(title, "Node Offline");
+    setText(detail, "无法连接控制接口 " + ep + "：" + String(e.message || e));
+  }
+}
+
+function renderStatus(st){
+  lastStatus = st;
+  mining = !!st.mining;
+
+  /* --- core metrics --- */
+  snapshotMetrics(st);
+  setNum($("mHeight"), st.height, "节点未返回 height 字段");
+  setText($("sHeight"), "链尾 " + String(st.tip_hash || "").slice(0,12) + "…");
+
+  if (isNum(st.difficulty) && isNum(st.bits)){
+    setText($("mDiff"), fmtDifficulty(st.difficulty) || "—");
+    setText($("sDiff"), "bits=" + st.bits + " · 相对最低难度 pow.MaxTargetBits");
+  } else {
+    unavail($("mDiff"), "节点未返回 difficulty 字段");
+    unavail($("sDiff"), "节点未返回 bits 字段");
+  }
+
+  if (Array.isArray(st.peers)){
+    setText($("mPeers"), fmtNum(st.peers.length));
+    setText($("sPeers"), st.peers.length ? "已建立连接" : "无活跃对等节点");
+  } else {
+    unavail($("mPeers"), "节点未返回 peers 字段");
+    setText($("sPeers"), "—");
+  }
+  if (setNum($("mPool"), st.mempool_size, "节点未返回 mempool_size 字段") && isNum(st.mempool_size)){
+    setText($("sPool"), st.mempool_size > 0 ? (st.mempool_size + " 笔待打包") : "无待确认交易");
+  } else {
+    setText($("sPool"), "—");
+  }
+  setText($("sMining"), mining ? "持续挖矿（-mine）" : "未启用持续挖矿");
+  $("mMining").textContent = mining ? "ACTIVE" : "IDLE";
+  $("mMining").style.color = mining ? "var(--ok)" : "var(--t2)";
+
+  /* --- blockchain --- */
+  setNum($("bHeight"), st.height, "节点未返回 height 字段");
+  var tip = typeof st.tip_hash === "string" ? st.tip_hash : "";
+  $("bTip").textContent = tip || "—";
+  $("cpTip").hidden = !tip;
+  if (isNum(st.difficulty) && isNum(st.bits)){
+    setText($("bDiff"), (fmtDifficulty(st.difficulty) || "—") + "（bits=" + st.bits + "）");
+  } else {
+    unavail($("bDiff"), "节点未返回难度字段");
+  }
+  unavail($("bTime"), "节点未暴露最新区块时间戳（/status 无该字段）");
+  unavail($("bSync"), "节点未暴露同步进度（无 IBD 指标，/status 无该字段）");
+
+  /* --- network --- */
+  var peers = asArray(st.peers);
+  if (!Array.isArray(st.peers)){
+    unavail($("nPeers"), "节点未返回 peers 字段");
+  } else if (peers.length){
+    $("nPeers").innerHTML = '<span class="state ok"><span class="dot"></span><b>' + peers.length + " 个已连接</b></span>";
+  } else {
+    $("nPeers").innerHTML = '<span class="state"><span class="dot"></span>No active peers</span>';
+  }
+  unavail($("nIn"),      "节点未暴露入站/出站方向（/status 仅有地址列表）");
+  unavail($("nOut"),     "节点未暴露入站/出站方向（/status 仅有地址列表）");
+  unavail($("nLat"),     "节点未采集对等节点延迟");
+  unavail($("nProto"),   "P2P 消息未携带协议版本号");
+  if (peers.length){
+    $("nList").textContent = peers.join("  ");
+  } else {
+    $("nList").innerHTML = '<span class="un" title="当前没有活跃对等节点">—</span>';
+  }
+
+  /* --- mining / hardware --- */
+  $("hMining").innerHTML = mining
+    ? '<span class="state ok"><span class="dot"></span><b>持续挖矿中</b></span>'
+    : '<span class="state"><span class="dot"></span>Mining inactive</span>';
+  $("hOnDemand").innerHTML = mining
+    ? '<span class="state warn"><span class="dot"></span>不可用：持续挖矿期间按需出块被拒绝（409）</span>'
+    : '<span class="state ok"><span class="dot"></span>可用：POST /mine count=1</span>';
+  unavail($("hHash"),   "全仓无算力统计实现（无 Hashes/sec 采集）");
+  unavail($("hDevice"), "无 GPU/设备枚举能力");
+  unavail($("hTemp"),   "无温度传感器采集");
+  unavail($("hPwr"),    "无功耗/风扇采集");
+
+  /* --- footer --- */
+  setText($("fBits"), isNum(st.bits) ? ("bits=" + st.bits) : "—");
+  if (typeof st.address === "string" && st.address){
+    setText($("fNode"), st.address.slice(0,10) + "…");
+    $("fNode").title = st.address;
+  } else {
+    unavail($("fNode"), "节点未返回钱包地址");
+  }
+  unavail($("fDir"),   "节点未暴露数据目录（/status 无该字段）");
+  unavail($("fProto"), "P2P 消息无协议版本字段");
+
+  /* --- primary control 提示 --- */
+  if (mining){
+    setText($("mineHint"), "节点以 -mine 持续挖矿；当前无「停止挖矿」接口，需重启节点方可停止。");
+  } else {
+    setText($("mineHint"), "按需出块（对标 generatetoaddress），仅影响本机链高。");
+  }
+  $("mineBtn").disabled = mining || busy || !online;
+}
+
+/* ---------------- 日志 ---------------- */
+function levelClass(lv){
+  return (lv === "WARN" || lv === "ERROR") ? lv : "INFO";
+}
+function renderLogs(list){
+  var box = $("log");
+  if (!list || !list.length){
+    box.innerHTML = '<div class="empty">暂无日志。节点尚未产生输出，或日志来源未接入。</div>';
+    setText($("logMeta"), "0 行");
+    return;
+  }
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < list.length; i++){
+    var e = list[i] || {};
+    var row = document.createElement("div");
+    row.className = "ln";
+    var t = document.createElement("span"); t.className = "tm"; t.textContent = "[" + (e.time || "--:--:--") + "]";
+    var l = document.createElement("span"); l.className = "lv " + levelClass(e.level); l.textContent = e.level || "INFO";
+    var c = document.createElement("span"); c.className = "cp"; c.textContent = e.component || "-";
+    var m = document.createElement("span"); m.className = "ms"; m.textContent = e.message || "";
+    row.appendChild(t); row.appendChild(l); row.appendChild(c); row.appendChild(m);
+    frag.appendChild(row);
+  }
+  box.innerHTML = "";
+  box.appendChild(frag);
+  box.scrollTop = box.scrollHeight;
+  setText($("logMeta"), list.length + " 行 · 等级为推断值");
+}
+
+/* ---------------- 刷新循环 ---------------- */
+/* 单飞（single-flight）：同一时刻只允许一个刷新在途。连击「刷新 / 重试连接」或
+   定时刷新与手动刷新手叠时，只会产生一次真实请求（§11：不得产生重复请求）。 */
+var inFlight = null;
+function tick(){
+  if (inFlight) return inFlight;
+  inFlight = doTick().finally(function(){ inFlight = null; });
+  return inFlight;
+}
+
+async function doTick(){
+  try {
+    var st = await jget("/status");
+    /* 形状非法 → 抛错走 Error 态：绝不把畸形响应当成 Online（§14）。 */
+    var why = validateStatus(st);
+    if (why) throw shapeError(why);
+    if (!online) setOnline(true);
+    /* 数据合法但渲染抛错 = 页面自身缺陷。必须显式暴露，绝不能吞掉后把状态
+       伪装成「节点离线」——那会把一个前端 bug 误报成节点故障。 */
+    try {
+      renderStatus(st);
+    } catch(err){
+      $("mineErr").textContent = "界面渲染异常（节点仍在线）：" + String((err && err.message) || err);
+    }
+    if (!logsPaused){
+      try {
+        var logs = await jget("/logs?tail=120");
+        renderLogs(logs);
+      } catch(e){
+        $("log").innerHTML = '<div class="empty">读取日志失败：' + String(e.message).replace(/[<>&]/g,"") + "</div>";
+        setText($("logMeta"), "读取失败");
+      }
+    }
+    setText($("lastSync"), "最后同步 " + nowTime());
+    $("mineErr").textContent = "";
+  } catch (e){
+    if (online) setOnline(false);
+    setFailureState(e);
+    setText($("lastSync"), "最后尝试 " + nowTime());
+  }
+}
+
+/* ---------------- 控制动作 ---------------- */
+$("mineBtn").addEventListener("click", async function(){
+  busy = true;
+  $("mineBtn").disabled = true;
+  setText($("mineBtnText"), "出块中…");
+  $("mineErr").textContent = "";
+  try {
+    var r = await fetch(API + "/mine", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ count: 1 })
+    });
+    var body = await r.json().catch(function(){ return {}; });
+    if (!r.ok){
+      $("mineErr").textContent = "出块失败：" + (body.error || ("HTTP " + r.status));
+    } else {
+      setText($("mineBtnText"), "已出块");
+      setTimeout(function(){ setText($("mineBtnText"), "立即出块"); }, 1200);
+    }
+  } catch (e){
+    $("mineErr").textContent = "出块失败：" + String(e.message || e);
+  } finally {
+    busy = false;
+    await tick();
+  }
+});
+
+$("refreshBtn").addEventListener("click", function(){
+  var self = this;
+  if (self.disabled) return;              /* 在途时忽略连击（§11 不得重复请求） */
+  self.disabled = true;
+  setText(self, "刷新中…");
+  tick().finally(function(){
+    self.innerHTML =
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+      '<path d="M20 11a8 8 0 1 0-2.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>' +
+      '<path d="M20 4.6V11h-6.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> 刷新';
+    self.disabled = false;
+  });
+});
+
+$("retryBtn").addEventListener("click", function(){
+  var self = this;
+  if (self.disabled) return;              /* 在途时忽略连击，不产生重复请求 */
+  self.disabled = true;
+  setText(self, "重试中…");
+  tick().finally(function(){
+    setText(self, "重试连接");
+    self.disabled = false;
+  });
+});
+
+$("logPauseBtn").addEventListener("click", function(){
+  logsPaused = !logsPaused;
+  this.textContent = logsPaused ? "继续" : "暂停";
+  this.setAttribute("aria-label", logsPaused ? "继续日志自动刷新" : "暂停日志自动刷新");
+});
+
+$("cpTip").addEventListener("click", async function(){
+  var txt = $("bTip").textContent || "";
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(txt);
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = txt; document.body.appendChild(ta); ta.select();
+      document.execCommand("copy"); document.body.removeChild(ta);
+    }
+    this.textContent = "已复制"; this.classList.add("ok");
+    var self = this;
+    setTimeout(function(){ self.textContent = "复制"; self.classList.remove("ok"); }, 1200);
+  } catch(e){
+    $("mineErr").textContent = "复制失败：" + String(e.message || e);
+  }
+});
+
+/* 键盘：按 r 刷新（不在输入框内时） */
+document.addEventListener("keydown", function(ev){
+  if (ev.target && /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)) return;
+  if (ev.key === "r" && !ev.ctrlKey && !ev.metaKey && !ev.altKey){ tick(); }
+});
+
+/* 启动 */
+/* 端点必须取自页面自身地址（同源），禁止硬编码：节点可以监听任何端口，
+   写死默认端口会在换端口启动时显示错误地址，离线排查时还会把人指错方向。 */
+$("endpointLabel").textContent = location.host || "同源控制接口";
+setOnline(false);
+tick();
+setInterval(tick, 2000);
+})();
+</script>
+</body>
+</html>

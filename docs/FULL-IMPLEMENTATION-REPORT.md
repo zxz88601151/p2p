@@ -85,6 +85,12 @@ block → transaction → utxo → blockchain → mempool → txbuild
 
 各包用例分布：cmd/node 12 · block 8 · blockchain 9 · control 8 · mempool 9 · p2p 5 · pow 17 · storage 3 · transaction 5 · txbuild 5 · utxo 16 · wallet 17。
 
+> **⚠️ 2026-09-12 更正（缺陷 F-3）**：上表中 `smoke-e2e.sh` 的「重启持久化」一段当时为**空转断言**——
+> 脚本以 `taskkill /F /PID "$!"` 终止节点，而 Git Bash 的 `$!` 是 MSYS 伪 PID，杀不掉原生进程，
+> 「重启后」的读数由同一存活进程应答。现已改用 `node.lock` 中的原生 PID 并新增两条断言，复跑 **15/15 PASS**。
+> 同时数值口径已更新为**当前** 159 个顶层用例（本文档其余数字为 2026-09-11 时点快照，保留不改）。
+> 详见 `docs/PROJECT-COMPLETION-REPORT.md` 的 F-3 小节。
+
 ## 4. 提交历史
 
 ```

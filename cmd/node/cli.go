@@ -32,6 +32,7 @@ const usageText = `p2pchain 节点与钱包工具
   node <子命令> [选项]
 
 子命令:
+  ui            启动节点并打开 Developer Console 页面（本机控制台，同 node 选项）
   status        查询运行中节点的状态（高度、链尾、对等节点、交易池、是否挖矿）
   balance       查询地址余额（默认查询节点钱包自身地址）
   utxos         列出地址的未花费输出（UTXO）
@@ -41,7 +42,7 @@ const usageText = `p2pchain 节点与钱包工具
   printchain    打印本地区块链（离线，只读）
   help          显示本帮助
 
-节点选项（node）:
+节点选项（node / ui）:
   -listen  :6688              P2P 监听地址
   -rpc     127.0.0.1:6689     控制接口监听地址（仅本机，无鉴权）
   -seed    host:port           种子节点地址（可留空）
@@ -70,6 +71,7 @@ mine 选项:
 
 示例:
   node -mine -datadir ~/.p2pchain
+  node ui -mine               # 启动节点并打开 Developer Console
   node status
   node balance
   node send -to 1AbC... -amount 10 -fee 1
@@ -99,6 +101,10 @@ func runCLI(cmd string, args []string, stdout, stderr io.Writer) (code int, ok b
 	}
 	if cmd == "node" {
 		runNode(args)
+		return 0, true
+	}
+	if cmd == "ui" {
+		runNodeUI(args)
 		return 0, true
 	}
 	fn, found := cliCommands[cmd]
