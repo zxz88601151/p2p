@@ -44,7 +44,8 @@ const (
 
 // Blockchain 内存中的区块链结构。
 // blocks 按高度顺序存储；utxo 为当前链的未花费输出集合（与 blocks 尾部一致）。
-// store 非空时，每次成功追加都会同步落盘，启动时从磁盘重建。
+// store 非空时，运行时新区块（AddBlock）追加成功后同步落盘；
+// 启动时的历史区块回放在此读取并重建，**回放过程不写回存储**。
 type Blockchain struct {
 	mu     sync.RWMutex
 	blocks []*block.Block
@@ -102,7 +103,9 @@ func NewBlockchainFromStore(store storage.BlockStore) (*Blockchain, error) {
 		if err != nil {
 			return nil, fmt.Errorf("读取高度 %d 区块失败: %w", i, err)
 		}
-		if err := bc.AddBlock(b); err != nil {
+		// 回放入口：这些区块本就来自磁盘，只校验并重建内存，绝不写回（否则会把
+		// blocks.dat 变成不断增长的重复日志，见 addBlock 注释）。
+		if err := bc.applyBlock(b); err != nil {
 			return nil, fmt.Errorf("回放高度 %d 区块失败（数据可能损坏）: %w", i, err)
 		}
 	}
@@ -249,8 +252,28 @@ func (bc *Blockchain) ValidateBlock(b *block.Block) error {
 	return nil
 }
 
-// AddBlock 校验并把区块原子地追加到链尾（校验 + UTXO 整体替换 + 追加 + 落盘）。
+// 区块追加语义（务必注意两类入口的区别）：
+//
+//   - 运行时新区块（挖矿产出 / P2P 收到）：AddBlock  —— 校验 + 入内存 + 落盘
+//   - 启动时回放历史区块：               applyBlock —— 校验 + 入内存 + **不落盘**
+//
+// 回放必须不落盘：历史区块本来就来自磁盘，回放时再 SaveBlock 一次等于把同一条记录
+// 重复追加进 append-only 的 blocks.dat，导致存储里的记录数多于链的实际高度
+// （同一个区块占据两个高度），下一次启动时回放会因 prev-hash 不匹配而拒绝加载，
+// 节点永久无法启动（P0 · GENESIS-0）。
 func (bc *Blockchain) AddBlock(b *block.Block) error {
+	return bc.addBlock(b, true)
+}
+
+// applyBlock 回放一个已持久化的历史区块：完整执行与 AddBlock 相同的一致性校验，
+// 但绝不写回存储。仅供 NewBlockchainFromStore 启动回放使用。
+func (bc *Blockchain) applyBlock(b *block.Block) error {
+	return bc.addBlock(b, false)
+}
+
+// addBlock 是追加的唯一实现：validateBlock →（可选）落盘 → 原子替换 UTXO 与链尾。
+// persist=false 时只重建内存状态。
+func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
@@ -259,7 +282,7 @@ func (bc *Blockchain) AddBlock(b *block.Block) error {
 		return fmt.Errorf("添加区块失败: %w", err)
 	}
 	// 先落盘再更新内存状态：落盘失败则内存状态不变，保证两者一致
-	if bc.store != nil {
+	if persist && bc.store != nil {
 		if err := bc.store.SaveBlock(b); err != nil {
 			return fmt.Errorf("区块持久化失败: %w", err)
 		}
