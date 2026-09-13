@@ -103,6 +103,18 @@ func (c *Client) Mine(count int) (*MineResponse, error) {
 	return &out, nil
 }
 
+// Stop 请求节点优雅停止（PHASE PRODUCT-DEV-1B）。
+//
+// 注意：节点可能在写出响应之前就关闭了连接，这属于正常现象而非失败，
+// 调用方应以「节点是否真的退出」作为最终判据（见 cmdStop 的轮询确认）。
+func (c *Client) Stop() (*StopResponse, error) {
+	var out StopResponse
+	if err := c.post("/stop", struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) get(path string, query map[string]string, out any) error {
 	u := c.base + path
 	if len(query) > 0 {

@@ -45,7 +45,7 @@ func startTestRuntime(t *testing.T, mine bool) (*nodeRuntime, *control.Client, s
 func mineBlocks(t *testing.T, rt *nodeRuntime, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
-		if !mineOnce(rt.svc) {
+		if !mineOnce(rt.svc, nil) {
 			t.Fatalf("第 %d 次挖矿被意外中断", i+1)
 		}
 	}

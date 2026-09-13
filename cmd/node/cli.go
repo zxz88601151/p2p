@@ -3,8 +3,9 @@
 // 命令分为两类：
 //   - 在线命令（status / balance / utxos / send）：通过本机控制接口与运行中的节点交互，
 //     因为只有节点才知道当前链尾、交易池与网络状态；
-//   - 离线命令（wallet / printchain）：直接读取数据目录，不需要节点在运行
-//     （printchain 以只读方式打开区块文件，因此不影响运行中的节点）。
+//   - 离线命令（wallet / printchain / verify / reset）：直接读/写数据目录，不需要节点在运行
+//     （printchain 与 verify 以只读方式打开区块文件，因此不影响运行中的节点；
+//     reset 相反，它要求数据目录**没有**节点在使用，见 cmdReset）。
 //
 // 设计约束：所有命令都把输出写到调用方注入的 io.Writer 并返回退出码，
 // 自身从不调用 os.Exit —— 这样命令行行为可以在测试中被直接断言
@@ -12,12 +13,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"p2pchain/internal/blockchain"
 	"p2pchain/internal/control"
@@ -39,9 +44,11 @@ const usageText = `p2pchain 节点与钱包工具
   utxos         列出地址的未花费输出（UTXO）
   send          用节点钱包向指定地址转账
   mine          按需立即挖出区块（开发/测试用，对标 bitcoind 的 generatetoaddress）
+  stop          请求运行中的节点优雅停止（释放数据目录锁后退出）
   wallet        查看或创建本地钱包（离线）
   printchain    打印本地区块链（离线，只读）
   verify        只读校验本地区块链（离线，绝不修改任何数据）
+  reset         清空本地实验状态（离线，破坏性：删除链/钱包/锁）
   help          显示本帮助
 
 节点选项（node / ui）:
@@ -69,7 +76,8 @@ mine 选项:
   -datadir <目录>              数据目录（默认 ~/.p2pchain）
   -limit   <整数>              （printchain）只打印最高 N 个区块，0 表示全部
   -tx                          （printchain）同时打印每个区块的交易
-  -json                        （printchain / verify）以 JSON 输出
+  -json                        （printchain / verify / reset）以 JSON 输出
+  -force                       （reset）跳过确认提示（脚本 / CI 使用）
 
 示例:
   node -mine -datadir ~/.p2pchain
@@ -78,9 +86,12 @@ mine 选项:
   node balance
   node send -to 1AbC... -amount 10 -fee 1
   node mine -count 11        # 立即出块，使首笔 coinbase 成熟
+  node stop                  # 优雅停止节点（等价于终端里按 Ctrl+C）
   node printchain -limit 5 -tx
   node verify -datadir ./data-a        # 只读校验本地链（退出码 0=通过 / 1=不通过）
   node verify -datadir ./data-a -json  # 机器可读报告
+  node reset -datadir ./data-a         # 清空实验状态，回到首次运行状态（需确认）
+  node reset -datadir ./data-a -force  # 同上但跳过确认（脚本用）
 `
 
 // cmdFunc 子命令实现：接收参数与输出目标，返回进程退出码。
@@ -93,10 +104,16 @@ var cliCommands = map[string]cmdFunc{
 	"utxos":      cmdUTXOs,
 	"send":       cmdSend,
 	"mine":       cmdMine,
+	"stop":       cmdStop,
 	"wallet":     cmdWallet,
 	"printchain": cmdPrintChain,
 	"verify":     cmdVerify,
+	"reset":      cmdReset,
 }
+
+// cliStdin 是 reset 确认提示的输入源。生产恒为 os.Stdin，
+// 测试可临时替换以断言「输入 yes / 输入其它 / 非终端」三条分支。
+var cliStdin io.Reader = os.Stdin
 
 // runCLI 执行子命令并返回退出码。ok=false 表示不是已知子命令。
 func runCLI(cmd string, args []string, stdout, stderr io.Writer) (code int, ok bool) {
@@ -271,6 +288,56 @@ func cmdMine(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "已挖出 %d 个区块，当前高度 %d\n", resp.Mined, resp.Height)
 	return 0
+}
+
+// stopWaitTimeout 发出停止请求后，等待节点真正退出的最长时限。
+// 覆盖「挖矿节点需要放弃当前候选区块后再退出」的正常耗时，
+// 超时则说明停止请求可能未被处理，必须如实报错而不是假装成功。
+const stopWaitTimeout = 15 * time.Second
+
+// stopPollInterval 等待节点退出时的探活间隔。
+const stopPollInterval = 100 * time.Millisecond
+
+// cmdStop 请求运行中的节点优雅停止（PHASE PRODUCT-DEV-1B）。
+//
+// 为什么需要它：在 Windows 下，后台/脚本启动的节点进程无法被投递可捕获的
+// 控制台信号（Ctrl+C 只能广播到整个控制台组，强杀又不会走清理链），
+// 于是「正常停止」长期只能靠 taskkill /F —— 那会留下 node.lock 残留。
+// 本命令走既有本机控制接口，让节点自己走一遍与 SIGINT 完全相同的关闭链。
+//
+// 判定成功的标准不是「请求发出去了」，而是「节点真的退出了」：
+// 控制接口不再响应才算停止完成（STOP-INV-01）。
+func cmdStop(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("stop", stderr)
+	rpc := fs.String("rpc", control.DefaultAddr, "节点控制接口地址")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	client := control.NewClient(*rpc)
+	// 先探活：节点不在时给出与其它在线命令一致的可操作提示。
+	if _, err := client.Status(); err != nil {
+		return fail(stderr, "%v\n（提示：请先用 `node` 启动节点）", err)
+	}
+
+	// 节点可能在写出响应前就关闭了连接——这是「已经在退出了」的正常表现，
+	// 因此不把它当失败；最终结论以「节点是否真的退出」为准。
+	if _, err := client.Stop(); err != nil {
+		fmt.Fprintf(stderr, "提示: 停止请求的响应未完整收到（%v），继续确认节点是否已退出...\n", err)
+	} else {
+		fmt.Fprintf(stdout, "已发送停止请求到 %s\n", *rpc)
+	}
+
+	deadline := time.Now().Add(stopWaitTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(stopPollInterval)
+		if _, err := client.Status(); err != nil {
+			fmt.Fprintf(stdout, "节点已停止（控制接口 %s 不再响应；数据目录锁已释放）\n", *rpc)
+			return 0
+		}
+	}
+	return fail(stderr, "节点在 %v 内未退出，停止请求可能未被处理；可检查节点日志或改用 Ctrl+C",
+		stopWaitTimeout)
 }
 
 // resolveAddress 解析查询目标地址：显式给出则直接用，否则取节点钱包地址。
@@ -468,4 +535,254 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "[verify] 原因      : %s\n", rep.Reason)
 	return 1
+}
+
+// ---- 离线命令：reset（PHASE PRODUCT-DEV-1A）----
+
+// resetDataFiles 一个数据目录中的全部**持久化状态产物**（§2 B/C）。
+//
+// 切片顺序即删除顺序，且顺序是有意义的：blocks.dat 排第一。
+// 若节点仍在运行，Windows 会因文件被占用而在第一个文件上直接失败，
+// 从而实现「一个都没删就失败」，而不是删掉钱包之后才失败（RESET-INV-07）。
+//
+// node.lock 不在此列：它由 DirLock.Release 删除（持有锁时不能删自己打开的
+// 文件），或在 --force 处理陈旧锁时单独删除。
+//
+// 这里只列真正会落盘的文件。UTXO / mempool / 网络状态纯内存，日志只在内存
+// ring 中，没有配置文件（internal/config 是未被引用的死包），因此无需清理。
+var resetDataFiles = []string{"blocks.dat", "wallet.json"}
+
+// resetReport 是 reset 的结果报告（-json 输出，字段风格与 verify 一致）。
+type resetReport struct {
+	DataDir string   `json:"data_dir"`
+	Removed []string `json:"removed"` // 本次实际删除的文件
+	Absent  []string `json:"absent"`  // 本就不存在（已干净）
+	Failed  []string `json:"failed"`  // 删除失败
+	Errors  []string `json:"errors"`  // 失败的具体原因
+	Clean   bool     `json:"clean"`   // 目录已无任何已知状态文件
+	Aborted bool     `json:"aborted"` // 首个文件失败后中止，剩余文件未被处理
+}
+
+// cmdReset 清空一个数据目录的实验状态，使其回到「首次运行」状态（§3 Option C）。
+//
+// 语义：删除 blocks.dat + wallet.json + node.lock。下次启动节点时会自动生成
+// 确定性创世区块与新钱包 —— 这就是一个可重复实验的干净起点。
+//
+// 不保留钱包（§3 否决 Option B）：链已删除而保留一个余额归零、UTXO 不存在的
+// 钱包是误导性状态；且 coinbase 归属矿工地址，保留旧钱包会让新链与「真正首次
+// 运行」的链不一致，反而削弱可复现性。需要长期保留身份请用 -datadir 分目录。
+//
+// 安全模型（§4）：
+//   - 默认需要交互确认；--force 跳过（脚本 / CI 使用）；
+//   - 非终端且无 --force 时直接失败，避免无人看管的静默破坏；
+//   - 先尝试获取数据目录独占锁。取不到说明存在 node.lock：
+//     无 --force 时中止，有 --force 时按陈旧锁处理；
+//   - 任一文件删除失败 => 退出码非 0 并列出失败项，绝不静默部分成功。
+func cmdReset(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("reset", stderr)
+	dataDir := fs.String("datadir", defaultDataDir(), "数据目录")
+	force := fs.Bool("force", false, "跳过确认提示（脚本 / CI 使用）")
+	asJSON := fs.Bool("json", false, "以 JSON 输出（机器可读）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// 1) 占用探测：能否取得数据目录独占锁。
+	//    先记录 node.lock 是否已存在：探测本身会创建它，
+	//    否则任何干净的目录都会被报告成「删掉了 node.lock」。
+	lockPath := filepath.Join(*dataDir, "node.lock")
+	lockExisted := true
+	if _, err := os.Stat(lockPath); err != nil {
+		lockExisted = false
+	}
+	lock, lockErr := storage.AcquireDirLock(*dataDir)
+	heldLock := lockErr == nil
+	if lockErr != nil && !errors.Is(lockErr, storage.ErrDatadirLocked) {
+		return fail(stderr, "探测数据目录失败: %v", lockErr)
+	}
+	if heldLock {
+		// 持有锁期间其它节点进程无法启动；结束时 Release 会删掉 node.lock。
+		defer func() { _ = lock.Release() }()
+	} else if !*force {
+		return fail(stderr,
+			"数据目录已被占用（存在 node.lock），未删除任何文件：\n"+
+				"  目录：%s\n"+
+				"  请先停止使用该目录的节点进程后重试；\n"+
+				"  若确认没有节点在运行（崩溃残留的陈旧锁），请追加 --force。",
+			*dataDir)
+	}
+
+	// 2) 确认（默认需要，--force 跳过）
+	if !*force {
+		pending := make([]string, 0, len(resetDataFiles)+1)
+		for _, name := range resetDataFiles {
+			if _, err := os.Stat(filepath.Join(*dataDir, name)); err == nil {
+				pending = append(pending, name)
+			}
+		}
+		if !heldLock {
+			pending = append(pending, "node.lock")
+		}
+		if len(pending) > 0 && !confirmReset(stdout, stderr, *dataDir, pending) {
+			fmt.Fprintln(stderr, "已取消，未删除任何文件。")
+			return 1
+		}
+	}
+
+	// 3) 删除（顺序敏感，见 resetDataFiles 注释）
+	//
+	// 失败即中止（RESET-INV-07）：第一个文件删除失败就停止，不再处理剩余文件。
+	// 「blocks.dat 排第一」只保证链最先被尝试；若失败后继续删 wallet.json，
+	// 就会留下「链还在、钱包没了」的不可恢复状态 —— 这比什么都不删更糟。
+	rep := resetReport{
+		DataDir: *dataDir,
+		Removed: []string{},
+		Absent:  []string{},
+		Failed:  []string{},
+		Errors:  []string{},
+	}
+	var aborted bool
+	for _, name := range resetDataFiles {
+		path := filepath.Join(*dataDir, name)
+		if _, err := os.Stat(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				rep.Absent = append(rep.Absent, name)
+				continue
+			}
+			rep.Failed = append(rep.Failed, name)
+			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", name, err))
+			aborted = true
+			break
+		}
+		if err := os.Remove(path); err != nil {
+			rep.Failed = append(rep.Failed, name)
+			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", name, err))
+			aborted = true
+			break
+		}
+		rep.Removed = append(rep.Removed, name)
+	}
+	if aborted {
+		// 中止：保留现场。若本次探测自己创建了 node.lock，defer 的 Release 会删掉它，
+		// 使目录回到操作前的样子；用户持有的陈旧锁则原样保留。
+	} else if heldLock {
+		// Windows 下无法删除自己仍打开的文件，交由锁自身的释放逻辑处理。
+		if err := lock.Release(); err != nil {
+			rep.Failed = append(rep.Failed, "node.lock")
+			rep.Errors = append(rep.Errors, fmt.Sprintf("node.lock: %v", err))
+		} else if lockExisted {
+			rep.Removed = append(rep.Removed, "node.lock")
+		} else {
+			// 锁是本次探测自己创建的，不属于「用户的状态」，不计入已删除。
+			rep.Absent = append(rep.Absent, "node.lock")
+		}
+	} else {
+		resetOne(&rep, lockPath, "node.lock")
+	}
+
+	// 4) 复核：目录里是否还有任何已知状态文件（RESET-INV-01/02/03）
+	rep.Aborted = aborted
+	rep.Clean = len(rep.Failed) == 0
+	for _, name := range append(append([]string{}, resetDataFiles...), "node.lock") {
+		if _, err := os.Stat(filepath.Join(*dataDir, name)); err == nil {
+			rep.Clean = false
+		}
+	}
+
+	if *asJSON {
+		data, err := json.MarshalIndent(rep, "", "  ")
+		if err != nil {
+			return fail(stderr, "序列化 reset 报告失败: %v", err)
+		}
+		fmt.Fprintln(stdout, string(data))
+		if !rep.Clean {
+			return 1
+		}
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "[reset] 数据目录  : %s\n", rep.DataDir)
+	fmt.Fprintf(stdout, "[reset] 已删除    : %s\n", joinOrNone(rep.Removed))
+	fmt.Fprintf(stdout, "[reset] 本不存在  : %s\n", joinOrNone(rep.Absent))
+	if !rep.Clean {
+		fmt.Fprintf(stdout, "[reset] 结果      : FAIL\n")
+		fmt.Fprintf(stdout, "[reset] 删除失败  : %s\n", strings.Join(rep.Failed, ", "))
+		for _, e := range rep.Errors {
+			fmt.Fprintf(stdout, "[reset] 原因      : %s\n", e)
+		}
+		if aborted {
+			fmt.Fprintf(stdout, "[reset] 说明      : 已在第一个失败处中止，剩余文件未被处理（数据安全优先）\n")
+		}
+		fmt.Fprintln(stderr, "错误: reset 未完全成功，数据目录可能处于不一致状态，请检查后重试。")
+		return 1
+	}
+	if len(rep.Removed) == 0 {
+		fmt.Fprintf(stdout, "[reset] 结果      : OK（数据目录已是干净状态，无需删除）\n")
+		return 0
+	}
+	fmt.Fprintf(stdout,
+		"[reset] 结果      : OK（已回到首次运行状态；下次启动将重新生成确定性创世与新钱包）\n")
+	return 0
+}
+
+// resetOne 删除单个文件并把结果记入报告。
+func resetOne(rep *resetReport, path, name string) {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			rep.Absent = append(rep.Absent, name)
+			return
+		}
+		rep.Failed = append(rep.Failed, name)
+		rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", name, err))
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		rep.Failed = append(rep.Failed, name)
+		rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", name, err))
+		return
+	}
+	rep.Removed = append(rep.Removed, name)
+}
+
+// confirmReset 在终端上请求确认。非终端（脚本 / CI）无法交互确认时返回 false。
+func confirmReset(stdout, stderr io.Writer, dataDir string, pending []string) bool {
+	if !isTerminalFn(cliStdin) {
+		fmt.Fprintf(stderr,
+			"错误: reset 是破坏性操作，需要确认；当前标准输入不是终端，无法交互确认。\n"+
+				"  若确认要清空 %s，请追加 --force。\n", dataDir)
+		return false
+	}
+	fmt.Fprintf(stdout, "即将清空数据目录: %s\n将删除: %s\n", dataDir, strings.Join(pending, ", "))
+	fmt.Fprint(stdout, "此操作不可撤销。输入 yes 继续: ")
+	line, err := bufio.NewReader(cliStdin).ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		fmt.Fprintln(stdout)
+		return false
+	}
+	return strings.TrimSpace(line) == "yes"
+}
+
+// isTerminalFn 判断输入是否来自终端。抽成变量只为让测试能覆盖
+// 「终端 + 输入 yes」与「终端 + 输入其它」两条分支；生产恒为 isTerminal。
+var isTerminalFn = isTerminal
+
+// isTerminal 判断 r 是否是字符设备（终端 / 控制台）。
+func isTerminal(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// joinOrNone 把文件列表拼成可读串，空列表显示为「（无）」。
+func joinOrNone(list []string) string {
+	if len(list) == 0 {
+		return "（无）"
+	}
+	return strings.Join(list, ", ")
 }

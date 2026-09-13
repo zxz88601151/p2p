@@ -24,6 +24,9 @@ import (
 // ErrAddressRequired 请求缺少 address 参数。
 var ErrAddressRequired = errors.New("缺少 address 参数")
 
+// ErrStopUnsupported 节点未启用远程停止（未注入停止回调）。
+var ErrStopUnsupported = errors.New("该节点未启用远程停止")
+
 // Node 是控制接口所需的节点能力（由节点服务实现）。
 type Node interface {
 	// Status 返回节点运行状态。
@@ -108,6 +111,12 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// StopResponse 停止请求的结果。
+type StopResponse struct {
+	Accepted bool   `json:"accepted"`
+	Message  string `json:"message"`
+}
+
 // Server 控制接口服务端。
 type Server struct {
 	node Node
@@ -116,6 +125,11 @@ type Server struct {
 	mu   sync.Mutex
 	// logs 是可选的日志来源；未注入时 /logs 返回空数组（诚实空态，不伪造日志）。
 	logs LogProvider
+
+	// stopHook 由节点注入：收到 POST /stop 时调用，用于请求节点优雅退出。
+	// 未注入时 /stop 返回 501（能力未启用）——绝不假装有能力。
+	stopHook func()
+	stopOnce sync.Once
 }
 
 // NewServer 创建服务端。
@@ -131,6 +145,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mine", s.handleMine)
 	mux.HandleFunc("/block", s.handleBlock)
 	mux.HandleFunc("/logs", s.handleLogs)
+	mux.HandleFunc("/stop", s.handleStop)
 	// 根路径提供本机 Developer Console 页面（单页、零外部资源）。
 	// 放在最后注册：ServeMux 以「最长前缀」匹配，不会遮蔽上面的精确路由。
 	mux.HandleFunc("/", s.handleConsole)
@@ -162,6 +177,20 @@ func (s *Server) Start(addr string) (string, error) {
 	// Serve 干净返回，无竞争、无崩溃。
 	go func() { _ = srv.Serve(ln) }()
 	return ln.Addr().String(), nil
+}
+
+// SetStopHook 注入「收到停止请求」的回调（PHASE PRODUCT-DEV-1B）。
+//
+// 回调由节点侧提供，语义是「请求节点优雅退出」，而不是「在这里执行关闭」——
+// 真正的关闭仍由节点主流程统一执行，从而保证 /stop 与 SIGINT/SIGTERM
+// 走完全相同的清理链（控制接口 → P2P → 存储 → 数据目录锁）。
+//
+// 未注入时 POST /stop 返回 501，而不是伪装成成功。
+// 回调最多被调用一次：重复的 /stop 请求幂等，不会重复触发关闭。
+func (s *Server) SetStopHook(hook func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopHook = hook
 }
 
 // Addr 返回实际监听地址（Start 之前为空）。
@@ -300,6 +329,36 @@ func (s *Server) handleMine(w http.ResponseWriter, r *http.Request) {
 
 // MaxMineCount 单次按需出块的上限，避免一次请求长时间占用节点。
 const MaxMineCount = 1000
+
+// handleStop 请求节点优雅停止（PHASE PRODUCT-DEV-1B）。
+//
+// 仅接受 POST：停止是破坏性动作，绝不能由 GET 触发——浏览器预取、
+// 控制台页面刷新、爬虫抓取都可能发出 GET，那会让节点被间接地关掉。
+//
+// 顺序至关重要：先把响应写出并 flush，再触发停止回调。
+// 若反过来，控制接口会在响应到达调用方之前被关闭，调用方只能看到
+// 「连接被重置」，无法区分「已接受」与「节点崩了」。
+func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	s.mu.Lock()
+	hook := s.stopHook
+	s.mu.Unlock()
+	if hook == nil {
+		writeError(w, http.StatusNotImplemented, ErrStopUnsupported)
+		return
+	}
+	writeJSON(w, http.StatusOK, StopResponse{
+		Accepted: true,
+		Message:  "节点已接受停止请求，正在释放数据目录锁并退出",
+	})
+	// 确保响应字节已经离开本进程，再开始关闭控制接口。
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	s.stopOnce.Do(hook)
+}
 
 // requireMethod 校验请求方法；不符时写 405 并返回 false。
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {

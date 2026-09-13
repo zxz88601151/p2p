@@ -225,7 +225,12 @@ func (rt *nodeRuntime) Close() {
 			_ = rt.store.Close()
 		}
 		if rt.lock != nil {
-			_ = rt.lock.Release()
+			// 不能静默吞掉：释放失败意味着 node.lock 残留，下次启动会被拒，
+			// 用户必须知道这件事（STOP-INV-09：异常不得静默报告成功）。
+			if err := rt.lock.Release(); err != nil {
+				log.Printf("[node] 警告：释放数据目录锁失败，可能需要手动删除 %s: %v",
+					rt.lock.Path(), err)
+			}
 		}
 	})
 }
@@ -299,25 +304,41 @@ func startNode(args []string, openConsole bool) {
 		testPanicAtStart()
 	}
 
-	// 优雅关闭：捕获 SIGINT/SIGTERM 后释放全部资源（含数据目录锁），
-	// 保证被信号终止的节点不会残留 node.lock 导致同目录后续启动被拒。
-	// 注意：这不属于「自动 stale-lock 删除」——此处释放的是本进程自己持有的锁；
-	// SIGINT/SIGTERM 复用与正常关闭完全相同的 rt.Close 链（§2.3），不为信号单独写释放逻辑。
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		<-sigCh
-		log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
-		rt.Close()
-		os.Exit(0)
-	}()
+	// ---- 停止出口（PHASE PRODUCT-DEV-1B §3）----
+	//
+	// stopCh 是节点唯一的「停止请求」出口，有两个来源：
+	//   1. OS 信号 SIGINT / SIGTERM（真实终端按 Ctrl+C、POSIX 的 kill）；
+	//   2. 控制接口 POST /stop（可编程停止，Windows 后台进程也能停）。
+	// 两者都只做一件事：关闭 stopCh。真正的关闭由下面的同一条路径执行，
+	// 因此「被信号停」与「被命令停」的清理行为完全一致。
+	//
+	// 关键改变：旧实现在信号 goroutine 里直接 rt.Close() + os.Exit(0)，
+	// 这会与主流程并发——若信号恰好在 AddBlock 写盘期间到达，store.Close()
+	// 会与写入并发执行，存在损坏 blocks.dat 的风险（STOP-INV-05）。
+	// 现在改为单出口：主流程自己走到 return，由最外层 defer 执行 rt.Close()。
+	var stopOnce sync.Once
+	stopCh := make(chan struct{})
+	requestStop := func() { stopOnce.Do(func() { close(stopCh) }) }
+	rt.ctl.SetStopHook(requestStop)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	if *mine {
-		runMiner(rt.svc, *maxBlocks)
+		runMiner(rt.svc, *maxBlocks, stopCh)
+		log.Printf("[node] 正在关闭（释放数据目录锁）...")
 		return
 	}
-	log.Printf("[node] 以全节点模式运行（未启用挖矿）；可用 `node status` 查看状态")
-	select {}
+	log.Printf("[node] 以全节点模式运行（未启用挖矿）；可用 `node stop` 停止节点")
+	select {
+	case <-sigCh:
+		log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
+	case <-stopCh:
+		log.Printf("[node] 收到停止请求，正在关闭（释放数据目录锁）...")
+	}
+	// 落到这里后由最外层 defer 执行 rt.Close()：
+	// 控制接口 → P2P → 区块存储 → 数据目录锁，顺序固定且幂等。
 }
 
 // openConsolePage 打印并尝试打开 Developer Console 页面（`node ui`）。
@@ -358,18 +379,29 @@ func isLoopback(addr string) bool {
 }
 
 // runMiner 持续挖矿：组装候选区块 → 挖矿（可被链尾变化中断）→ 上链 → 广播。
-// maxBlocks > 0 时挖满该数量后停止挖矿，转为普通全节点继续运行。
-func runMiner(svc *nodeService, maxBlocks int) {
+// maxBlocks > 0 时挖满该数量后停止挖矿，转为普通全节点继续运行（直到收到停止请求）。
+//
+// stop 是停止请求通道：收到后不再组装新的候选区块，函数返回，
+// 由调用方走统一的关闭链。已经在途的 AddBlock 会自然跑完——
+// 绝不在写盘中途中断，这是 STOP-INV-05（stop 不损坏 blocks.dat）的保证。
+func runMiner(svc *nodeService, maxBlocks int, stop <-chan struct{}) {
 	svc.mining.Store(true)
 	log.Printf("[miner] 挖矿已启用，地址=%s 上限=%s", svc.miner.Address(), blocksLimitText(maxBlocks))
 	mined := 0
 	for {
+		select {
+		case <-stop:
+			svc.mining.Store(false)
+			return
+		default:
+		}
 		if maxBlocks > 0 && mined >= maxBlocks {
 			svc.mining.Store(false)
 			log.Printf("[miner] 已达到挖矿上限 %d 个区块（当前高度 %d），转为全节点模式", maxBlocks, svc.chain.Height())
-			select {}
+			<-stop // 继续运行直到被要求停止
+			return
 		}
-		if mineOnce(svc) {
+		if mineOnce(svc, stop) {
 			mined++
 		}
 	}
@@ -383,11 +415,14 @@ func blocksLimitText(max int) string {
 	return fmt.Sprintf("%d 个区块", max)
 }
 
-// mineOnce 尝试挖出一个区块。返回 false 表示因链尾变化被中断，需要重新组装。
+// mineOnce 尝试挖出一个区块。返回 false 表示被中断（链尾变化或收到停止请求），需要重新组装。
 //
 // 全程持有 mineMu：持续挖矿循环与「按需出块」两类入口必须串行，
 // 否则同一高度会有两个候选区块在求解，先出块的会白烧 CPU。
-func mineOnce(svc *nodeService) bool {
+//
+// stop 为 nil 时该中断源不存在（按需出块场景），nil channel 在 select 中永不就绪。
+// 停止只取消「求解过程」，不取消已经开始的写盘：求解成功后的 AddBlock 照常跑完。
+func mineOnce(svc *nodeService, stop <-chan struct{}) bool {
 	svc.mineMu.Lock()
 	defer svc.mineMu.Unlock()
 
@@ -430,6 +465,11 @@ func mineOnce(svc *nodeService) bool {
 		close(cancel)
 		<-done // 等 worker 全部退出，确保没有后台 goroutine 继续持有这个候选区块
 		log.Printf("[miner] 链尾已变化，放弃当前候选区块（高度=%d）", height)
+		return false
+	case <-stop:
+		close(cancel)
+		<-done
+		log.Printf("[miner] 收到停止请求，放弃当前候选区块（高度=%d）", height)
 		return false
 	case <-done:
 	}

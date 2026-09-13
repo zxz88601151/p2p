@@ -167,7 +167,7 @@ func (s *nodeService) Mine(count int) (control.MineResponse, error) {
 
 	mined := 0
 	for i := 0; i < count; i++ {
-		if !mineOnce(s) {
+		if !mineOnce(s, nil) {
 			// 被链尾变化中断：说明有对端区块到达，本轮作废，不计入结果
 			break
 		}
