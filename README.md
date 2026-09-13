@@ -1,8 +1,42 @@
 # P2PChain
 
-一个类似比特币的点对点 Proof-of-Work 区块链，Go 1.22 实现，**零外部依赖（仅标准库）**，支持普通电脑 CPU 挖矿。定位是学习型教学项目：用最直白的方式完整实现一条真实可跑、可转账、可多节点共识同步的 UTXO 区块链。
+一个给开发者用的**本地区块链节点工具**：Go 1.22 实现，**零外部依赖（仅标准库）、单个二进制**，
+在本机运行一条确定性可重放的 Proof-of-Work UTXO 链，并提供 CLI、本机 JSON 接口
+与一个轻量观测控制台。
+
+```text
+Local · Deterministic · Single Binary · Developer-focused · Replayable · Verifiable
+```
+
+它的用途是：让你在几秒内**造出任意高度的本地链**、观察共识与 P2P 的真实行为、
+用 CLI 构造并广播交易、并在任何时候用 `verify` **只读地**证明本地链的完整与一致。
 
 > ⚠️ 这是**学习/实验项目**，未做安全审计，不要用于任何真实资产场景。
+
+### 今天它是什么
+
+```text
+Developer Node
+```
+
+即：一个开发者在本机运行和调试的确定性节点 —— 自带完整 UTXO 与密码学交易校验、
+按需出块、每次启动自动把整条链重新校验一遍、并对自己的数据目录拥有独占所有权。
+
+**它不是**（这些尚未达到产品门槛，不在当前范围内）：
+
+```text
+Verification Runtime · Verifiable Work Runtime · Contribution Network
+```
+
+### 已具备的能力
+
+- 确定性本地链（固定创世，所有节点字节级一致）
+- UTXO 状态机与密码学交易校验（P-256 签名、公钥哈希锁定、双花/成熟期/金额守恒）
+- 重放（启动时对整条链重新执行完整共识校验）
+- 持久化（append-only `blocks.dat` + 数据目录独占锁 + 优雅释放）
+- P2P 同步（真实区块/交易传播、追赶同步、种子重连）
+- 挖矿（可取消、多核并行）
+- **离线只读校验（`verify`）**
 
 ## 已实现的功能（全部可运行、有测试覆盖）
 
@@ -17,7 +51,7 @@
 - **持久化**：`blocks.dat` 追加写 + 启动全量回放重建 UTXO；重启不丢链
 - **P2P 网络**：TCP + 换行分隔 JSON；握手（交换高度与已知节点）、区块/交易真实传播与中继、追赶同步（分批拉取）、**种子节点断线自动重连**（防孤岛链）
 - **控制接口**：localhost JSON API（`/status /balance /utxos /send /mine /block`）
-- **CLI 子命令**：`status / balance / utxos / send / mine / wallet / printchain / help`
+- **CLI 子命令**：`ui / node / status / balance / utxos / send / mine / wallet / printchain / verify / help`
 
 ## 快速开始
 
@@ -57,7 +91,41 @@ go build -o node ./cmd/node
 # 离线命令
 ./node wallet -datadir ./data-a         # 查看或创建本地钱包
 ./node printchain -datadir ./data-a     # 打印本地区块链（只读）
+./node verify -datadir ./data-a         # 只读校验本地链（退出码 0=通过 / 1=不通过）
 ```
+
+## 只读校验（verify）
+
+`verify` 以**只读**方式打开 `blocks.dat`，逐块重新执行与节点启动时完全相同的共识校验
+（父哈希 → PoW → 难度位 → 时间戳 → Merkle 重验 → 体积 → 交易状态迁移），
+输出 `PASS` / `FAIL`；失败时给出**失败高度、区块哈希与具体原因**，而不是泛化的 "invalid"。
+
+```text
+$ ./node verify -datadir ./data-a
+[verify] 数据目录  : ./data-a
+[verify] 已校验区块: 4 个（高度 0 → 3）
+[verify] 创世哈希  : 0000aca1af72...db58c
+[verify] 链尾哈希  : 0000b60369db...6ce59
+[verify] 结果      : PASS（只读回放校验通过，未修改任何数据）
+```
+
+保证（设计与测试双重约束）：
+
+- 不写 `blocks.dat`（校验前后的 SHA-256 与文件大小不变，有回归测试覆盖）
+- 不获取/创建/删除数据目录锁 —— 因此**可以在节点正在运行时执行**
+- 不加载或写入钱包、不产生新区块、不触发挖矿、不启动 P2P、不改变链状态
+- 退出码：`0` = 通过；`1` = 未通过或无法执行；`2` = 参数错误
+
+机器可读输出：`./node verify -datadir ./data-a -json`
+
+字节级格式（供第三方独立实现解析/复算）见
+[`docs/DETERMINISTIC-SERIALIZATION-SPEC.md`](docs/DETERMINISTIC-SERIALIZATION-SPEC.md)。
+
+## 控制台（Console）
+
+`node ui` 会在启动节点后打开内嵌的 Developer Console。
+它是**轻量节点观测面**（状态、链尾、网络、日志 + 按需出块），
+**不是**区块浏览器、交易构建器或钱包管理器 —— 这些能力请使用上面的 CLI。
 
 节点启动选项：`-listen`（P2P 监听）、`-rpc`（控制接口，仅本机回环）、`-seed`（种子地址，逗号分隔）、`-datadir`（数据目录）、`-mine`（启用挖矿）、`-maxblocks`（出块上限）、`-miners`（并行 worker 数）。
 
@@ -146,8 +214,8 @@ p2pchain/
 ## 测试
 
 ```bash
-go test ./...        # 单元 + 集成 + 进程内端到端（159 个顶层用例）
-go test -race ./...  # 数据竞态检测（同 159 个用例）
+go test ./...        # 单元 + 集成 + 进程内端到端（171 个顶层用例）
+go test -race ./...  # 数据竞态检测（同 171 个用例）
 bash scripts/smoke-e2e.sh   # 双真实节点进程：出块→同步→转账→打包→余额→真重启持久化（15 项）
 ```
 
@@ -171,4 +239,7 @@ bash scripts/smoke-e2e.sh   # 双真实节点进程：出块→同步→转账�
 - `docs/PROJECT-COMPLETION-REPORT.md` — 项目完成报告（全量验收证据 + 未决项分级）
 - `docs/DEVELOPMENT_PROMPT.md` — 模块任务卡片（原始开发提示词）
 - `docs/FULL-IMPLEMENTATION-REPORT.md` — 全量实现报告（含各阶段验收证据）
+- `docs/DETERMINISTIC-SERIALIZATION-SPEC.md` — **确定性序列化规范**（第三方可不读源码实现解析/哈希/创世重建）
+- `docs/PHASE-GENESIS-0-GENESIS-BLOCK-MINING-RUNTIME-VALIDATION.md` — 创世与挖矿实机验证（含独立复算证据）
+- `docs/PHASE-GENESIS-0.1-P0-PERSISTENCE-REMEDIATION.md` — P0 持久化缺陷修复与回归
 - `docs/PHASE-*.md` — 各阶段工程报告（含 `PHASE-BRAND-*` 产品/控制台阶段）
