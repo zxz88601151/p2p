@@ -19,6 +19,7 @@ import (
 	"io"
 	"path/filepath"
 
+	"p2pchain/internal/blockchain"
 	"p2pchain/internal/control"
 	"p2pchain/internal/storage"
 	"p2pchain/internal/wallet"
@@ -40,6 +41,7 @@ const usageText = `p2pchain 节点与钱包工具
   mine          按需立即挖出区块（开发/测试用，对标 bitcoind 的 generatetoaddress）
   wallet        查看或创建本地钱包（离线）
   printchain    打印本地区块链（离线，只读）
+  verify        只读校验本地区块链（离线，绝不修改任何数据）
   help          显示本帮助
 
 节点选项（node / ui）:
@@ -67,7 +69,7 @@ mine 选项:
   -datadir <目录>              数据目录（默认 ~/.p2pchain）
   -limit   <整数>              （printchain）只打印最高 N 个区块，0 表示全部
   -tx                          （printchain）同时打印每个区块的交易
-  -json                        （printchain）以 JSON 输出
+  -json                        （printchain / verify）以 JSON 输出
 
 示例:
   node -mine -datadir ~/.p2pchain
@@ -77,6 +79,8 @@ mine 选项:
   node send -to 1AbC... -amount 10 -fee 1
   node mine -count 11        # 立即出块，使首笔 coinbase 成熟
   node printchain -limit 5 -tx
+  node verify -datadir ./data-a        # 只读校验本地链（退出码 0=通过 / 1=不通过）
+  node verify -datadir ./data-a -json  # 机器可读报告
 `
 
 // cmdFunc 子命令实现：接收参数与输出目标，返回进程退出码。
@@ -91,6 +95,7 @@ var cliCommands = map[string]cmdFunc{
 	"mine":       cmdMine,
 	"wallet":     cmdWallet,
 	"printchain": cmdPrintChain,
+	"verify":     cmdVerify,
 }
 
 // runCLI 执行子命令并返回退出码。ok=false 表示不是已知子命令。
@@ -403,4 +408,64 @@ func cmdPrintChain(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+// ---- 离线只读校验 ----
+
+// cmdVerify 对本地链执行一次只读的确定性回放校验。
+//
+// 产品契约（PHASE BRAND-1.2 §3）：
+//   - 以**只读**方式打开 blocks.dat（与 printchain 同一机制），绝不写回、绝不取锁；
+//   - 逐块重新执行与节点启动时完全相同的共识校验（复用 blockchain.VerifyStoredChain）；
+//   - 结论只有 PASS / FAIL 两种，FAIL 时必须给出失败高度、区块哈希与具体原因；
+//   - 退出码：0 = 校验通过；1 = 校验未通过或无法执行；2 = 命令行参数错误。
+func cmdVerify(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("verify", stderr)
+	dataDir := fs.String("datadir", defaultDataDir(), "数据目录")
+	asJSON := fs.Bool("json", false, "以 JSON 输出（机器可读）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	store, err := storage.OpenFileBlockStoreReadOnly(*dataDir)
+	if err != nil {
+		return fail(stderr, "打开区块数据失败: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	rep, err := blockchain.VerifyStoredChain(store)
+	if err != nil {
+		return fail(stderr, "执行校验失败: %v", err)
+	}
+	rep.DataDir = *dataDir
+
+	if *asJSON {
+		data, err := json.MarshalIndent(rep, "", "  ")
+		if err != nil {
+			return fail(stderr, "序列化校验报告失败: %v", err)
+		}
+		fmt.Fprintln(stdout, string(data))
+		if !rep.Valid {
+			return 1
+		}
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "[verify] 数据目录  : %s\n", rep.DataDir)
+	if rep.Valid {
+		fmt.Fprintf(stdout, "[verify] 已校验区块: %d 个（高度 0 → %d）\n", rep.Blocks, rep.Height)
+		fmt.Fprintf(stdout, "[verify] 创世哈希  : %s\n", rep.GenesisHash)
+		fmt.Fprintf(stdout, "[verify] 链尾哈希  : %s\n", rep.TipHash)
+		fmt.Fprintf(stdout, "[verify] 结果      : PASS（只读回放校验通过，未修改任何数据）\n")
+		return 0
+	}
+	fmt.Fprintf(stdout, "[verify] 结果      : FAIL\n")
+	if rep.FailHeight >= 0 {
+		fmt.Fprintf(stdout, "[verify] 失败高度  : %d\n", rep.FailHeight)
+	}
+	if rep.FailHash != "" {
+		fmt.Fprintf(stdout, "[verify] 失败区块  : %s\n", rep.FailHash)
+	}
+	fmt.Fprintf(stdout, "[verify] 原因      : %s\n", rep.Reason)
+	return 1
 }
