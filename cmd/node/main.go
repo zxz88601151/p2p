@@ -136,11 +136,16 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	svc.net = p2pNode
 	p2pNode.SetHeightProvider(func() int { return chain.Height() })
 
-	go func() {
-		if err := p2pNode.Start(); err != nil {
-			log.Printf("[p2p] 监听结束: %v", err)
-		}
-	}()
+	// PHASE TEST-INFRASTRUCTURE-REMEDIATION-1：同步完成 P2P 端口绑定。
+	// Start 返回即 listener 已就绪（ListenAddr 就绪契约），消除
+	// 「newNodeRuntime 返回但监听地址仍是配置占位值（127.0.0.1:0）」的竞态。
+	// 绑定失败现在会让节点启动明确失败（此前只记日志，节点会以无监听状态继续运行）。
+	if err := p2pNode.Start(); err != nil {
+		p2pNode.Stop()
+		_ = store.Close()
+		_ = lock.Release()
+		return nil, fmt.Errorf("启动 P2P 监听失败: %w", err)
+	}
 
 	ctl := control.NewServer(svc)
 	actualRPC, err := ctl.Start(cfg.RPCAddr)

@@ -6,6 +6,7 @@ package main
 //   - 多核并行挖矿：并行路径产出的区块必须能通过共识校验（PoW 有效且 Nonce 落在搜索类内）。
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,13 @@ func TestSeedReconnectAfterRestart(t *testing.T) {
 	// 节点 A：先启动以取得一个稳定监听地址
 	rtA := startRuntimeAt(t, "127.0.0.1:0", nil, t.TempDir())
 	addrA := rtA.p2p.ListenAddr()
+
+	// 就绪契约（PHASE TEST-INFRASTRUCTURE-REMEDIATION-1）：newNodeRuntime 返回时
+	// listener 必已绑定，ListenAddr() 不得再返回配置占位地址（127.0.0.1:0）。
+	// 修复前此处存在竞态：占位地址会让 B 向端口 0 拨号并 30s 超时。
+	if strings.HasSuffix(addrA, ":0") {
+		t.Fatalf("listener readiness contract 被破坏：ListenAddr() 返回占位地址 %q", addrA)
+	}
 
 	// 节点 B：以 A 为种子
 	rtB := startRuntimeAt(t, "127.0.0.1:0", []string{addrA}, t.TempDir())

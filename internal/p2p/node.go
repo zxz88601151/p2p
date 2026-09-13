@@ -137,12 +137,30 @@ func NewNode(listenAddr, nodeID, genesisHash string, handler Handler) *Node {
 }
 
 // Start 启动监听（阻塞调用，通常在独立 goroutine 中运行）。
+// Start 同步完成端口绑定并返回实际地址，随后在后台 goroutine 接受连接。
+//
+// PHASE TEST-INFRASTRUCTURE-REMEDIATION-1：Start 返回时 listener 必已就绪——
+// 这是 ListenAddr() 的就绪契约（调用方拿到的是已解析的真实地址，
+// 127.0.0.1:0 这类配置占位值不会再作为运行时监听地址出现）。
+// 修复前 Start 阻塞式注入 Serve，调用方只能丢进 goroutine 异步等待，
+// 导致「newNodeRuntime 返回但 listener 尚未赋值」的竞态
+// （TestSeedReconnectAfterRestart 偶发 30s 超时的根因）。
 func (n *Node) Start() error {
 	ln, err := net.Listen("tcp", n.listenAddr)
 	if err != nil {
 		return fmt.Errorf("监听失败: %w", err)
 	}
-	return n.Serve(ln)
+	n.mu.Lock()
+	if n.closing {
+		n.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	n.listener = ln
+	n.mu.Unlock()
+	log.Printf("[p2p] 节点已启动，监听 %s（nodeID=%s）", ln.Addr().String(), n.nodeID)
+	go n.acceptLoop(ln)
+	return nil
 }
 
 // Serve 在调用方提供的监听器上接受连接（阻塞）。
@@ -161,7 +179,12 @@ func (n *Node) Serve(ln net.Listener) error {
 	n.listener = ln
 	n.mu.Unlock()
 	log.Printf("[p2p] 节点已启动，监听 %s（nodeID=%s）", ln.Addr().String(), n.nodeID)
+	n.acceptLoop(ln)
+	return nil
+}
 
+// acceptLoop 是 Start/Serve 共用的连接接受循环（阻塞直至 listener 关闭且节点 closing）。
+func (n *Node) acceptLoop(ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -169,7 +192,7 @@ func (n *Node) Serve(ln net.Listener) error {
 			closing := n.closing
 			n.mu.RUnlock()
 			if closing {
-				return nil
+				return
 			}
 			log.Printf("[p2p] 接受连接出错: %v", err)
 			continue
