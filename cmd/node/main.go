@@ -406,32 +406,170 @@ func isLoopback(addr string) bool {
 	return host == "localhost" || strings.HasPrefix(host, "127.") || host == "::1"
 }
 
-// runMiner 持续挖矿：组装候选区块 → 挖矿（可被链尾变化中断）→ 上链 → 广播。
+// 挖矿重试/退避参数（PHASE MINING-REMEDIATION-1）。
+//
+// 设计意图：修复前 mineOnce 返回裸 bool，上层对任何失败都「立即以同一高度重试」，
+// 在「补贴耗尽且无手续费交易」时退化为 6 核热循环 + 5 GB/天日志（P1-MINING-001）。
+// 下列参数把「重试」变成有界、有分类、有可观测性的行为。
+const (
+	// stallRecheckInterval 是 STALLED（政策终态）下的复查间隔。
+	// STALLED 不执行任何 PoW，只按该间隔重新评估「是否已出现合法候选」
+	// （例如带手续费交易已到达，或链尾已推进）。每秒一次的唤醒开销可忽略，
+	// 既不会忙等，也不会错过外部事件。
+	stallRecheckInterval = time.Second
+	// retryBackoffInitial / retryBackoffMax 是「无法归类的可重试失败」的有界指数退避。
+	retryBackoffInitial = 50 * time.Millisecond
+	retryBackoffMax     = 2 * time.Second
+	// maxConsecutiveOperationalFailures 是连续不可归类失败的升级阈值：
+	// 超过即进入 FAILED —— 保证「不得无限循环」。
+	maxConsecutiveOperationalFailures = 12
+	// maxConsecutiveStaleRetries 是连续「链尾变化」重试的守护阈值。
+	// 正常的分叉竞争远达不到该值；达到说明存在未预见的循环，转入有界退避。
+	// 注意：**不升级为 FAILED** —— 链尾变化本身是合法情形，不是缺陷。
+	maxConsecutiveStaleRetries = 1000
+)
+
+// runMiner 持续挖矿：组装候选区块 → **模板预校验** → 挖矿（可被链尾变化中断）→ 上链 → 广播。
 // maxBlocks > 0 时挖满该数量后停止挖矿，转为普通全节点继续运行（直到收到停止请求）。
 //
 // stop 是停止请求通道：收到后不再组装新的候选区块，函数返回，
 // 由调用方走统一的关闭链。已经在途的 AddBlock 会自然跑完——
 // 绝不在写盘中途中断，这是 STOP-INV-05（stop 不损坏 blocks.dat）的保证。
+//
+// 状态机（PHASE MINING-REMEDIATION-1）：循环不再以「worker goroutine 是否存在」
+// 判定运行状态，而是把 mineOnce 的**分类结果**映射为显式语义状态
+// （见 mining_state.go）。因此「无意义 PoW 热循环」在结构上不可能再出现：
+// 任何不可挖的情形都会落到 STALLED（政策终态）或 FAILED（结构性错误），二者都不执行 PoW。
 func runMiner(svc *nodeService, maxBlocks int, stop <-chan struct{}) {
 	svc.mining.Store(true)
+	svc.startHeight.Store(int64(svc.chain.Height()))
+	svc.setMineState(MiningStarting, "enabled")
 	log.Printf("[miner] 挖矿已启用，地址=%s 上限=%s", svc.miner.Address(), blocksLimitText(maxBlocks))
+
 	mined := 0
+	consecutiveStale := 0
+	consecutiveOperational := 0
+
+	// finish 统一收尾：关闭挖矿标志并落到终态（不干扰已在途的写盘）。
+	finish := func(state miningState, reason string) {
+		svc.mining.Store(false)
+		svc.setMineState(state, reason)
+	}
+
 	for {
 		select {
 		case <-stop:
-			svc.mining.Store(false)
+			finish(MiningStopped, "stopped")
 			return
 		default:
 		}
+
 		if maxBlocks > 0 && mined >= maxBlocks {
-			svc.mining.Store(false)
 			log.Printf("[miner] 已达到挖矿上限 %d 个区块（当前高度 %d），转为全节点模式", maxBlocks, svc.chain.Height())
+			finish(MiningStopped, "max-blocks-reached")
 			<-stop // 继续运行直到被要求停止
 			return
 		}
-		if mineOnce(svc, stop) {
+
+		switch mineOnce(svc, stop) {
+		case mineOutcomeMined:
 			mined++
+			consecutiveStale, consecutiveOperational = 0, 0
+
+		case mineOutcomeStalled:
+			consecutiveStale, consecutiveOperational = 0, 0
+			// 政策终态：不执行 PoW、不视为故障。
+			// 等待「停止请求 / 链尾变化 / 复查超时」，以便带手续费交易到达或链尾推进后重新评估。
+			if waitStalledRecheck(svc, stop, stallRecheckInterval) {
+				finish(MiningStopped, "stopped")
+				return
+			}
+
+		case mineOutcomeStop:
+			finish(MiningStopped, "stopped")
+			return
+
+		case mineOutcomeStructFail:
+			// 结构性错误无法通过重试恢复：终止挖矿（不自动重启），保持进程以全节点语义运行。
+			log.Printf("[miner] 挖矿已终止（FAILED）：模板结构性错误，需修复后重启节点")
+			finish(MiningFailed, "structural-error")
+			<-stop
+			return
+
+		case mineOutcomeStale:
+			consecutiveOperational = 0
+			consecutiveStale++
+			// 链尾变化属合法重试：立即重建模板（预校验已挡住陈旧模板，故不烧 PoW）。
+			if consecutiveStale > maxConsecutiveStaleRetries {
+				consecutiveStale = 0
+				if sleepOrStop(stop, retryBackoffMax) {
+					finish(MiningStopped, "stopped")
+					return
+				}
+			}
+
+		case mineOutcomeBackoff:
+			consecutiveStale = 0
+			consecutiveOperational++
+			if consecutiveOperational > maxConsecutiveOperationalFailures {
+				log.Printf("[miner] 连续 %d 次不可归类的挖矿失败，挖矿终止（FAILED）", consecutiveOperational)
+				finish(MiningFailed, "operational-failures-exceeded")
+				<-stop
+				return
+			}
+			if sleepOrStop(stop, backoffDuration(consecutiveOperational)) {
+				finish(MiningStopped, "stopped")
+				return
+			}
 		}
+	}
+}
+
+// backoffDuration 返回第 n 次连续失败的有界指数退避时长（上限 retryBackoffMax）。
+func backoffDuration(n int) time.Duration {
+	d := retryBackoffInitial
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= retryBackoffMax {
+			return retryBackoffMax
+		}
+	}
+	if d > retryBackoffMax {
+		return retryBackoffMax
+	}
+	return d
+}
+
+// sleepOrStop 睡眠 d；若期间收到停止请求则立即返回 true。
+func sleepOrStop(stop <-chan struct{}, d time.Duration) bool {
+	if d <= 0 {
+		return false
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-stop:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// waitStalledRecheck 在 STALLED（政策终态）下等待「停止请求 / 链尾变化 / 复查超时」三者之一。
+// 返回 true 表示应停止挖矿。
+//
+// 作用：在**不执行任何 PoW** 的前提下，既不会忙等（每秒一次唤醒），
+// 也能被「链尾变化」立即唤醒（例如对端区块到达）。
+func waitStalledRecheck(svc *nodeService, stop <-chan struct{}, d time.Duration) (stopRequested bool) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-stop:
+		return true
+	case <-svc.tipChanged:
+		return false
+	case <-t.C:
+		return false
 	}
 }
 
@@ -443,14 +581,22 @@ func blocksLimitText(max int) string {
 	return fmt.Sprintf("%d 个区块", max)
 }
 
-// mineOnce 尝试挖出一个区块。返回 false 表示被中断（链尾变化或收到停止请求），需要重新组装。
+// mineOnce 尝试挖出一个区块，返回**分类结果**（见 mineOutcome）。
+//
+// 关键顺序（PHASE MINING-REMEDIATION-1）：
+//
+//	构造模板 → 模板预校验（跳过 PoW 的完整共识校验） → PoW → 上链
+//
+// 预校验保证「无效模板 ⇒ 0 次 PoW 尝试」，而不是先烧完整套 PoW 再被拒绝。
+// 修复前本函数返回裸 bool，把「链尾变化 / 收到停止 / 结构性拒绝」压成同一个 false，
+// 上层因而对所有 false 都立即重试 —— 那正是无意义 PoW 热循环（P1-MINING-001）的来源。
 //
 // 全程持有 mineMu：持续挖矿循环与「按需出块」两类入口必须串行，
 // 否则同一高度会有两个候选区块在求解，先出块的会白烧 CPU。
 //
 // stop 为 nil 时该中断源不存在（按需出块场景），nil channel 在 select 中永不就绪。
 // 停止只取消「求解过程」，不取消已经开始的写盘：求解成功后的 AddBlock 照常跑完。
-func mineOnce(svc *nodeService, stop <-chan struct{}) bool {
+func mineOnce(svc *nodeService, stop <-chan struct{}) mineOutcome {
 	svc.mineMu.Lock()
 	defer svc.mineMu.Unlock()
 
@@ -461,21 +607,68 @@ func mineOnce(svc *nodeService, stop <-chan struct{}) bool {
 	tip, err := svc.chain.Tip()
 	if err != nil {
 		log.Printf("[miner] 读取链尾失败: %v", err)
-		time.Sleep(time.Second)
-		return false
+		svc.setMineState(MiningRunning, "tip-read-failed")
+		return mineOutcomeBackoff
 	}
 	height := svc.chain.Height() + 1
 
 	pending := svc.pool.Pending(MaxBlockTxs)
 	fees := svc.pool.TotalFees(pending)
 
-	coinbase := transaction.NewCoinbaseTx(svc.miner.PubKeyHash(), utxo.Subsidy(height)+fees, height)
+	subsidy := utxo.Subsidy(height)
+	coinbase := transaction.NewCoinbaseTx(svc.miner.PubKeyHash(), subsidy+fees, height)
 	txs := make([]*transaction.Transaction, 0, len(pending)+1)
 	txs = append(txs, coinbase)
 	txs = append(txs, pending...)
 
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), svc.chain.CurrentBits(), txs)
-	log.Printf("[miner] 开始挖矿: 高度=%d 打包交易=%d 手续费=%d 难度位=%d",
+
+	// ---- 模板预校验：跳过 PoW，其余共识规则全部执行 ----
+	//
+	// 与 AddBlock 使用**同一份**规则（blockchain.ValidateTemplate → validateBlock(b, true)），
+	// 不存在「两套验证规则」的漂移风险；这里刻意不自行复算共识结论，
+	// 而是把「模板是否合法」的判定完全交给共享校验器。
+	if err := svc.chain.ValidateTemplate(candidate); err != nil {
+		// 分类决策完全交给纯函数（见 mining_state.go 的 classifyTemplateFailure），
+		// 本处只负责把分类落成状态、日志与返回值。
+		switch classifyTemplateFailure(err, subsidy+fees) {
+		case classTemplateStale:
+			// B/C 类：链/链尾已变化（模板本身并不非法）—— 重建模板重试即可。
+			svc.mineRetries.Add(1)
+			svc.setMineState(MiningRunning, "template-refresh")
+			log.Printf("[miner] MINING_TEMPLATE_REFRESH 高度=%d 原因=%v（链/链尾已变化，重建模板后重试，不执行 PoW）", height, err)
+			return mineOutcomeStale
+
+		case classTemplatePolicyTerminal:
+			// D 类：政策终态（A1 裁决：Subsidy 可达 0）。
+			//
+			// 该高度**不存在任何合法候选区块**，由两条既有共识规则合取而得：
+			//   ① coinbase 必须至少有一个输出且每个输出金额 != 0  ⇒  总额 >= 1
+			//      （utxo.ValidateCoinbaseStructure，apply.go:81-88）
+			//   ② coinbase 输出总额 <= Subsidy(height)+fees          ⇒  总额 <= 0
+			//      （utxo.ApplyBlock，apply.go:258）
+			// ①与②互斥 ⇒ 不可满足。这是**政策终态，不是缺陷**：
+			// 不执行 PoW，状态记为 STALLED；一旦有带手续费交易到达即自动恢复。
+			//
+			// 注意与 subsidy==0 && fees>0 严格区分：后者 coinbase = fees > 0，仍可正常出块。
+			if svc.setMineState(MiningStalled, "subsidy-exhausted-no-fee-tx") {
+				log.Printf("[miner] MINING_STALLED 高度=%d 补贴=%d 手续费=%d 原因=subsidy-exhausted-no-fee-tx：该高度不存在合法候选区块，不执行 PoW",
+					height, subsidy, fees)
+			}
+			return mineOutcomeStalled
+
+		default:
+			// A 类（classTemplateStructural）：结构性错误 —— 无法通过重试恢复，
+			// 挖矿终止（FAILED）。default 而非具名 case 是为了让「出现未分类的
+			// 新分类值」也落到最保守的处置上（宁可停机，也不无限烧 PoW）。
+			svc.setMineState(MiningFailed, "structural-error")
+			log.Printf("[miner] MINING_TEMPLATE_REJECTED 高度=%d 原因=%v（结构性错误：模板不满足共识要求，不执行 PoW）", height, err)
+			return mineOutcomeStructFail
+		}
+	}
+
+	svc.setMineState(MiningRunning, "pow")
+	log.Printf("[miner] MINING_POW_START 高度=%d 打包交易=%d 手续费=%d 难度位=%d",
 		height, len(pending), fees, candidate.Header.Bits)
 
 	// 挖矿在工作 goroutine 中进行，主 goroutine 监听「链尾变化」信号；
@@ -483,34 +676,60 @@ func mineOnce(svc *nodeService, stop <-chan struct{}) bool {
 	// 不能只丢下不管：并行 worker 会一直算到命中，既白烧 CPU 也会泄漏 goroutine。
 	done := make(chan struct{})
 	cancel := make(chan struct{})
+	var (
+		found    bool
+		attempts uint64
+	)
 	go func() {
 		defer close(done)
-		pow.MineCancelable(candidate, svc.miners, cancel)
+		// 返回值必须被接收：attempts 是「PoW 尝试次数」可观测性的来源；
+		// found 用于区分「命中」与「被取消」。
+		found, attempts = pow.MineCancelable(candidate, svc.miners, cancel)
 	}()
 
 	select {
 	case <-svc.tipChanged:
 		close(cancel)
 		<-done // 等 worker 全部退出，确保没有后台 goroutine 继续持有这个候选区块
-		log.Printf("[miner] 链尾已变化，放弃当前候选区块（高度=%d）", height)
-		return false
+		svc.powAttempts.Add(attempts)
+		svc.mineRetries.Add(1)
+		svc.setMineState(MiningRunning, "tip-changed-retry")
+		log.Printf("[miner] MINING_TEMPLATE_STALE 高度=%d PoW尝试=%d 原因=链尾已变化，放弃当前候选区块", height, attempts)
+		return mineOutcomeStale
 	case <-stop:
+		svc.setMineState(MiningStopping, "stop-requested")
 		close(cancel)
 		<-done
+		svc.powAttempts.Add(attempts)
 		log.Printf("[miner] 收到停止请求，放弃当前候选区块（高度=%d）", height)
-		return false
+		return mineOutcomeStop
 	case <-done:
+		svc.powAttempts.Add(attempts)
+		if !found {
+			// 理论不可达：未发出取消信号时求解必然以命中结束。防御性处理。
+			log.Printf("[miner] 求解未命中且未收到中断信号（高度=%d），按可重试失败处理", height)
+			svc.mineRetries.Add(1)
+			return mineOutcomeBackoff
+		}
 	}
 
 	if err := svc.chain.AddBlock(candidate); err != nil {
-		log.Printf("[miner] 挖到的区块被拒绝（链尾可能已变化）: %v", err)
-		return false
+		// 不变式：预校验已通过且 PoW 已命中 ⇒ 此处失败只可能是链尾在求解期间被替换。
+		// 因此不再输出「链尾可能已变化」这种模糊措辞，而是明确归类。
+		svc.rejectedBlocks.Add(1)
+		svc.mineRetries.Add(1)
+		svc.setMineState(MiningRunning, "block-orphaned-retry")
+		log.Printf("[miner] MINING_TEMPLATE_STALE 高度=%d 原因=链尾在求解期间变化（该区块作废）: %v", height, err)
+		return mineOutcomeStale
 	}
 	svc.pool.RemoveIncluded(candidate, svc.chain.UTXOSnapshot(), height)
-	log.Printf("[miner] 挖到新区块: 高度=%d 哈希=%s 交易数=%d",
+	svc.acceptedBlocks.Add(1)
+	svc.lastAcceptedAt.Store(time.Now().Unix())
+	svc.setMineState(MiningRunning, "mined")
+	log.Printf("[miner] MINING_BLOCK_ACCEPTED 高度=%d 哈希=%s 交易数=%d",
 		svc.chain.Height(), candidate.Header.HashHex(), len(candidate.Transactions))
 	svc.broadcastBlock(candidate)
-	return true
+	return mineOutcomeMined
 }
 
 // defaultDataDir 返回默认数据目录。

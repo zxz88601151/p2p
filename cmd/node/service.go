@@ -49,7 +49,34 @@ type nodeService struct {
 
 	// mining 表示本节点是否正在挖矿（供 /status 查询）。原子读写即可，
 	// 避免为一次状态展示引入锁竞争。
+	//
+	// 语义（PHASE MINING-REMEDIATION-1）：本字段仅表示「挖矿循环是否处于活动状态」
+	// （含 STARTING/RUNNING/STALLED），**不代表**「正在对一个合法候选区块执行 PoW」。
+	// 真实语义状态见 mineState；`/status` 的权威字段是 mining_state。
 	mining atomic.Bool
+
+	// ---- 挖矿运行时语义状态（PHASE MINING-REMEDIATION-1）----
+	//
+	// 背景：此前「worker goroutine 存在」被直接当作「运行中」（svc.mining），
+	// 导致在「补贴耗尽且无手续费交易」时控制接口仍报告「运行中」，而实际上
+	// 模板根本不存在合法候选（无意义 PoW 热循环）。以下字段把该状态显式化。
+	//
+	// mineState 是 miningState 枚举字符串（原子读写，供 /status 查询）。
+	mineState atomic.Value
+	// mineReason 是最近一次状态变化的可读原因（用于区分「政策终态」与「真实故障」）。
+	mineReason atomic.Value
+	// powAttempts 是自启动以来累计实际执行的 PoW 尝试次数（双 SHA-256 计数）。
+	powAttempts atomic.Uint64
+	// mineRetries 是模板重建/重试次数（链尾变化、陈旧竞争等合法重试亦计入）。
+	mineRetries atomic.Int64
+	// acceptedBlocks 是自启动以来成功上链的区块数。
+	acceptedBlocks atomic.Int64
+	// rejectedBlocks 是自启动以来上链被拒的次数（预校验通过后的意外拒绝）。
+	rejectedBlocks atomic.Int64
+	// lastAcceptedAt 是最近一次成功出块的 Unix 秒（0 表示尚未出块）。
+	lastAcceptedAt atomic.Int64
+	// startHeight 是挖矿循环启动时的链高（用于回答「链是否真的在推进」）。
+	startHeight atomic.Int64
 
 	// mineMu 串行化所有挖矿入口（持续挖矿循环与按需出块），
 	// 保证任一时刻只有一个候选区块在被求解。
@@ -60,12 +87,16 @@ type nodeService struct {
 }
 
 func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *wallet.Wallet) *nodeService {
-	return &nodeService{
+	s := &nodeService{
 		chain:      chain,
 		pool:       pool,
 		miner:      miner,
 		tipChanged: make(chan struct{}, 1),
 	}
+	// atomic.Value 必须先 Store 再 Load，否则 Load 返回 nil 接口导致类型断言 panic。
+	s.mineState.Store(miningState(MiningStopped))
+	s.mineReason.Store("init")
+	return s
 }
 
 // notifyTipChanged 非阻塞地通知挖矿循环：链尾可能已变化，应重新组装候选区块。

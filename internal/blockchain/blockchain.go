@@ -197,7 +197,19 @@ func (bc *Blockchain) currentBitsLocked() uint32 {
 //  1. PrevHash        2. PoW           3. Bits == 共识难度
 //  4. 时间戳范围      5. Merkle 重验   6. 体积上限
 //  7. coinbase 位置/数量 + 全部交易的状态迁移（签名/双花/maturity/金额/coinbase 上限）
-func (bc *Blockchain) validateBlock(b *block.Block) (*utxo.UTXOSet, error) {
+//
+// skipPoW 仅供本地挖矿模板预校验使用（PHASE MINING-REMEDIATION-1）：
+// 未求解的候选区块必然不满足 PoW，若照常执行第 2 步会恒返回 ErrInvalidPoW，
+// 从而掩盖 coinbase / UTXO / 交易 / 结构层面的真实错误。skipPoW = true 时
+// **只跳过第 2 步**，其余步骤与顺序完全不变 —— 因此它与完整校验共享同一份规则，
+// 不存在「两套共识规则」的漂移风险。
+//
+// 安全边界：skipPoW = true 绝不能用于来自网络的区块（跳过 PoW 即放弃
+// 防伪造区块的 DoS 保护）；该路径只允许由 ValidateTemplate 在本地挖矿路径调用。
+//
+// 本函数的规则顺序（尤其是 PoW 位于第 2 步）不得调整：对网络入块而言，
+// 先验 PoW 是必要且正确的防 DoS 设计。
+func (bc *Blockchain) validateBlock(b *block.Block, skipPoW bool) (*utxo.UTXOSet, error) {
 	tip := bc.blocks[len(bc.blocks)-1]
 	height := len(bc.blocks) // 新区块高度
 
@@ -205,8 +217,8 @@ func (bc *Blockchain) validateBlock(b *block.Block) (*utxo.UTXOSet, error) {
 	if b.Header.PrevBlockHash != tip.Header.Hash() {
 		return nil, ErrInvalidPrevHash
 	}
-	// 2. 工作量证明
-	if !pow.Validate(&b.Header) {
+	// 2. 工作量证明（skipPoW 时跳过 —— 见函数注释的安全边界）
+	if !skipPoW && !pow.Validate(&b.Header) {
 		return nil, ErrInvalidPoW
 	}
 	// 3. 难度位必须与当前共识难度一致（防止矿工私降难度）
@@ -246,10 +258,47 @@ func unwrapLayoutErr(err error) error { return err }
 func (bc *Blockchain) ValidateBlock(b *block.Block) error {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	if _, err := bc.validateBlock(b); err != nil {
+	if _, err := bc.validateBlock(b, false); err != nil {
 		return err
 	}
 	return nil
+}
+
+// ValidateTemplate 对一个**本地构造、尚未求解 PoW** 的挖矿候选区块做结构校验。
+//
+// 与 ValidateBlock 使用完全相同的共识规则与校验顺序，唯一差异是跳过第 2 步 PoW。
+// 用途：在付出 PoW 代价之前判定「该模板在当前链状态下是否存在合法候选」，
+// 使 `Subsidy(height)+fees == 0`（补贴耗尽且无手续费交易）这类**机械可判定为
+// 不可满足**的模板立即被识别，而不是先烧掉整套 PoW 再被拒绝。
+//
+// 返回值语义：
+//   - ErrInvalidPrevHash：链尾已变化（模板陈旧）—— 重建模板即可，不是缺陷；
+//   - 其它错误：结构性错误 —— 属于代码/策略不一致，挖矿应进入 FAILED；
+//   - nil：模板结构合法，可以进入 PoW。
+//
+// 不改变链状态：内部在 UTXO 集合的克隆上做状态迁移，返回值被丢弃。
+func (bc *Blockchain) ValidateTemplate(b *block.Block) error {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if _, err := bc.validateBlock(b, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+// IsTemplateStale 判定 ValidateTemplate 的失败是否仅为「链/链尾已变化」这一类
+// 可重试原因（模板本身并不非法）：
+//
+//   - ErrInvalidPrevHash      ：模板构造所依据的链尾已被替换；
+//   - ErrTimestampOutOfRange  ：链尾时间戳已前移到本模板时间戳之后（对端区块领先）；
+//   - ErrUnexpectedBits       ：共识难度位已变化（因链尾变化导致）。
+//
+// 这三者都无法由模板构造逻辑本身产生，重建模板后重试即可，不应误判为结构性缺陷。
+// 其余错误（coinbase 布局/金额、UTXO 迁移、Merkle、体积等）一律视为结构性错误。
+func IsTemplateStale(err error) bool {
+	return errors.Is(err, ErrInvalidPrevHash) ||
+		errors.Is(err, ErrTimestampOutOfRange) ||
+		errors.Is(err, ErrUnexpectedBits)
 }
 
 // 区块追加语义（务必注意两类入口的区别）：
@@ -277,7 +326,7 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	newSet, err := bc.validateBlock(b)
+	newSet, err := bc.validateBlock(b, false)
 	if err != nil {
 		return fmt.Errorf("添加区块失败: %w", err)
 	}

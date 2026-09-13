@@ -175,8 +175,40 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "节点钱包地址: %s\n", st.Address)
 	fmt.Fprintf(stdout, "对等节点: %d 个 %v\n", len(st.Peers), st.Peers)
 	fmt.Fprintf(stdout, "交易池: %d 笔待打包\n", st.MempoolSize)
-	fmt.Fprintf(stdout, "挖矿状态: %s\n", miningText(st.Mining))
+	fmt.Fprintf(stdout, "挖矿状态: %s\n", miningStateText(*st))
+	// 仅在异常状态（停滞/失败）时补充原因：这正是开发者区分
+	// 「政策终态（补贴耗尽，不是故障）」与「结构性错误（需要修复）」所需的最小信息。
+	// 正常状态下不额外输出，保持既有输出格式不变。
+	if st.MiningState == string(MiningStalled) || st.MiningState == string(MiningFailed) {
+		fmt.Fprintf(stdout, "挖矿原因: %s\n", st.MiningReason)
+	}
 	return 0
+}
+
+// miningStateText 渲染挖矿状态。
+//
+// 优先使用语义状态 MiningState（PHASE MINING-REMEDIATION-1）：它区分
+// 「正在对合法模板求解 PoW」（运行中）与「不存在合法候选、未执行任何 PoW」（已停滞）
+// 以及「结构性错误」（失败）。修复前只有一个布尔值，停摆期间会误报「运行中」。
+//
+// 当服务端未给出 MiningState 时（例如旧版节点或第三方实现）退化为按
+// Mining 布尔值渲染，保持向后兼容。
+func miningStateText(st control.StatusInfo) string {
+	switch st.MiningState {
+	case string(MiningRunning):
+		return "运行中"
+	case string(MiningStarting):
+		return "启动中"
+	case string(MiningStalled):
+		return "已停滞（不存在合法候选区块，未执行 PoW）"
+	case string(MiningFailed):
+		return "失败（模板结构性错误，挖矿已终止）"
+	case string(MiningStopping):
+		return "停止中"
+	case string(MiningStopped):
+		return "已停止"
+	}
+	return miningText(st.Mining)
 }
 
 func miningText(mining bool) string {

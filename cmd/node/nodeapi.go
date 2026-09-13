@@ -34,6 +34,7 @@ func (s *nodeService) Status() (control.StatusInfo, error) {
 		return control.StatusInfo{}, err
 	}
 	bits := s.chain.CurrentBits()
+	state, reason := s.miningStateSnapshot()
 	return control.StatusInfo{
 		Height:      s.chain.Height(),
 		TipHash:     tip.Header.HashHex(),
@@ -43,6 +44,16 @@ func (s *nodeService) Status() (control.StatusInfo, error) {
 		Address:     s.miner.Address(),
 		Bits:        bits,
 		Difficulty:  relativeDifficulty(bits),
+
+		// 挖矿运行时语义状态（PHASE MINING-REMEDIATION-1）。
+		// MiningState 是权威字段：它区分「真的在对合法模板执行 PoW」（RUNNING）
+		// 与「不存在合法候选、未执行任何 PoW」（STALLED）以及「结构性错误」（FAILED）。
+		MiningState:    string(state),
+		MiningReason:   reason,
+		PowAttempts:    s.powAttempts.Load(),
+		MiningRetries:  s.mineRetries.Load(),
+		AcceptedBlocks: s.acceptedBlocks.Load(),
+		RejectedBlocks: s.rejectedBlocks.Load(),
 	}, nil
 }
 
@@ -157,6 +168,10 @@ func (s *nodeService) BlockHex(height int) (string, error) {
 //
 // 与持续挖矿循环（-mine）互斥：若正在持续挖矿则直接拒绝，
 // 否则两个挖矿路径会各自组装候选区块、互相作废，白烧 CPU 且日志混乱。
+//
+// 退出条件（PHASE MINING-REMEDIATION-1）：只要本轮不是「成功出块」
+// （链尾变化 / 政策终态 / 结构性错误 / 可重试失败）即停止本轮，
+// 不再把「被拒绝」误当作「被链尾变化中断」。
 func (s *nodeService) Mine(count int) (control.MineResponse, error) {
 	if s.mining.Load() {
 		return control.MineResponse{}, errors.New("节点正在持续挖矿（-mine），请先停用持续挖矿再使用按需出块")
@@ -165,13 +180,25 @@ func (s *nodeService) Mine(count int) (control.MineResponse, error) {
 		return control.MineResponse{}, fmt.Errorf("挖矿数量必须大于 0，实际 %d", count)
 	}
 
+	s.setMineState(MiningStarting, "on-demand")
 	mined := 0
+	last := mineOutcomeStop
 	for i := 0; i < count; i++ {
-		if !mineOnce(s, nil) {
-			// 被链尾变化中断：说明有对端区块到达，本轮作废，不计入结果
+		last = mineOnce(s, nil)
+		if last != mineOutcomeMined {
 			break
 		}
 		mined++
+	}
+	// 终态：结构性错误与政策终态保留其状态（便于 /status 直接暴露原因），
+	// 其余情形回到 STOPPED（按需出块已结束）。
+	switch last {
+	case mineOutcomeStructFail:
+		// 保留 FAILED
+	case mineOutcomeStalled:
+		// 保留 STALLED
+	default:
+		s.setMineState(MiningStopped, "on-demand-done")
 	}
 	return control.MineResponse{Mined: mined, Height: s.chain.Height()}, nil
 }

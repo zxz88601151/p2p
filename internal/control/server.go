@@ -50,8 +50,31 @@ type StatusInfo struct {
 	TipHash     string   `json:"tip_hash"`
 	Peers       []string `json:"peers"`
 	MempoolSize int      `json:"mempool_size"`
-	Mining      bool     `json:"mining"`
-	Address     string   `json:"address"` // 节点钱包地址
+	// Mining 表示**挖矿循环是否处于活动状态**（含 STARTING/RUNNING/STALLED），
+	// 不表示「正在对合法候选区块执行 PoW」。判断真实挖矿语义请用 MiningState。
+	Mining  bool   `json:"mining"`
+	Address string `json:"address"` // 节点钱包地址
+
+	// ---- 挖矿运行时语义状态（PHASE MINING-REMEDIATION-1，新增字段）----
+	//
+	// 这些字段是**新增**的，不改变既有字段语义，因此对既有调用方保持兼容。
+	// 它们存在的理由：修复前控制接口只能看到 Mining=true，无法区分
+	// 「正在有效挖矿」「因补贴耗尽而不存在合法候选（STALLED）」「结构性错误（FAILED）」。
+
+	// MiningState 是挖矿运行时的语义状态：
+	// STOPPED / STARTING / RUNNING / STALLED / FAILED / STOPPING。
+	// 权威字段——RUNNING 才表示正在对**已通过预校验的**模板求解 PoW。
+	MiningState string `json:"mining_state"`
+	// MiningReason 是最近一次状态变化的原因（如 subsidy-exhausted-no-fee-tx）。
+	MiningReason string `json:"mining_reason"`
+	// PowAttempts 是自启动以来累计实际执行的 PoW 尝试次数（双 SHA-256 计数）。
+	// 在「不存在合法候选」时该值必须零增长。
+	PowAttempts uint64 `json:"pow_attempts"`
+	// MiningRetries 是模板重建/重试次数。
+	MiningRetries int64 `json:"mining_retries"`
+	// AcceptedBlocks / RejectedBlocks 是自启动以来成功上链与被拒计数。
+	AcceptedBlocks int64 `json:"accepted_blocks"`
+	RejectedBlocks int64 `json:"rejected_blocks"`
 
 	// Bits 是「下一个待挖区块」的难度目标（前导零位数语义，见 pow.BitsToTarget）。
 	// 这是共识真值，UI 展示难度必须以此为准。
