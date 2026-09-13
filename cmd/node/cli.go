@@ -79,6 +79,12 @@ mine 选项:
   -json                        （printchain / verify / reset）以 JSON 输出
   -force                       （reset）跳过确认提示（脚本 / CI 使用）
 
+选项位置（PHASE PRODUCT-DEV-1C.0）:
+  子命令与选项的先后顺序**不改变命令语义**，下面两行完全等价：
+    node verify -datadir ./data-a
+    node -datadir ./data-a verify
+  识别不了的子命令一律报错退出（退出码 2），绝不会退化成「启动节点」。
+
 示例:
   node -mine -datadir ~/.p2pchain
   node ui -mine               # 启动节点并打开 Developer Console

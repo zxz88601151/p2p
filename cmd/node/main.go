@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -247,16 +248,43 @@ func runNode(args []string) { startNode(args, false) }
 // 用系统默认浏览器打开 Developer Console 页面（`node ui` 子命令）。
 func runNodeUI(args []string) { startNode(args, true) }
 
+// nodeFlags 节点启动选项（node / ui 共用）的解析结果。
+//
+// 抽出来是为了让 startNode 与 main 的「子命令预扫描」使用**同一份**选项定义。
+// 若两处各写一份，形如 `-datadir X verify` 的组合会在「预扫描认为选项在哪里结束」
+// 与「实际解析认为选项在哪里结束」之间产生分歧，P1 会以另一种形式复发。
+type nodeFlags struct {
+	listen    string
+	rpc       string
+	seed      string
+	dataDir   string
+	mine      bool
+	maxBlocks int
+	miners    int
+}
+
+// newNodeFlagSet 创建节点选项集。
+//
+// errHandling 由调用方决定：
+//   - startNode 用 ExitOnError：解析失败直接打印用法并退出（既有行为，不变）；
+//   - main 的预扫描用 ContinueOnError：只需要知道「选项在哪里结束」，
+//     解析失败时把 argv 原样交回 startNode，由它按既有行为报错。
+func newNodeFlagSet(errHandling flag.ErrorHandling) (*flag.FlagSet, *nodeFlags) {
+	nf := &nodeFlags{}
+	fs := flag.NewFlagSet("node", errHandling)
+	fs.StringVar(&nf.listen, "listen", ":6688", "本节点监听地址")
+	fs.StringVar(&nf.rpc, "rpc", control.DefaultAddr, "控制接口监听地址（仅本机，无鉴权）")
+	fs.StringVar(&nf.seed, "seed", "", "种子节点地址，多个用逗号分隔；留空表示作为第一个节点启动")
+	fs.StringVar(&nf.dataDir, "datadir", defaultDataDir(), "数据目录（存放区块数据与钱包）")
+	fs.BoolVar(&nf.mine, "mine", false, "是否启用挖矿")
+	fs.IntVar(&nf.maxBlocks, "maxblocks", 0, "挖矿最多产出多少个区块，0 表示不限（用于测试网可控出块）")
+	fs.IntVar(&nf.miners, "miners", runtime.NumCPU(), "并行挖矿的 worker 数，1 表示单线程")
+	return fs, nf
+}
+
 // startNode 是 runNode / runNodeUI 的共同实现。
 func startNode(args []string, openConsole bool) {
-	fs := flag.NewFlagSet("node", flag.ExitOnError)
-	listenAddr := fs.String("listen", ":6688", "本节点监听地址")
-	rpcAddr := fs.String("rpc", control.DefaultAddr, "控制接口监听地址（仅本机，无鉴权）")
-	seedAddrs := fs.String("seed", "", "种子节点地址，多个用逗号分隔；留空表示作为第一个节点启动")
-	dataDir := fs.String("datadir", defaultDataDir(), "数据目录（存放区块数据与钱包）")
-	mine := fs.Bool("mine", false, "是否启用挖矿")
-	maxBlocks := fs.Int("maxblocks", 0, "挖矿最多产出多少个区块，0 表示不限（用于测试网可控出块）")
-	miners := fs.Int("miners", runtime.NumCPU(), "并行挖矿的 worker 数，1 表示单线程")
+	fs, nf := newNodeFlagSet(flag.ExitOnError)
 	_ = fs.Parse(args)
 
 	// 最外层 defer（cmd 层级，§2.1）：无论正常返回、收到信号、还是初始化/运行期 panic，
@@ -274,19 +302,19 @@ func startNode(args []string, openConsole bool) {
 	}()
 
 	rt2, err := newNodeRuntime(nodeConfig{
-		ListenAddr: *listenAddr,
-		RPCAddr:    *rpcAddr,
-		Seeds:      splitSeeds(*seedAddrs),
-		DataDir:    *dataDir,
-		Mine:       *mine,
-		MaxBlocks:  *maxBlocks,
-		Miners:     *miners,
+		ListenAddr: nf.listen,
+		RPCAddr:    nf.rpc,
+		Seeds:      splitSeeds(nf.seed),
+		DataDir:    nf.dataDir,
+		Mine:       nf.mine,
+		MaxBlocks:  nf.maxBlocks,
+		Miners:     nf.miners,
 	})
 	if err != nil {
 		// 数据目录被另一节点占用时给出明确、可执行的用户级错误（与「数据损坏」区分）。
 		if errors.Is(err, storage.ErrDatadirLocked) {
 			log.Fatalf("[node] 数据目录已被另一个节点进程占用，未启动本节点：\n  目录：%s\n  同一数据目录一次只能由一个节点进程使用；请勿删除 blocks.dat，也勿重复启动。\n  如果确认没有其他节点进程在运行，请手动删除 %s 后重新启动。",
-				*dataDir, filepath.Join(*dataDir, "node.lock"))
+				nf.dataDir, filepath.Join(nf.dataDir, "node.lock"))
 		}
 		log.Fatalf("[node] %v", err)
 	}
@@ -325,8 +353,8 @@ func startNode(args []string, openConsole bool) {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	if *mine {
-		runMiner(rt.svc, *maxBlocks, stopCh)
+	if nf.mine {
+		runMiner(rt.svc, nf.maxBlocks, stopCh)
 		log.Printf("[node] 正在关闭（释放数据目录锁）...")
 		return
 	}
@@ -493,16 +521,68 @@ func defaultDataDir() string {
 	return ".p2pchain"
 }
 
+// splitCommandArgs 把 argv 拆成「子命令 + 该子命令的参数」。
+//
+// 返回 cmd == "" 表示本次应当启动节点（args 原样返回）。
+//
+// 为什么需要它（PHASE PRODUCT-DEV-1C.0，P1）：
+//
+//	node -datadir X verify
+//
+// 过去 main 只看 argv[0] 是否以 "-" 开头：这里是 "-datadir"，于是直接 runNode；
+// flag 包解析到 "verify" 时停止并把它当作位置参数忽略掉，结果「看起来是离线
+// 只读校验」的命令实际启动了完整节点——建链、建钱包、取数据目录锁、监听控制
+// 接口与 P2P 端口，并永久阻塞。这同时违背了 cmdVerify 自述的
+// 「只读、绝不写回、绝不取锁」契约。
+//
+// 约定（§4）：**参数排列不能改变 command identity。**
+// 只要 argv 中存在子命令（且它不位于某个选项的值位置），就必须执行该子命令；
+// 位于它之前的、显式设置过的选项，按原值搬到子命令之后。
+// 组合本身无意义时（例如 node -mine verify）由子命令自己的 flag 集报 usage
+// 错误并退出码 2——绝不静默退化成「启动节点」（INV-05）。
+func splitCommandArgs(argv []string) (cmd string, args []string) {
+	if len(argv) == 0 {
+		return "", argv
+	}
+	// 既有形式：子命令就在首位，零变更地走原路径。
+	if !strings.HasPrefix(argv[0], "-") {
+		return argv[0], argv[1:]
+	}
+	// 选项在前：用与 startNode 完全相同的选项集先解析一遍。flag 包会在第一个
+	// 非选项 token 处停下，Args() 即「选项结束之后的剩余位置参数」。
+	// 预扫描不产生任何副作用：不读数据目录、不建文件、不监听端口。
+	fs, _ := newNodeFlagSet(flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(argv); err != nil {
+		return "", argv // 解析失败：交回 startNode，按既有行为打印用法并退出
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return "", argv // 只有选项，没有位置参数：就是启动节点（INV-06）
+	}
+	// 把显式设置过的选项搬到子命令之后。
+	// 统一写 -name=value：布尔选项写成 "-mine true" 会被 flag 包当成两个 token
+	// （-mine 后面跟一个位置参数），而 -name=value 对所有类型都成立。
+	prefix := make([]string, 0, 4)
+	fs.Visit(func(f *flag.Flag) {
+		prefix = append(prefix, "-"+f.Name+"="+f.Value.String())
+	})
+	out := make([]string, 0, len(prefix)+len(rest)-1)
+	out = append(out, prefix...)
+	out = append(out, rest[1:]...)
+	return rest[0], out
+}
+
 func main() {
-	// 首参数为非选项时按子命令处理：识别不了就报错退出，
-	// 避免把拼错的子命令当成「启动节点」而误导用户。
-	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
-		code, ok := runCLI(os.Args[1], os.Args[2:], os.Stdout, os.Stderr)
+	argv := os.Args[1:]
+	cmd, args := splitCommandArgs(argv)
+	if cmd != "" {
+		code, ok := runCLI(cmd, args, os.Stdout, os.Stderr)
 		if !ok {
-			fmt.Fprintf(os.Stderr, "错误: 未知子命令 %q\n\n%s", os.Args[1], usageText)
+			fmt.Fprintf(os.Stderr, "错误: 未知子命令 %q\n\n%s", cmd, usageText)
 			os.Exit(2)
 		}
 		os.Exit(code)
 	}
-	runNode(os.Args[1:])
+	runNode(argv)
 }
