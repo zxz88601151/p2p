@@ -642,6 +642,12 @@ func mineOnce(svc *nodeService, stop <-chan struct{}) mineOutcome {
 
 	candidate := block.NewCandidateBlock(tip.Header.Hash(), svc.chain.CurrentBits(), txs)
 
+	// 难度共识硬分叉（PHASE DIFFICULTY-CONSENSUS-IMPLEMENTATION-1）：
+	// 候选块版本与时间戳必须与该高度激活的规则一致，否则 validateTemplate/AddBlock
+	// 会以 ErrInvalidVersion / ErrTimestampOutOfRange 拒绝（硬分叉强制）。
+	candidate.Header.Version = svc.chain.RequiredVersionFor(height)
+	candidate.Header.Timestamp = svc.chain.MiningTimestamp(height)
+
 	// ---- 模板预校验：跳过 PoW，其余共识规则全部执行 ----
 	//
 	// 与 AddBlock 使用**同一份**规则（blockchain.ValidateTemplate → validateBlock(b, true)），

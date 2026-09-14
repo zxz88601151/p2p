@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/pow"
@@ -24,6 +23,7 @@ import (
 var (
 	ErrInvalidPrevHash     = errors.New("区块的前置哈希与当前链尾不匹配")
 	ErrInvalidPoW          = errors.New("区块哈希未达到难度目标，工作量证明无效")
+	ErrInvalidVersion      = errors.New("区块版本与当前激活高度的共识规则不一致")
 	ErrEmptyChain          = errors.New("链为空")
 	ErrUnknownHeight       = errors.New("请求的区块高度不存在")
 	ErrUnexpectedBits      = errors.New("区块难度位与当前共识难度不一致")
@@ -51,6 +51,12 @@ type Blockchain struct {
 	blocks []*block.Block
 	utxo   *utxo.UTXOSet
 	store  storage.BlockStore
+
+	// activationHeight 是难度浮动/新时间戳-MTP/新版本强制生效的高度。
+	// 默认取共识常量 pow.ActivationHeight（2000，> 当前生产高度，保证存量链不破）；
+	// 测试可注入更小的高度以越过激活边界而无需真挖 2000 块。
+	// 该字段是共识真值的一部分，绝不在运行期变更。
+	activationHeight int
 }
 
 // NewBlockchainWithGenesis 使用给定的创世区块初始化链（不持久化，供测试/临时链使用）。
@@ -61,9 +67,22 @@ func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 		return nil, fmt.Errorf("创世区块 UTXO 初始化失败: %w", err)
 	}
 	return &Blockchain{
-		blocks: []*block.Block{genesis},
-		utxo:   genesisSet,
+		blocks:          []*block.Block{genesis},
+		utxo:            genesisSet,
+		activationHeight: pow.ActivationHeight,
 	}, nil
+}
+
+// NewBlockchainWithGenesisAndActivation 同 NewBlockchainWithGenesis，但允许显式指定
+// 激活高度——**仅供测试**越过难度共识硬分叉边界（无需真挖 2000 块）。
+// 生产路径一律使用 NewBlockchainWithGenesis（取共识默认 pow.ActivationHeight）。
+func NewBlockchainWithGenesisAndActivation(genesis *block.Block, activationHeight int) (*Blockchain, error) {
+	bc, err := NewBlockchainWithGenesis(genesis)
+	if err != nil {
+		return nil, err
+	}
+	bc.activationHeight = activationHeight
+	return bc, nil
 }
 
 // NewBlockchainFromStore 从持久化存储加载链；空库时创建确定性创世并落盘。
@@ -169,26 +188,13 @@ func (bc *Blockchain) BlocksFrom(from, count int) (blocks []*block.Block, atTip 
 func (bc *Blockchain) CurrentBits() uint32 {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
-	return bc.currentBitsLocked()
+	return bc.expectedBitsFor(len(bc.blocks))
 }
 
+// currentBitsLocked 已被 expectedBitsFor 取代：始终基于本链（活动链）视图计算候选块难度，
+// 与 ComputeExpectedBitsAt 共享同一份冻结契约。
 func (bc *Blockchain) currentBitsLocked() uint32 {
-	if len(bc.blocks) == 0 {
-		return pow.MaxTargetBits
-	}
-	tip := bc.blocks[len(bc.blocks)-1]
-	height := len(bc.blocks) - 1
-	if height == 0 || height%pow.DifficultyAdjustmentInterval != 0 {
-		return tip.Header.Bits
-	}
-
-	periodStartHeight := height - pow.DifficultyAdjustmentInterval
-	if periodStartHeight < 0 {
-		periodStartHeight = 0
-	}
-	periodStart := bc.blocks[periodStartHeight]
-	actualTimespan := tip.Header.Timestamp - periodStart.Header.Timestamp
-	return pow.AdjustBits(tip.Header.Bits, actualTimespan)
+	return bc.expectedBitsFor(len(bc.blocks))
 }
 
 // validateBlock 对区块执行全序共识校验；全部通过时返回应用后的新 UTXO 集合。
@@ -217,20 +223,21 @@ func (bc *Blockchain) validateBlock(b *block.Block, skipPoW bool) (*utxo.UTXOSet
 	if b.Header.PrevBlockHash != tip.Header.Hash() {
 		return nil, ErrInvalidPrevHash
 	}
+	// 1.5 版本号必须与该高度激活的共识规则一致（硬分叉强制，见 consensus.go）
+	if err := bc.validateVersion(b, height); err != nil {
+		return nil, err
+	}
 	// 2. 工作量证明（skipPoW 时跳过 —— 见函数注释的安全边界）
 	if !skipPoW && !pow.Validate(&b.Header) {
 		return nil, ErrInvalidPoW
 	}
-	// 3. 难度位必须与当前共识难度一致（防止矿工私降难度）
-	if b.Header.Bits != bc.currentBitsLocked() {
-		return nil, fmt.Errorf("%w: 区块 %d，共识 %d", ErrUnexpectedBits, b.Header.Bits, bc.currentBitsLocked())
+	// 3. 难度位必须与基于本链计算的期望难度一致（防止矿工私降/私升难度）
+	if err := bc.validateBits(b, height); err != nil {
+		return nil, err
 	}
-	// 4. 时间戳：不得早于父块（保证难度调整的时间跨度单调），不得大幅超前
-	if b.Header.Timestamp < tip.Header.Timestamp {
-		return nil, fmt.Errorf("%w: 时间戳 %d 早于父块 %d", ErrTimestampOutOfRange, b.Header.Timestamp, tip.Header.Timestamp)
-	}
-	if b.Header.Timestamp > time.Now().Unix()+maxFutureTimestampDrift {
-		return nil, fmt.Errorf("%w: 时间戳 %d 超前本地时钟超过 %d 秒", ErrTimestampOutOfRange, b.Header.Timestamp, maxFutureTimestampDrift)
+	// 4. 时间戳：按激活状态分叉（旧规则保留墙钟上限；新规则改用 MTP，剥离墙钟）
+	if err := bc.validateTimestamp(b, tip, height); err != nil {
+		return nil, err
 	}
 	// 5. Merkle 重验（防「同 Merkle 根不同交易集合」与头/体不一致）
 	if block.ComputeMerkleRoot(b.Transactions) != b.Header.MerkleRoot {

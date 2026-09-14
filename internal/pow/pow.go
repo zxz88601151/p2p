@@ -9,7 +9,9 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -34,22 +36,41 @@ const (
 	// 比特币是 2016，个人项目初期建议设置得小一些（如 20~50）以便更快看到难度变化效果。
 	DifficultyAdjustmentInterval = 20
 
-	// MaxDifficultyBits 是本链难度（bits）的上限，等价于 MaxTargetBits —— 即「难度上限 = 初始最低难度」。
+	// MaxDifficultyBits 是本链难度（bits）的**浮动上限**。
 	//
-	// 这是一项**有意的测试网设计**，不是遗留缺陷：本链以 CPU 毫秒级出块为目标
-	// （见 MaxTargetBits 注释），实际出块间隔远小于 TargetBlockTimeSeconds。若允许难度
-	// 按公式自由上升，每个周期会 +2 bits（如 16→18→20…），约 200 块后单块需枚举 2^36 次哈希，
-	// 单块耗时从毫秒级升到小时级，学习/回归价值随之消失。
+	// 历史：本链早期以 CPU 毫秒级出块为目标（见 MaxTargetBits 注释），曾把难度**有意钉死**
+	// 在最低难度（MaxDifficultyBits == MaxTargetBits == 16），使难度不浮动。
 	//
-	// 因此 AdjustBits 的输出被钳制在 [1, MaxDifficultyBits]；又因本链起点即为 MaxTargetBits，
-	// 链上可达的 bits 被**固定**在 MaxDifficultyBits。效果与测试网预期一致：
-	// 难度不浮动，但「实际用时 vs 期望用时 → 更难/更易」的推导过程完整保留、可单测验证。
+	// 现经 PHASE DIFFICULTY-CONSENSUS-DESIGN-1 + PRE-IMPLEMENTATION-GATE-1 审计，
+	// 在**固定激活高度硬分叉**（见下方 ActivationHeight）之后解除钉死：难度可按 AdjustBits
+	// 公式在 [1, MaxDifficultyBits] 内真实浮动，上限抬至 32（单块枚举 2^32 次哈希 ≈ 数千秒，
+	// 给难度足够的上行空间，又不至于在一两个周期内失控）。
 	//
-	// 若将来需要难度真正浮动，必须重设 clamp 带宽（并把 MaxDifficultyBits 抬到预期上限），
-	// 这属于**独立的共识参数阶段**——因为难度是共识真值，改动会致老节点拒绝新区块。
-	// 详见 docs/PHASE-0.1-GATE-A-R-POW-DIFFICULTY-REMEDIATION-REPORT.md §17 与
-	// docs/PROJECT-COMPLETION-REPORT.md 的「难度语义」一节。
-	MaxDifficultyBits = MaxTargetBits
+	// 硬分叉语义：height < ActivationHeight 仍走「旧规则」（难度钉死 MaxTargetBits=16、
+	// 版本 < NewBlockVersion）；height >= ActivationHeight 才启用本浮动规则。
+	// 因此本常量只影响 post-activation 的链，存量（pre-activation）链行为不变。
+	MaxDifficultyBits = 32
+)
+
+// ---- 难度共识硬分叉激活参数（PHASE DIFFICULTY-CONSENSUS-IMPLEMENTATION-1） ----
+
+const (
+	// ActivationHeight 是难度浮动 + 新时间戳/MTP 规则 + 新版本强制生效的**固定激活高度**。
+	//
+	// 选择 2000 是刻意大于当前生产链高度（约 1275），保证**存量链在激活前的行为与旧节点
+	// 逐字节等价**——已落盘的 blocks.dat 回放时不触发任何新规则（旧块全部 bits=16、
+	// version=1、时间戳满足旧共识区间），因此无需任何迁移或重挖。
+	//
+	// 这是结构性硬分叉：旧节点（ActivationHeight 尚未定义/仍钉死 16）在 height >= 2000 处
+	// 会拒绝新块（新块 version>=2 且时间戳/难度走新规则），新旧节点确定性分叉。
+	// 软分叉不可行（DESIGN-1 已形式化证明），故采用固定高度硬分叉。
+	ActivationHeight = 2000
+
+	// LegacyBlockVersion 是激活前区块必须使用的版本号（< NewBlockVersion）。
+	LegacyBlockVersion uint32 = 1
+
+	// NewBlockVersion 是激活后区块必须使用的版本号（>= 此值）。
+	NewBlockVersion uint32 = 2
 )
 
 // BitsToTarget 将压缩格式的难度（Bits）还原为大整数目标值。
@@ -268,11 +289,162 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 	if newBits < 1 {
 		newBits = 1
 	}
-	// 难度上限钳制：本链 MaxDifficultyBits == MaxTargetBits，因此难度被固定在最低值。
-	// 这是测试网的有意设计（见常量注释），不是把「下限常量」误用作上限。
+	// 难度上限钳制：post-activation 时本链 MaxDifficultyBits=32，难度可在 [1,32] 内浮动。
 	if newBits > MaxDifficultyBits {
 		newBits = MaxDifficultyBits
 	}
 	return newBits
 
+}
+
+// ---- 难度共识：工作量度量、链视图与激活门控（PHASE DIFFICULTY-CONSENSUS-IMPLEMENTATION-1） ----
+
+// ChainView 是「一条链的只读视图」抽象，使难度/时间戳/MTP 计算既能作用于**主链**
+// （*blockchain.Blockchain 天然满足），也能作用于**候选竞争链**（未来 reorg 时由
+// BlockTree 提供），从而让 expectedBits / MTP 始终基于「候选区块自身的祖先」而非
+// 任意活动链尾——这是 fork-choice 安全的前提（DESIGN-1 §FC-004 闭环要求）。
+//
+// 注意：必须是按高度 O(1) 随机访问的视图；窗口 [max(0,h-10)..h] 的 MTP 计算依赖此。
+type ChainView interface {
+	BlockByHeight(height int) (*block.Block, error)
+	Height() int
+}
+
+// WorkOfBits 返回难度位 bits 对应的**期望工作量（期望 PoW 成本）**。
+//
+// 本链的 target = 2^(256-bits) 是 2 的整数次幂 ⇒ 满足 target 的哈希期望尝试次数
+// 严格等于 2^bits（无取整误差）。因此 Work(bits) = 2^bits 既是真实期望成本，
+// 也是 fork-choice 的链工作量度量（CumulativeWork = Σ 2^bits_i）。
+//
+// 术语：用「期望工作量 / 期望 PoW 成本」而非「保证 2^bits 次哈希」——哈希是随机变量，
+// 任何单块的实际尝试次数可能远低于或高于期望值，但**期望**严格为 2^bits，长期累加后
+// 期望工作量之差即难度之差，足以作为共识度量的稳定指标。使用 *big.Int 避免 uint64 溢出
+// （bits 可达 32 ⇒ 2^32 仍在 uint64 内，但 Σ 跨数千块必然溢出，故全程 big.Int）。
+func WorkOfBits(bits uint32) *big.Int {
+	w := big.NewInt(1)
+	if bits >= 256 {
+		// bits>=256 ⇒ target>=2^0=1 ⇒ 任何哈希都满足；赋予极大值代表「零难度」，
+		// 但本链 MaxDifficultyBits=32，正常路径不会到达；此处仅防御除零/越界。
+		w.Lsh(w, 255)
+		return w
+	}
+	w.Lsh(w, uint(bits))
+	return w
+}
+
+// IsActivationActive 判断给定高度是否已处于新共识规则（难度浮动 + MTP 时间戳 + 新版本）。
+//
+// 约定：激活块自身（height == ActivationHeight）即使用新规则——激活高度是「新规则起点」，
+// 而非「旧规则终点」。高度 0（创世）始终视为未激活（创世永远用 MaxTargetBits）。
+func IsActivationActive(height, activationHeight int) bool {
+	return height >= activationHeight && height > 0
+}
+
+// VersionForHeight 返回给定高度区块**必须**使用的版本号。
+//
+// 硬分叉版本强制：激活前必须用 LegacyBlockVersion（< NewBlockVersion），激活后必须
+// 用 NewBlockVersion（>= 此值）。二者互斥构成结构性分叉（DESIGN-1 已证软分叉不可行）。
+func VersionForHeight(height, activationHeight int) uint32 {
+	if IsActivationActive(height, activationHeight) {
+		return NewBlockVersion
+	}
+	return LegacyBlockVersion
+}
+
+// ComputeExpectedBitsAt 按共识规则独立计算「高度 height 的区块应当使用的难度位」，
+// 完全基于 view 提供的候选链自身祖先（绝不依赖外部活动链尾）。
+//
+// 规则（冻结于 DESIGN-1 / GATE-1）：
+//   - height == 0：创世，固定 MaxTargetBits。
+//   - height < ActivationHeight（旧规则）：难度钉死在父块 bits（= MaxTargetBits），
+//     此即旧链「难度不浮动」语义的精确等价（旧链无论是否周期边界，结果恒为 16）。
+//   - height >= ActivationHeight（新规则）：
+//       · 非周期边界（height % DifficultyAdjustmentInterval != 0）：沿用父块 bits；
+//       · 周期边界：以 [height-Interval, height-1] 的实际时间跨度调用 AdjustBits，
+//         结果钳制在 [1, MaxDifficultyBits]（现 32）内浮动。
+//
+// 返回的错误仅在 view 无法提供所需祖先块时产生（如 height-1 越界），正常路径恒为 nil。
+func ComputeExpectedBitsAt(view ChainView, height, activationHeight int) (uint32, error) {
+	if height == 0 {
+		return MaxTargetBits, nil
+	}
+	parent, err := view.BlockByHeight(height - 1)
+	if err != nil {
+		return 0, fmt.Errorf("计算期望难度：读取父块（高度 %d）失败: %w", height-1, err)
+	}
+	if !IsActivationActive(height, activationHeight) {
+		// 旧规则：钉死在父块难度（= MaxTargetBits）。等价于旧 currentBitsLocked 的全部分支。
+		return parent.Header.Bits, nil
+	}
+	if height%DifficultyAdjustmentInterval != 0 {
+		return parent.Header.Bits, nil
+	}
+	periodStartHeight := height - DifficultyAdjustmentInterval
+	if periodStartHeight < 0 {
+		periodStartHeight = 0
+	}
+	periodStart, err := view.BlockByHeight(periodStartHeight)
+	if err != nil {
+		return 0, fmt.Errorf("计算期望难度：读取周期起点（高度 %d）失败: %w", periodStartHeight, err)
+	}
+	actualTimespan := parent.Header.Timestamp - periodStart.Header.Timestamp
+	return AdjustBits(parent.Header.Bits, actualTimespan), nil
+}
+
+// MedianTimePastAt 计算高度 h 的「过去中位数时间」（MTP）。
+//
+// 定义（冻结于 DESIGN-1）：窗口为 [max(0, h-10), h] 共至多 11 个区块的时间戳，
+// 取中位数；median 下标 k = n/2（Go sort 升序后 n/2 为「上半中位数」，偶数个时偏上，
+// 与比特币一致）。h < 0 视为空视图返回 0（调用方不应传入）。
+//
+// 共识用途（仅 post-activation）：新块时间戳必须满足 Timestamp > MTP(h-1)，
+// 从而（1）保证时间戳单调非减（MTP(h-1) >= 父块时间戳），（2）天然防御 timewarp 攻击
+// （矿工无法把时间戳设到低于父链最近 11 块的中位数之下），（3）**不依赖任何墙钟**，
+// 因此墙钟偏差/恶意时钟都不会造成永久共识分叉。
+func MedianTimePastAt(view ChainView, h, activationHeight int) int64 {
+	if h < 0 {
+		return 0
+	}
+	// 冻结设计（DESIGN-1）：窗口为 [max(0, h-10), h] 共至多 11 个区块（比特币等价 MTP）。
+	// 注意：必须是 h-10，而非 h-11——后者会构成 12 块窗口，是偏离冻结设计的共识参数错误，
+	// 会在任何窗口内存在非单调时间戳时令不同节点计算出不同的 MTP，造成永久分叉。
+	start := h - 10
+	if start < 0 {
+		start = 0
+	}
+	n := h - start + 1
+	ts := make([]int64, 0, n)
+	for i := start; i <= h; i++ {
+		b, err := view.BlockByHeight(i)
+		if err != nil {
+			// 视图缺口：以 0 填充（正常主链视图不会到达此处；防御性）。
+			ts = append(ts, 0)
+			continue
+		}
+		ts = append(ts, b.Header.Timestamp)
+	}
+	sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
+	k := len(ts) / 2
+	return ts[k]
+}
+
+// ChainCumulativeWork 返回从创世（高度 0）累积到 height（含）的总**期望工作量**，
+// 即 fork-choice 的链工作量度量：CumulativeWork = Σ_{i=0}^{height} WorkOfBits(bits_i)。
+//
+// 使用 *big.Int 累加，跨数千块不会溢出（单个 2^bits 在 bits=32 时为 2^32 ≈ 4e9，
+// 仍落 uint64，但 Σ 必然越界，故全程 big.Int）。本函数是 reorg 时「最大累积工作量」
+// 判据的权威数据源（与 BlockTree.CumulativeWork 同源，DESIGN-1 §FC-004 闭环）。
+func ChainCumulativeWork(view ChainView, height int) (*big.Int, error) {
+	if height < 0 {
+		return big.NewInt(0), nil
+	}
+	total := big.NewInt(0)
+	for i := 0; i <= height; i++ {
+		b, err := view.BlockByHeight(i)
+		if err != nil {
+			return nil, fmt.Errorf("累积工作量：读取高度 %d 失败: %w", i, err)
+		}
+		total.Add(total, WorkOfBits(b.Header.Bits))
+	}
+	return total, nil
 }

@@ -426,26 +426,20 @@ func mustHeight(t *testing.T, bc *blockchain.Blockchain, height int) *block.Bloc
 // ---- 难度方向：链级 runtime 验证（PHASE 0.1 §17 caveat #2 的闭环） ----
 
 // expectedNextBits 按共识规则**独立重算**「链尾之后下一块应使用的 bits」。
-// 与 Blockchain.currentBitsLocked 是两套独立实现：链级值若与它一致，说明
-// 「周期起点选择 + 实际跨度计算 + AdjustBits 调用」的接线正确（非空断言）。
+// 与 Blockchain.expectedBitsFor 是两套独立实现：链级值若与它一致，说明
+// 「周期起点选择 + 实际跨度计算 + 激活门控 + AdjustBits 调用」的接线正确（非空断言）。
+//
+// 必须走门控的 ComputeExpectedBitsAt：pre-activation 钉死父块 bits（=MaxTargetBits），
+// post-activation 才真正 retarget——这保证了即使 AdjustBits 上限已抬到 32，
+// 存量（pre-activation）链在每个边界高度的期望难度仍是 16（与旧实现逐字节等价）。
 func expectedNextBits(t *testing.T, bc *blockchain.Blockchain, tipHeight, interval int) uint32 {
 	t.Helper()
-	tip, err := bc.Tip()
+	_ = interval
+	want, err := pow.ComputeExpectedBitsAt(bc, tipHeight+1, bc.ActivationHeight())
 	if err != nil {
-		t.Fatalf("读取链尾失败: %v", err)
+		t.Fatalf("独立重算期望难度失败: %v", err)
 	}
-	if tipHeight == 0 || tipHeight%interval != 0 {
-		return tip.Header.Bits
-	}
-	startHeight := tipHeight - interval
-	if startHeight < 0 {
-		startHeight = 0
-	}
-	periodStart, err := bc.BlockByHeight(startHeight)
-	if err != nil {
-		t.Fatalf("读取周期起点高度 %d 失败: %v", startHeight, err)
-	}
-	return pow.AdjustBits(tip.Header.Bits, tip.Header.Timestamp-periodStart.Header.Timestamp)
+	return want
 }
 
 // TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries 是
@@ -491,8 +485,8 @@ func TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries(t *t
 			if err != nil {
 				t.Fatalf("初始化链失败: %v", err)
 			}
-			if got := bc.CurrentBits(); got != pow.MaxDifficultyBits {
-				t.Fatalf("创世后 CurrentBits=%d, want %d", got, pow.MaxDifficultyBits)
+			if got := bc.CurrentBits(); got != pow.MaxTargetBits {
+				t.Fatalf("创世后 CurrentBits=%d, want %d", got, pow.MaxTargetBits)
 			}
 
 			for h := 1; h <= lastBoundary; h++ {
@@ -503,9 +497,9 @@ func TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries(t *t
 					t.Fatalf("高度 %d 读取链尾失败: %v", h, err)
 				}
 				// 全链 bits 恒为设计上限：任何高度都不允许偏离
-				if tip.Header.Bits != pow.MaxDifficultyBits {
+				if tip.Header.Bits != pow.MaxTargetBits {
 					t.Fatalf("高度 %d 的区块 bits=%d，偏离设计上限 %d：本链难度不应浮动",
-						h, tip.Header.Bits, pow.MaxDifficultyBits)
+						h, tip.Header.Bits, pow.MaxTargetBits)
 				}
 
 				if h%interval != 0 {
@@ -516,8 +510,8 @@ func TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries(t *t
 				if got := bc.CurrentBits(); got != want {
 					t.Fatalf("高度 %d 边界：链级 CurrentBits=%d，独立重算=%d（接线不一致）", h, got, want)
 				}
-				if got := bc.CurrentBits(); got != pow.MaxDifficultyBits {
-					t.Fatalf("高度 %d 边界：CurrentBits=%d, want %d", h, got, pow.MaxDifficultyBits)
+				if got := bc.CurrentBits(); got != pow.MaxTargetBits {
+					t.Fatalf("高度 %d 边界：CurrentBits=%d, want %d", h, got, pow.MaxTargetBits)
 				}
 
 				if h != interval {
@@ -539,7 +533,7 @@ func TestChainDifficultyIsPinnedAtDesignedCeilingAcrossAdjustmentBoundaries(t *t
 				t.Fatalf("链高 = %d, want %d", bc.Height(), lastBoundary)
 			}
 			t.Logf("链高 %d：全链 bits 恒为 %d（期望跨度 %d 秒）",
-				bc.Height(), pow.MaxDifficultyBits, expected)
+				bc.Height(), pow.MaxTargetBits, expected)
 		})
 	}
 }

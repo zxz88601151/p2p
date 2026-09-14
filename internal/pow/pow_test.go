@@ -47,15 +47,15 @@ func TestValidateRejectsInvalidPoW(t *testing.T) {
 	}
 }
 
-// TestDifficultyAdjustmentBounds 验证难度调整结果始终落在 [1, MaxTargetBits]。
+// TestDifficultyAdjustmentBounds 验证难度调整结果始终落在 [1, MaxDifficultyBits]（现 32，浮动上限）。
 func TestDifficultyAdjustmentBounds(t *testing.T) {
-	short := pow.AdjustBits(pow.MaxTargetBits, 1)    // 远快于期望 -> 更难, 封顶
+	short := pow.AdjustBits(pow.MaxTargetBits, 1)    // 远快于期望 -> 更难
 	long := pow.AdjustBits(pow.MaxTargetBits, 1<<40) // 远慢于期望 -> 更易
-	if short < 1 || short > pow.MaxTargetBits {
-		t.Fatalf("AdjustBits(short)=%d out of [1,%d]", short, pow.MaxTargetBits)
+	if short < 1 || short > pow.MaxDifficultyBits {
+		t.Fatalf("AdjustBits(short)=%d out of [1,%d]", short, pow.MaxDifficultyBits)
 	}
-	if long < 1 || long > pow.MaxTargetBits {
-		t.Fatalf("AdjustBits(long)=%d out of [1,%d]", long, pow.MaxTargetBits)
+	if long < 1 || long > pow.MaxDifficultyBits {
+		t.Fatalf("AdjustBits(long)=%d out of [1,%d]", long, pow.MaxDifficultyBits)
 	}
 	if short < long {
 		t.Fatalf("shorter timespan should yield >= bits than longer: short=%d long=%d", short, long)
@@ -134,60 +134,65 @@ func TestTargetBitsConservativeRounding(t *testing.T) {
 	}
 }
 
-// TestAdjustBitsDirection 验证既有 clamp 语义下的调整方向不变量：
+// TestAdjustBitsDirection 验证调整方向不变量（新阶段：难度真实浮动，上限 MaxDifficultyBits=32）：
 //
 //	AdjustBits 输出方向由 newTarget ∝ actualTimespan 决定（先算 target 后取整），
-//	随后的两层 clamp（既有语义，本阶段不改）决定链可达行为：
-//	  - MaxTarget 下限 clamp：target 不得超过 T(20)，难度不得低于初始值
-//	  - MaxTargetBits 天花板 clamp：bits 不得超过 20
+//	下限 clamp（>= MaxTargetBits 的 target）与上限 clamp（<= MaxDifficultyBits 的 bits）只压缩可达范围，
+//	不改变方向。从链起点 bits=MaxTargetBits(16) 出发：
+//	  - 短跨度（算力强）：原始 target 更小 ⇒ bits 更高（>16），方向「更难」；
+//	  - 均衡跨度：目标不变 ⇒ bits 不变（=16）；
+//	  - 长跨度（算力弱）：原始 target 更大 ⇒ bits 更低（<16），方向「更易」。
 //
-// 因此从链唯一可达 bits=20 出发，短/均衡/长三种时间跨度结果均为 20：
-//   - 短周期（算力强）：原始 target=2^234（更难，bits 本应为 22），被天花板 clamp 回 20 —— 不变易
-//   - 长周期（算力弱）：原始 target=2^238（更易，bits 本应为 18），被下限 clamp 回 20 —— 不低于初始难度
-//
-// 修复前的缺陷正是绕过了这条不变量：均衡态返回 19（比下限还易 2 倍）。
+// 方向不变量：时间跨度单调变长时，结果 bits 单调不增（允许持平，但绝不反向上升）。
 func TestAdjustBitsDirection(t *testing.T) {
 	expected := int64(pow.TargetBlockTimeSeconds) * int64(pow.DifficultyAdjustmentInterval)
 
-	cases := []struct {
-		name      string
-		timespan  int64
-		direction string
-	}{
-		{"short timespan (hashpower up)", expected / 4, "harder-or-equal (ceiling clamp)"},
-		{"expected timespan", expected, "no drift"},
-		{"long timespan (hashpower down)", expected * 4, "easier-or-equal (floor clamp)"},
-	}
-	for _, c := range cases {
-		got := pow.AdjustBits(pow.MaxTargetBits, c.timespan)
-		if got != pow.MaxTargetBits {
-			t.Fatalf("%s: AdjustBits = %d, want %d (%s)", c.name, got, pow.MaxTargetBits, c.direction)
+	prev := uint32(0)
+	for _, span := range []int64{expected / 4, expected, expected * 4} {
+		got := pow.AdjustBits(pow.MaxTargetBits, span)
+		if prev != 0 && got > prev {
+			t.Fatalf("时间跨度变长时难度反而上升：prev=%d got=%d（span=%d）", prev, got, span)
 		}
+		prev = got
+	}
+
+	// 具体值锚定（起点 bits=16）：短跨度必须更难（>16），均衡必须不变（=16）。
+	if short := pow.AdjustBits(pow.MaxTargetBits, expected/4); short <= pow.MaxTargetBits {
+		t.Fatalf("短跨度应使难度升高（>%d），实际=%d", pow.MaxTargetBits, short)
+	}
+	if eq := pow.AdjustBits(pow.MaxTargetBits, expected); eq != pow.MaxTargetBits {
+		t.Fatalf("均衡跨度难度应不变（=%d），实际=%d", pow.MaxTargetBits, eq)
 	}
 }
 
-// TestMaxDifficultyBitsIsTheDesignedCeiling 固化本链「难度上限 = 初始最低难度」这一
-// **有意设计**（测试网毫秒级出块优先于难度浮动）。
+// TestMaxDifficultyBitsIsTheDesignedCeiling 固化新阶段的设计：
 //
-// 该常量不是把「下限常量」误用作上限：AdjustBits 的下限 clamp 用 MaxTarget/MaxTargetBits
-// 表达，上限 clamp 用 MaxDifficultyBits 表达。二者在当前共识参数下取值相同，
-// 但语义分离，将来若要开放难度浮动只需调整 MaxDifficultyBits 与 clamp 带宽
-// （属独立共识参数阶段，见常量注释）。
+//	难度在 [1, MaxDifficultyBits] 内**真实浮动**，上限抬至 32（仍 >= 初始最低难度 MaxTargetBits）。
+//
+// 该上限是 AdjustBits 的天花板钳制（见 pow.go 常量注释）：解锁了旧链「钉死 16」的有意限制，
+// 但仍保证链上可达 bits 不超过 32（避免单周期难度爆炸）。本用例守护「上限语义不被破坏」：
+// AdjustBits 产出永不超过 MaxDifficultyBits，且 MaxDifficultyBits 必须 >= 初始最低难度。
 func TestMaxDifficultyBitsIsTheDesignedCeiling(t *testing.T) {
-	if pow.MaxDifficultyBits != pow.MaxTargetBits {
-		t.Fatalf("MaxDifficultyBits=%d 与 MaxTargetBits=%d 不一致："+
-			"本链设计为难度固定在最低值，若此处被改动必须同步更新 README/控制台文案与共识说明",
+	if pow.MaxDifficultyBits < pow.MaxTargetBits {
+		t.Fatalf("MaxDifficultyBits=%d 低于 MaxTargetBits=%d：难度上限不应低于初始最低难度",
 			pow.MaxDifficultyBits, pow.MaxTargetBits)
 	}
 	if pow.MaxDifficultyBits >= 256 {
 		t.Fatalf("MaxDifficultyBits=%d 非法：BitsToTarget 在 bits>=256 时目标失去意义", pow.MaxDifficultyBits)
+	}
+	// 上限钳制：从任意合法起始难度出发，极短跨度（算力极强）的产出不得越过 MaxDifficultyBits。
+	for b := uint32(1); b <= pow.MaxTargetBits; b++ {
+		if got := pow.AdjustBits(b, 1); got > pow.MaxDifficultyBits {
+			t.Fatalf("AdjustBits(%d, 1) = %d 越过 MaxDifficultyBits=%d", b, got, pow.MaxDifficultyBits)
+		}
 	}
 }
 
 // TestAdjustBitsNeverExceedsDesignedCeiling 穷举 [1, MaxDifficultyBits] 的全部合法输入难度
 // × 各类时间跨度（含 0、负数、极小、均衡、极大、极端），断言输出恒落在 [1, MaxDifficultyBits]。
 //
-// 这是「难度不浮动」的**代数级**保证：不论算力多强、时间跨度多极端，链上难度都不会越过设计上限。
+// 这是「难度浮动但不超过设计上限」的**代数级**保证：不论算力多强、时间跨度多极端，
+// 链上可达 bits 都不会越过天花板 MaxDifficultyBits（现 32），也不会低于 1。
 func TestAdjustBitsNeverExceedsDesignedCeiling(t *testing.T) {
 	expected := int64(pow.TargetBlockTimeSeconds) * int64(pow.DifficultyAdjustmentInterval)
 	spans := []int64{
