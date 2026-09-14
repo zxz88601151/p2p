@@ -8,12 +8,17 @@
 //   - 提供 CheckInvariant 验证整树结构不变式。
 //
 // 本阶段「不实现」（属后续阶段）：
-//   - fork-choice / SetTip / 链切换执行；
-//   - 持久化（落盘）；
+//   - 共识级链切换执行（ConnectBlock/DisconnectBlock/UTXO rollback）—— REORG-1C / R3；
+//   - 持久化（落盘）—— REORG-1E / R5；
 //   - BlockUndo / atomic commit / crash recovery；
 //   - common ancestor 计算；
 //   - MaxReorgDepth 与 P2P reorg 同步；
 //   - 任何共识参数、难度或 P2P 行为变更。
+//
+// REORG-1B 在本包内新增「树级 tip 基础设施」（见 settip.go）：
+//   - BlockTree.bestTip / bestTipWork（R1 契约 §C.2-q4：显式 active tip 指针）；
+//   - SetTip 仅移动该指针，**绝不触碰 UTXO / mempool / 持久化**（§9 契约）；
+//   - 这是 REORG-1C 共识级 SetTip 的数据前提，本身不触发链切换。
 //
 // 该包是纯内存结构，不依赖任何既有链模块（仅使用标准库），
 // 因此天然不接入 cmd/node，reorg 执行保持 OFF。
@@ -158,9 +163,18 @@ func (n *BlockNode) IsAncestorOf(other *BlockNode) bool {
 }
 
 // BlockTree 是 BlockNode 的内存索引，提供 O(1) 查找、双向链接与不变式检查。
-// 本阶段不持久化、不实现 fork-choice / SetTip。
+// REORG-1B 在其上新增树级 tip 状态（bestTip/bestTipWork）与 SetTip 原语（见 settip.go）。
+// 本包不持久化、不实现共识级链切换（Connect/Disconnect/UTXO rollback 属 REORG-1C）。
 type BlockTree struct {
 	nodes map[[32]byte]*BlockNode
+
+	// —— REORG-1B 树级 tip 状态（R1 契约 §C.2-q4：显式 active tip 指针）——
+	// bestTip 是当前「活动链尾」的索引指针；bestTipWork 是其 CumulativeWork 的缓存（O(1) fork-choice）。
+	// 二者仅由 SetTip 维护；fork-choice 决策走 ShouldReorg（只读比较，不切换）。
+	// 注意：本字段是「索引层」状态，不等于「共识层」活动链（共识层活动链仍由 blockchain.blocks[len-1] 表达，
+	// 直到 REORG-1C 把 SetTip 接入 blockchain 并完成 UTXO disconnect/connect）。
+	bestTip     *BlockNode
+	bestTipWork *big.Int
 }
 
 // NewBlockTree 创建一棵空树。
