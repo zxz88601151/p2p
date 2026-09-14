@@ -25,7 +25,26 @@ type walletFileJSON struct {
 	PubKey  string `json:"pubkey"`
 }
 
-// SaveToFile 将钱包写入指定路径（0600 权限，目录不存在时自动创建）。
+// 未导出测试注入点：仅在单元测试中被替换，生产路径语义为零改变。
+// PHASE WALLET-PERSISTENCE-HARDENING-1：用于 T4–T7 失败注入。
+var (
+	hookWrite = func(f *os.File, data []byte) error {
+		_, err := f.Write(data)
+		return err
+	}
+	hookSync   = func(f *os.File) error { return f.Sync() }
+	hookRename = os.Rename
+)
+
+// SaveToFile 将钱包以 crash-safe 方式写入指定路径（0600 权限，目录不存在时自动创建）。
+//
+// 持久化协议（PHASE WALLET-PERSISTENCE-HARDENING-1，方案 B1）：
+// 同目录 tmp → 完整写入 → Sync → Close → 原子 rename 替换。
+// 保证 wallet.json 在任意 crash 边界下只能是「完整旧文件、完整新文件或不存在」，
+// 绝不会成为半写/损坏 JSON（W1–W7 crash matrix，见阶段审计报告）。
+//
+// 明确禁止：delete-before-rename、O_TRUNC 打开目标、rename 失败后的任何非原子 fallback
+// （含 Windows sharing violation 时的绕过尝试）——失败即返回错误，方向 fail-stop。
 func (w *Wallet) SaveToFile(path string) error {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -43,7 +62,36 @@ func (w *Wallet) SaveToFile(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	// tmp 与目标同目录 → 同一 filesystem → rename 原子性成立。
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("创建钱包临时文件失败: %w", err)
+	}
+	if err := hookWrite(f, data); err != nil {
+		f.Close()
+		removeTmp(tmp)
+		return fmt.Errorf("写入钱包临时文件失败: %w", err)
+	}
+	if err := hookSync(f); err != nil {
+		f.Close()
+		removeTmp(tmp)
+		return fmt.Errorf("同步钱包临时文件失败: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		removeTmp(tmp)
+		return fmt.Errorf("关闭钱包临时文件失败: %w", err)
+	}
+	if err := hookRename(tmp, path); err != nil {
+		removeTmp(tmp)
+		return fmt.Errorf("原子替换钱包文件失败: %w", err)
+	}
+	return nil
+}
+
+// removeTmp 失败路径的 best-effort 清理：其自身失败不得覆盖主持久化错误，故忽略返回值。
+func removeTmp(tmp string) {
+	_ = os.Remove(tmp)
 }
 
 // LoadFromFile 从指定路径读取钱包并恢复密钥对，同时校验曲线点合法性。
