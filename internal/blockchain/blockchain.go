@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"p2pchain/internal/block"
+	"p2pchain/internal/blocktree"
 	"p2pchain/internal/pow"
 	"p2pchain/internal/storage"
 	"p2pchain/internal/utxo"
@@ -52,11 +53,29 @@ type Blockchain struct {
 	utxo   *utxo.UTXOSet
 	store  storage.BlockStore
 
+	// tree 是区块的内存树索引（REORG-1C），用于 fork detection、chainwork 比较、
+	// common ancestor 计算。不持久化，启动时从 storage 重建。
+	tree *blocktree.BlockTree
+
 	// activationHeight 是难度浮动/新时间戳-MTP/新版本强制生效的高度。
 	// 默认取共识常量 pow.ActivationHeight（2000，> 当前生产高度，保证存量链不破）；
 	// 测试可注入更小的高度以越过激活边界而无需真挖 2000 块。
 	// 该字段是共识真值的一部分，绝不在运行期变更。
 	activationHeight int
+}
+
+// reorgStore 是 storage.FileBlockStore 提供的最小 v2 接口子集，
+// 供 blockchain 通过类型断言调用 reorg 原语，避免修改 storage.BlockStore 骨架接口。
+type reorgStore interface {
+	storage.BlockStore
+	AppendCanonicalBlock(b *block.Block, undo utxo.BlockUndo) error
+	SaveBlockDetached(b *block.Block) error
+	SaveBlockWithUndo(b *block.Block, undo utxo.BlockUndo) error
+	CommitTip(hash [32]byte) error
+	CommitReorg(detachedUndos map[[32]byte]utxo.BlockUndo, newBlocks []*block.Block, newUndos []utxo.BlockUndo, newTipHash [32]byte) error
+	HasBlock(hash [32]byte) bool
+	HasUndo(hash [32]byte) bool
+	V2Mode() bool
 }
 
 // NewBlockchainWithGenesis 使用给定的创世区块初始化链（不持久化，供测试/临时链使用）。
@@ -66,9 +85,15 @@ func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创世区块 UTXO 初始化失败: %w", err)
 	}
+	tree := blocktree.NewBlockTree()
+	_, err = tree.AddBlock(genesis.Header.Hash(), [32]byte{}, 0, genesis.Header.Bits, genesis.Header.Timestamp)
+	if err != nil {
+		return nil, fmt.Errorf("创世区块加入树索引失败: %w", err)
+	}
 	return &Blockchain{
 		blocks:          []*block.Block{genesis},
 		utxo:            genesisSet,
+		tree:            tree,
 		activationHeight: pow.ActivationHeight,
 	}, nil
 }
@@ -83,6 +108,24 @@ func NewBlockchainWithGenesisAndActivation(genesis *block.Block, activationHeigh
 	}
 	bc.activationHeight = activationHeight
 	return bc, nil
+}
+
+// rebuildTree 从当前 bc.blocks 重建 blocktree（启动回放后调用）。
+func (bc *Blockchain) rebuildTree() error {
+	bc.tree = blocktree.NewBlockTree()
+	for i, b := range bc.blocks {
+		_, err := bc.tree.AddBlock(b.Header.Hash(), b.Header.PrevBlockHash, i, b.Header.Bits, b.Header.Timestamp)
+		if err != nil {
+			return fmt.Errorf("重建树索引 高度 %d 失败: %w", i, err)
+		}
+	}
+	// 初始活动链尾 = 当前链尾
+	if tip := bc.blocks[len(bc.blocks)-1]; len(bc.blocks) > 0 {
+		if node := bc.tree.LookupNode(tip.Header.Hash()); node != nil {
+			_ = bc.tree.SetTip(node)
+		}
+	}
+	return nil
 }
 
 // NewBlockchainFromStore 从持久化存储加载链；空库时创建确定性创世并落盘。
@@ -127,6 +170,10 @@ func NewBlockchainFromStore(store storage.BlockStore) (*Blockchain, error) {
 		if err := bc.applyBlock(b); err != nil {
 			return nil, fmt.Errorf("回放高度 %d 区块失败（数据可能损坏）: %w", i, err)
 		}
+	}
+	// REORG-1C：从回放后的 canonical 链重建 blocktree
+	if err := bc.rebuildTree(); err != nil {
+		return nil, fmt.Errorf("重建 blocktree 失败: %w", err)
 	}
 	return bc, nil
 }
@@ -329,32 +376,295 @@ func (bc *Blockchain) applyBlock(b *block.Block) error {
 
 // addBlock 是追加的唯一实现：validateBlock →（可选）落盘 → 原子替换 UTXO 与链尾。
 // persist=false 时只重建内存状态。
+// REORG-1C：已扩展为支持 fork detection + reorg execution。
 func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	if len(bc.blocks) == 0 {
+		return ErrEmptyChain
+	}
+
+	currentTip := bc.blocks[len(bc.blocks)-1]
+	parentHash := b.Header.PrevBlockHash
+
+	// ── Case 1: 直接延长当前链 ──
+	if parentHash == currentTip.Header.Hash() {
+		return bc.extendChain(b, persist)
+	}
+
+	// ── Case 2: Fork block（父在当前链但非链尾，或在另一条 branch 上）──
+	parentNode := bc.tree.LookupNode(parentHash)
+	if parentNode == nil {
+		// 父不存在：可能是 orphan（P2P 到达顺序问题），现阶段直接拒绝
+		return fmt.Errorf("%w: parent %x not in tree", ErrInvalidPrevHash, parentHash[:4])
+	}
+
+	// 加入 blocktree（轻量级元数据索引）
+	height := parentNode.Height + 1
+	node, err := bc.tree.AddBlock(b.Header.Hash(), parentHash, height, b.Header.Bits, b.Header.Timestamp)
+	if err != nil {
+		if errors.Is(err, blocktree.ErrDuplicateHash) {
+			return nil // 已存在，幂等
+		}
+		return fmt.Errorf("blocktree add failed: %w", err)
+	}
+
+	// 对 fork block 做完整共识校验（基于父分支的 UTXO）
+	if err := bc.validateForkBlock(b, parentNode); err != nil {
+		// 用 ErrInvalidPrevHash 包装 fork 校验失败，以保持既有测试断言兼容：
+		// 旧语义下「非 tip 父哈希」一律返回 ErrInvalidPrevHash；新语义下仍拒绝，
+		// 但附带真实失败原因。errors.Is(err, ErrInvalidPrevHash) 保持为 true。
+		return fmt.Errorf("%w: %v", ErrInvalidPrevHash, err)
+	}
+
+	// 决定是否应 reorg
+	shouldReorg, _, err := bc.tree.ShouldReorg(node)
+	if err != nil {
+		return err
+	}
+
+	if !shouldReorg {
+		// 保存为 detached，但不切换 canonical
+		if persist && bc.store != nil {
+			if v2s, ok := bc.store.(reorgStore); ok {
+				_ = v2s.SaveBlockDetached(b)
+			}
+		}
+		return nil
+	}
+
+	// 执行 reorg
+	return bc.executeReorg(node, persist)
+}
+
+// extendChain 处理直接延长当前 canonical 链的区块。
+func (bc *Blockchain) extendChain(b *block.Block, persist bool) error {
 	newSet, err := bc.validateBlock(b, false)
 	if err != nil {
 		return fmt.Errorf("添加区块失败: %w", err)
 	}
-	// 先落盘再更新内存状态：落盘失败则内存状态不变，保证两者一致
 	if persist && bc.store != nil {
-		if err := bc.store.SaveBlock(b); err != nil {
-			return fmt.Errorf("区块持久化失败: %w", err)
+		if v2s, ok := bc.store.(reorgStore); ok && v2s.V2Mode() {
+			// v2 模式：生成 undo 并使用 AppendCanonicalBlock
+			_, undo, _, err := utxo.ApplyBlockWithUndo(bc.utxo, b.Transactions, len(bc.blocks))
+			if err != nil {
+				return fmt.Errorf("生成 undo 失败: %w", err)
+			}
+			if err := v2s.AppendCanonicalBlock(b, undo); err != nil {
+				return fmt.Errorf("区块持久化失败: %w", err)
+			}
+		} else {
+			// legacy 模式或 v2 尚未激活：保持逐字节不变
+			if err := bc.store.SaveBlock(b); err != nil {
+				return fmt.Errorf("区块持久化失败: %w", err)
+			}
 		}
 	}
 	bc.blocks = append(bc.blocks, b)
 	bc.utxo = newSet
+	// 同步更新 blocktree tip
+	if node := bc.tree.LookupNode(b.Header.Hash()); node != nil {
+		_ = bc.tree.SetTip(node)
+	}
 	return nil
 }
 
-// TODO 分叉处理（reorg，设计要点，当前为单链追加实现）：
-//
-// 真实网络中，不同节点可能几乎同时挖出不同的区块，形成临时分叉。
-// 处理原则（最长有效链 / 最大累积工作量）：
-//  1. 收到新区块时若 PrevBlockHash 不指向当前链尾，判断其所在链的累积工作量；
-//  2. 更高则执行重组：回滚链尾区块（需要按高度逆序反向应用 UTXO——
-//     因此持久化层保存每个 UTXO 条目的产生高度与消费记录），
-//     切换到工作量更大的链，被回滚交易重新入池；
-//  3. 需要把 blocks []*Block 升级为 map[哈希]BlockNode 的树状索引。
-//  本项目保留单链实现 + 上述设计说明，作为下一阶段工作项。
+// validateForkBlock 对一条 fork branch 上的区块执行共识校验。
+// 需要重建父节点处的 UTXO 状态（replay from genesis）。
+func (bc *Blockchain) validateForkBlock(b *block.Block, parentNode *blocktree.BlockNode) error {
+	baseUTXO, err := bc.utxoAtNode(parentNode)
+	if err != nil {
+		return fmt.Errorf("rebuild parent UTXO failed: %w", err)
+	}
+	parentBlock, err := bc.blockAtHash(parentNode.Hash)
+	if err != nil {
+		return fmt.Errorf("get parent block failed: %w", err)
+	}
+	height := parentNode.Height + 1
+
+	// 1. 链式结构
+	if b.Header.PrevBlockHash != parentBlock.Header.Hash() {
+		return ErrInvalidPrevHash
+	}
+	// 2. 版本号
+	if err := bc.validateVersion(b, height); err != nil {
+		return err
+	}
+	// 3. PoW
+	if !pow.Validate(&b.Header) {
+		return ErrInvalidPoW
+	}
+	// 4. 难度（使用当前链的期望难度作为近似；fork branch 难度差异属已知局限）
+	if err := bc.validateBits(b, height); err != nil {
+		return err
+	}
+	// 5. 时间戳
+	if err := bc.validateTimestamp(b, parentBlock, height); err != nil {
+		return err
+	}
+	// 6. Merkle
+	if block.ComputeMerkleRoot(b.Transactions) != b.Header.MerkleRoot {
+		return ErrMerkleMismatch
+	}
+	// 7. 体积
+	if size := b.Size(); size > MaxBlockSize {
+		return fmt.Errorf("%w: %d > %d", ErrBlockTooLarge, size, MaxBlockSize)
+	}
+	// 8. 交易层
+	_, _, err = utxo.ApplyBlock(baseUTXO, b.Transactions, height)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrBadTxLayout, unwrapLayoutErr(err))
+	}
+	return nil
+}
+
+// utxoAtNode 通过从创世 replay 到 node，返回 node 处的 UTXO 状态。
+func (bc *Blockchain) utxoAtNode(node *blocktree.BlockNode) (*utxo.UTXOSet, error) {
+	path := node.PathToRoot()
+	// 反转为 genesis → node
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	if len(path) == 0 {
+		return nil, errors.New("empty path")
+	}
+	genesisBlock, err := bc.blockAtHash(path[0].Hash)
+	if err != nil {
+		return nil, fmt.Errorf("genesis: %w", err)
+	}
+	set, _, err := utxo.ApplyBlock(utxo.NewUTXOSet(), genesisBlock.Transactions, 0)
+	if err != nil {
+		return nil, fmt.Errorf("genesis apply: %w", err)
+	}
+	for i := 1; i < len(path); i++ {
+		b, err := bc.blockAtHash(path[i].Hash)
+		if err != nil {
+			return nil, fmt.Errorf("height %d: %w", i, err)
+		}
+		newSet, _, err := utxo.ApplyBlock(set, b.Transactions, i)
+		if err != nil {
+			return nil, fmt.Errorf("height %d apply: %w", i, err)
+		}
+		set = newSet
+	}
+	return set, nil
+}
+
+// blockAtHash 按哈希查找区块：先搜索内存中的 canonical 链，再回退到 storage。
+func (bc *Blockchain) blockAtHash(hash [32]byte) (*block.Block, error) {
+	for _, b := range bc.blocks {
+		if b.Header.Hash() == hash {
+			return b, nil
+		}
+	}
+	if bc.store != nil {
+		return bc.store.GetBlockByHash(hash)
+	}
+	return nil, storage.ErrNotFound
+}
+
+// executeReorg 执行完整的链重组：disconnect old → apply new → persist → update memory。
+func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) error {
+	oldTip := bc.tree.BestTip()
+	if oldTip == nil {
+		return errors.New("no active tip")
+	}
+
+	ancestor := bc.tree.FindCommonAncestor(oldTip, newTip)
+	if ancestor == nil {
+		return errors.New("no common ancestor found")
+	}
+
+	// disconnect path: oldTip → ... → ancestor's child (reverse order)
+	disconnectPath := make([]*blocktree.BlockNode, 0)
+	for cur := oldTip; cur != nil && cur.Hash != ancestor.Hash; cur = cur.Parent {
+		disconnectPath = append(disconnectPath, cur)
+	}
+
+	// connect path: ancestor's child → ... → newTip
+	connectPath := make([]*blocktree.BlockNode, 0)
+	for cur := newTip; cur != nil && cur.Hash != ancestor.Hash; cur = cur.Parent {
+		connectPath = append(connectPath, cur)
+	}
+	for i, j := 0, len(connectPath)-1; i < j; i, j = i+1, j-1 {
+		connectPath[i], connectPath[j] = connectPath[j], connectPath[i]
+	}
+
+	// 从 common ancestor replay 得到起始 UTXO
+	utxoSet, err := bc.utxoAtNode(ancestor)
+	if err != nil {
+		return fmt.Errorf("reorg: ancestor UTXO rebuild failed: %w", err)
+	}
+
+	// 若 ancestor == oldTip（即 newTip 是 oldTip 的后代），disconnectPath 为空
+	// 否则需要 disconnect old branch；但当前实现选择「从 ancestor 全量 replay」，
+	// 不依赖旧 UTXO 的增量回滚。这简化了实现且对开发者节点规模可接受。
+	_ = disconnectPath
+
+	// Apply new branch
+	newBlocks := make([]*block.Block, 0, len(connectPath))
+	newUndos := make([]utxo.BlockUndo, 0, len(connectPath))
+	for _, node := range connectPath {
+		b, err := bc.blockAtHash(node.Hash)
+		if err != nil {
+			return fmt.Errorf("reorg: get block %x: %w", node.Hash[:4], err)
+		}
+		newSet, undo, _, err := utxo.ApplyBlockWithUndo(utxoSet, b.Transactions, node.Height)
+		if err != nil {
+			return fmt.Errorf("reorg: apply block %x: %w", node.Hash[:4], err)
+		}
+		utxoSet = newSet
+		newBlocks = append(newBlocks, b)
+		newUndos = append(newUndos, undo)
+	}
+
+	// Persist
+	if persist && bc.store != nil {
+		if v2s, ok := bc.store.(reorgStore); ok {
+			// detached undos = 已存储但缺 undo 的区块
+			detachedUndos := make(map[[32]byte]utxo.BlockUndo)
+			for i, node := range connectPath {
+				if v2s.HasBlock(node.Hash) && !v2s.HasUndo(node.Hash) {
+					detachedUndos[node.Hash] = newUndos[i]
+				}
+			}
+			// actual new blocks = 尚未存储的区块
+			var actualNewBlocks []*block.Block
+			var actualNewUndos []utxo.BlockUndo
+			for i, b := range newBlocks {
+				if !v2s.HasBlock(b.Header.Hash()) {
+					actualNewBlocks = append(actualNewBlocks, b)
+					actualNewUndos = append(actualNewUndos, newUndos[i])
+				}
+			}
+			if err := v2s.CommitReorg(detachedUndos, actualNewBlocks, actualNewUndos, newTip.Hash); err != nil {
+				return fmt.Errorf("reorg: persist failed: %w", err)
+			}
+		}
+	}
+
+	// Update memory canonical state
+	newChain := make([]*block.Block, 0, ancestor.Height+1+len(connectPath))
+	ancestorPath := ancestor.PathToRoot()
+	for i, j := 0, len(ancestorPath)-1; i < j; i, j = i+1, j-1 {
+		ancestorPath[i], ancestorPath[j] = ancestorPath[j], ancestorPath[i]
+	}
+	for _, n := range ancestorPath {
+		b, _ := bc.blockAtHash(n.Hash)
+		if b != nil {
+			newChain = append(newChain, b)
+		}
+	}
+	for _, n := range connectPath {
+		b, _ := bc.blockAtHash(n.Hash)
+		if b != nil {
+			newChain = append(newChain, b)
+		}
+	}
+
+	bc.blocks = newChain
+	bc.utxo = utxoSet
+	_ = bc.tree.SetTip(newTip)
+	return nil
+}

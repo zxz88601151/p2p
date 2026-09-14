@@ -162,6 +162,26 @@ func (n *BlockNode) IsAncestorOf(other *BlockNode) bool {
 	return false
 }
 
+// FindCommonAncestor 返回 a 与 b 的最近公共祖先（含自身）。
+// 若 a == b，返回 a；若二者无公共祖先（不应发生在单树中），返回 nil。
+func (t *BlockTree) FindCommonAncestor(a, b *BlockNode) *BlockNode {
+	if a == nil || b == nil {
+		return nil
+	}
+	// 收集 a 的祖先路径（含自身）到 map
+	seen := make(map[[32]byte]*BlockNode)
+	for cur := a; cur != nil; cur = cur.Parent {
+		seen[cur.Hash] = cur
+	}
+	// 从 b 向上回溯，第一个在 seen 中的节点即为 LCA
+	for cur := b; cur != nil; cur = cur.Parent {
+		if n, ok := seen[cur.Hash]; ok {
+			return n
+		}
+	}
+	return nil
+}
+
 // BlockTree 是 BlockNode 的内存索引，提供 O(1) 查找、双向链接与不变式检查。
 // REORG-1B 在其上新增树级 tip 状态（bestTip/bestTipWork）与 SetTip 原语（见 settip.go）。
 // 本包不持久化、不实现共识级链切换（Connect/Disconnect/UTXO rollback 属 REORG-1C）。

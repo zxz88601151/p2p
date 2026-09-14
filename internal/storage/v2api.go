@@ -283,6 +283,122 @@ func (s *FileBlockStore) AppendCanonicalBlock(b *block.Block, undo utxo.BlockUnd
 	return s.commitTipAfterAppend(rec, offs[2])
 }
 
+// CommitReorg 批量持久化一次完整的 reorg：为已存储的 detached 区块补写 UNDO、
+// 为新块写入 (UNDO+BLOCK)、最后追加 TIP(newTip)。全部帧在一次 fsync 中提交（MODEL A）。
+func (s *FileBlockStore) CommitReorg(
+	detachedUndos map[[32]byte]utxo.BlockUndo,
+	newBlocks []*block.Block,
+	newUndos []utxo.BlockUndo,
+	newTipHash [32]byte,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.requireWritable(); err != nil {
+		return err
+	}
+	if len(newBlocks) != len(newUndos) {
+		return fmt.Errorf("newBlocks(%d) 与 newUndos(%d) 长度不匹配", len(newBlocks), len(newUndos))
+	}
+
+	// Phase 1: validate & compute (NO side effects on s.v2 maps yet)
+	for hash, undo := range detachedUndos {
+		rec, ok := s.v2.records[hash]
+		if !ok {
+			return fmt.Errorf("%w: detached undo 目标区块不存在 %x", ErrBlockNotFound, hash)
+		}
+		if !rec.isV2 {
+			return fmt.Errorf("%w: detached undo 目标区块为 legacy %x", ErrLegacyImmutable, hash)
+		}
+		if undo.Height != rec.height {
+			return fmt.Errorf("%w: undo.Height=%d 区块 height=%d", ErrUndoBinding, undo.Height, rec.height)
+		}
+		if _, dup := s.v2.undoIndex[hash]; dup {
+			return fmt.Errorf("%w: %x", ErrDuplicateUndo, hash)
+		}
+	}
+
+	type pendingNew struct {
+		hash   [32]byte
+		height int
+		cum    *big.Int
+		block  *block.Block
+		undo   utxo.BlockUndo
+	}
+	var pending []pendingNew
+	for i, b := range newBlocks {
+		h, cum, err := s.deriveStrict(b)
+		if err != nil {
+			return err
+		}
+		if newUndos[i].Height != h {
+			return fmt.Errorf("%w: undo.Height=%d 派生 height=%d", ErrUndoBinding, newUndos[i].Height, h)
+		}
+		hash := b.Header.Hash()
+		if _, dup := s.v2.undoIndex[hash]; dup {
+			return fmt.Errorf("%w: %x", ErrDuplicateUndo, hash)
+		}
+		pending = append(pending, pendingNew{hash, h, cum, b, newUndos[i]})
+	}
+
+	// Determine tip record (may be new or existing)
+	var tipRec *blockRecord
+	if r, ok := s.v2.records[newTipHash]; ok {
+		tipRec = r
+	} else {
+		// newTip must be one of the newBlocks
+		found := false
+		for _, p := range pending {
+			if p.hash == newTipHash {
+				tipRec = &blockRecord{hash: p.hash, height: p.height, cumWork: p.cum, block: p.block, isV2: true}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: newTip %x 不在 storage 也不在 newBlocks 中", ErrTipBlockMissing, newTipHash)
+		}
+	}
+
+	// Phase 2: build frames (pure computation)
+	var frames [][]byte
+	for hash, undo := range detachedUndos {
+		rec := s.v2.records[hash]
+		ub, _ := utxo.EncodeUndo(undo)
+		frames = append(frames, encodeFrame(recTypeUndo, uint32(rec.height), hash, ub))
+	}
+	for _, p := range pending {
+		ub, _ := utxo.EncodeUndo(p.undo)
+		frames = append(frames, encodeFrame(recTypeUndo, uint32(p.height), p.hash, ub))
+		frames = append(frames, encodeFrame(recTypeBlock, uint32(p.height), p.hash, p.block.Encode()))
+	}
+	tipPayload, _ := encodeTipPayload(tipRec.cumWork, tipRec.height)
+	frames = append(frames, encodeFrame(recTypeTip, uint32(tipRec.height), tipRec.hash, tipPayload))
+
+	// Phase 3: single fsync
+	offs, err := s.appendFrames(frames...)
+	if err != nil {
+		return err
+	}
+
+	// Phase 4: update in-memory state (guaranteed to match disk now)
+	offIdx := len(detachedUndos)
+	for _, p := range pending {
+		undoOff := offs[offIdx]
+		offIdx++
+		blockOff := offs[offIdx]
+		offIdx++
+		s.registerBlock(p.block, p.height, p.cum, blockOff)
+		s.v2.undoIndex[p.hash] = undoRecord{blockHash: p.hash, height: uint32(p.height), offset: undoOff}
+	}
+	for hash, undo := range detachedUndos {
+		h := s.v2.records[hash].height
+		_ = undo
+		s.v2.undoIndex[hash] = undoRecord{blockHash: hash, height: uint32(h), offset: 0}
+	}
+	tipOff := offs[len(offs)-1]
+	return s.commitTipAfterAppend(tipRec, tipOff)
+}
+
 // ── 写入：逻辑删除 / 回退（永不物理删除已提交字节）───────────────────────
 
 // DeleteBlock 逻辑删除一枚区块（墓碑 + 追加 TIP）。
