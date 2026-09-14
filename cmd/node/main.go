@@ -359,6 +359,20 @@ func startNode(args []string, openConsole bool) {
 	defer signal.Stop(sigCh)
 
 	if nf.mine {
+		// P2 修复（PHASE P2-SIGTERM-REMEDIATION-1/2）：挖矿路径下 main goroutine
+		// 被 runMiner 同步占用，sigCh 原先无人消费——SIGTERM/SIGINT 被 Notify 捕获
+		// 后缓冲进通道即被静默吞掉，进程永不退出（Linux 实证）。
+		// 该桥接 goroutine 把信号转译为既有 requestStop()，与 `node stop` 汇聚到
+		// 同一个 stopCh 单出口；stopOnce 保证幂等，不产生第二套 shutdown 状态机。
+		// runMiner 返回后本 goroutine 经 stopCh case 返回，无泄漏（进程生命周期内）。
+		go func() {
+			select {
+			case <-sigCh:
+				log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
+				requestStop()
+			case <-stopCh:
+			}
+		}()
 		runMiner(rt.svc, nf.maxBlocks, stopCh)
 		log.Printf("[node] 正在关闭（释放数据目录锁）...")
 		return
