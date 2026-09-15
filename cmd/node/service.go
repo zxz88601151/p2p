@@ -253,17 +253,47 @@ func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayloa
 // ---- 内部工具 ----
 
 // addBlockAndUpdatePool 追加区块并同步交易池：移除已上链交易、剔除失效交易。
+// REORG-1F：若触发 reorg，在 canonical TIP 提交后复活断开区块中的交易。
 func (s *nodeService) addBlockAndUpdatePool(b *block.Block) error {
 	height := s.chain.Height() + 1
-	if err := s.chain.AddBlock(b); err != nil {
+	result, err := s.chain.AddBlockWithResult(b)
+	if err != nil {
 		return err
 	}
+
+	// REORG-1F：若发生 reorg，复活断开区块中的非 coinbase 交易。
+	if result != nil {
+		s.resurrectMempool(result, height)
+	}
+
 	s.pool.RemoveIncluded(b, s.chain.UTXOSnapshot(), height)
 	log.Printf("[node] 新区块已上链: 高度=%d 哈希=%s 交易数=%d",
 		s.chain.Height(), b.Header.HashHex(), len(b.Transactions))
 	// 链尾变化 → 通知挖矿循环放弃当前候选区块
 	s.notifyTipChanged()
 	return nil
+}
+
+// resurrectMempool 根据 ReorgResult 将断开区块中的交易重新加入内存池。
+func (s *nodeService) resurrectMempool(result *blockchain.ReorgResult, height int) {
+	// 构造新 canonical 链的交易去重集
+	newChainTxs := make(map[[32]byte]struct{})
+	for _, b := range result.ConnectBlocks {
+		for _, tx := range b.Transactions {
+			newChainTxs[tx.Hash()] = struct{}{}
+		}
+	}
+
+	accepted, rejected := s.pool.ReaddDisconnected(
+		result.DisconnectBlocks,
+		s.chain.UTXOSnapshot(),
+		height,
+		newChainTxs,
+	)
+	if accepted > 0 || rejected > 0 {
+		log.Printf("[node] reorg resurrection: 复活=%d 拒绝=%d 断开块=%d 新块=%d",
+			accepted, rejected, len(result.DisconnectBlocks), len(result.ConnectBlocks))
+	}
 }
 
 // requestSync 向指定对端请求从 from 高度开始的区块。

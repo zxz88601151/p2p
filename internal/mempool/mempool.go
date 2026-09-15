@@ -217,3 +217,116 @@ func (m *Mempool) All() []*transaction.Transaction {
 	}
 	return out
 }
+
+// ReaddDisconnected 在链重组后将断开区块中的非 coinbase 交易重新加入内存池。
+//
+// 参数：
+//   - disconnectBlocks：被断开分支上的区块列表（从 old tip 到 ancestor）。
+//   - newBase：新 canonical 链的 UTXO 状态。
+//   - height：新链当前高度（用于 maturity 等校验）。
+//   - newChainTxs：新 canonical 链中已确认的交易哈希集合（用于去重）。
+//
+// 返回 (accepted, rejected) 计数。
+//
+// 算法：
+//  1. 扫描断开区块，收集非 coinbase 候选（跳过已在新链确认的）。
+//  2. 多轮尝试 mempool.Add，处理 parent→child 依赖链。
+//  3. 每轮将成功入池的交易移出候选集；无进展时终止。
+//
+// 约束：
+//   - 不修改共识状态；失败静默丢弃。
+//   - 遵守 pool 容量限制（maxSize）。
+//   - 已存在于 pool 中的交易跳过（幂等）。
+func (m *Mempool) ReaddDisconnected(disconnectBlocks []*block.Block, newBase *utxo.UTXOSet, height int, newChainTxs map[[32]byte]struct{}) (accepted, rejected int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Phase 1: 收集候选（确定性顺序：disconnectBlocks 顺序 × tx 索引顺序）
+	candidates := make([]*transaction.Transaction, 0)
+	seen := make(map[[32]byte]struct{})
+	for _, b := range disconnectBlocks {
+		for i, tx := range b.Transactions {
+			if i == 0 {
+				continue // coinbase 永不复活
+			}
+			id := tx.Hash()
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			if _, confirmed := newChainTxs[id]; confirmed {
+				continue
+			}
+			candidates = append(candidates, tx)
+		}
+	}
+
+	// Phase 2: 多轮入池
+	remaining := candidates
+	for len(remaining) > 0 {
+		progress := false
+		nextRemaining := make([]*transaction.Transaction, 0)
+		for _, tx := range remaining {
+			id := tx.Hash()
+			if _, inPool := m.txs[id]; inPool {
+				// 已存在于 pool（前序轮次或 reorg 前遗留）
+				continue
+			}
+			fee, err := m.addLocked(newBase, tx, height, id)
+			if err != nil {
+				nextRemaining = append(nextRemaining, tx)
+				continue
+			}
+			m.txs[id] = tx
+			m.fees[id] = fee
+			m.order = append(m.order, id)
+			accepted++
+			progress = true
+		}
+		if !progress {
+			rejected += len(nextRemaining)
+			break
+		}
+		remaining = nextRemaining
+	}
+
+	return accepted, rejected
+}
+
+// addLocked 是 Add 的核心校验逻辑（无锁版本），供 ReaddDisconnected 内部复用。
+// 返回值：fee（成功）或 error（失败）。
+func (m *Mempool) addLocked(base *utxo.UTXOSet, tx *transaction.Transaction, height int, id [32]byte) (uint64, error) {
+	if tx.IsCoinbase() {
+		return 0, ErrCoinbaseIn
+	}
+	if m.maxSize > 0 && len(m.txs) >= m.maxSize {
+		return 0, ErrPoolFull
+	}
+	view := m.compositeViewLocked(base, height, id)
+	fee, err := utxo.ValidateTransaction(tx, view, height)
+	if err != nil {
+		if errors.Is(err, utxo.ErrUnknownUTXO) {
+			return 0, fmt.Errorf("%w: %v", ErrConflict, err)
+		}
+		return 0, fmt.Errorf("%w: %v", ErrInvalidTx, err)
+	}
+	return fee, nil
+}
+
+// compositeViewLocked 是 compositeView 的无锁版本，供已持有 m.mu 的调用方使用。
+func (m *Mempool) compositeViewLocked(base *utxo.UTXOSet, height int, skip [32]byte) *utxo.UTXOSet {
+	view := base.Clone()
+	for _, id := range m.order {
+		if id == skip {
+			continue
+		}
+		tx, ok := m.txs[id]
+		if !ok {
+			continue
+		}
+		if _, err := utxo.ValidateTransaction(tx, view, height); err != nil {
+			continue
+		}
+	}
+	return view
+}

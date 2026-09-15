@@ -62,6 +62,19 @@ type Blockchain struct {
 	// 测试可注入更小的高度以越过激活边界而无需真挖 2000 块。
 	// 该字段是共识真值的一部分，绝不在运行期变更。
 	activationHeight int
+
+	// lastReorgResult 记录最近一次 AddBlock 触发的 reorg 结果（REORG-1F）。
+	// 由 executeReorg 设置，由 AddBlock/AddBlockWithResult 的调用方读取。
+	// 非共识状态——mempool resurrection 使用，不影响 canonical tip 选择。
+	lastReorgResult *ReorgResult
+}
+
+// ReorgResult 记录一次链重组的完整信息，供上层（service/mempool）做 resurrection。
+type ReorgResult struct {
+	OldTip           *blocktree.BlockNode
+	NewTip           *blocktree.BlockNode
+	DisconnectBlocks []*block.Block
+	ConnectBlocks    []*block.Block
 }
 
 // reorgStore 是 storage.FileBlockStore 提供的最小 v2 接口子集，
@@ -86,14 +99,15 @@ func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 		return nil, fmt.Errorf("创世区块 UTXO 初始化失败: %w", err)
 	}
 	tree := blocktree.NewBlockTree()
-	_, err = tree.AddBlock(genesis.Header.Hash(), [32]byte{}, 0, genesis.Header.Bits, genesis.Header.Timestamp)
+	node, err := tree.AddBlock(genesis.Header.Hash(), [32]byte{}, 0, genesis.Header.Bits, genesis.Header.Timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("创世区块加入树索引失败: %w", err)
 	}
+	_ = tree.SetTip(node)
 	return &Blockchain{
-		blocks:          []*block.Block{genesis},
-		utxo:            genesisSet,
-		tree:            tree,
+		blocks:           []*block.Block{genesis},
+		utxo:             genesisSet,
+		tree:             tree,
 		activationHeight: pow.ActivationHeight,
 	}, nil
 }
@@ -365,7 +379,22 @@ func IsTemplateStale(err error) bool {
 // （同一个区块占据两个高度），下一次启动时回放会因 prev-hash 不匹配而拒绝加载，
 // 节点永久无法启动（P0 · GENESIS-0）。
 func (bc *Blockchain) AddBlock(b *block.Block) error {
+	bc.mu.Lock()
+	bc.lastReorgResult = nil
+	bc.mu.Unlock()
 	return bc.addBlock(b, true)
+}
+
+// AddBlockWithResult 与 AddBlock 相同，但额外返回 reorg 结果（如有）。
+// 若触发 reorg，返回的 *ReorgResult 包含断开/连接分支的区块信息。
+func (bc *Blockchain) AddBlockWithResult(b *block.Block) (*ReorgResult, error) {
+	if err := bc.AddBlock(b); err != nil {
+		return nil, err
+	}
+	bc.mu.RLock()
+	result := bc.lastReorgResult
+	bc.mu.RUnlock()
+	return result, nil
 }
 
 // applyBlock 回放一个已持久化的历史区块：完整执行与 AddBlock 相同的一致性校验，
@@ -394,6 +423,20 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 	}
 
 	// ── Case 2: Fork block（父在当前链但非链尾，或在另一条 branch 上）──
+	// 损坏防护：区块哈希若已存在于 canonical 链（bc.blocks），则这是重复持久化记录
+	//（旧 bug 的存储形态：同一区块被追加两次），必须显式拒绝，绝不能当作幂等
+	// re-delivery 静默吞掉——否则「含重复记录的损坏存储」会被加载成一条有效链。
+	//
+	// 判据必须**只**查 canonical 内存链（bc.blocks），绝不能用 blockAtHash：
+	// 后者在 bc.blocks 未命中时会回退 store.GetBlockByHash，而 v2 存储索引
+	//（s.v2.records）同时登记 detached（非 canonical）区块——SaveBlockDetached
+	// 经 registerBlock 写入。若在此处误用 blockAtHash，一枚已落盘的合法 fork
+	// 区块被再次投递时会被误判成「损坏重复记录」而拒绝，既破坏 re-delivery 的
+	// 幂等语义，也会让 OnBlocksResp 直接 return，导致 syncing 标志永久卡死。
+	if bc.canonicalContains(b.Header.Hash()) {
+		bh := b.Header.Hash()
+		return fmt.Errorf("%w: 区块 %x 已存在于 canonical 链（疑似重复持久化记录）", ErrInvalidPrevHash, bh[:4])
+	}
 	parentNode := bc.tree.LookupNode(parentHash)
 	if parentNode == nil {
 		// 父不存在：可能是 orphan（P2P 到达顺序问题），现阶段直接拒绝
@@ -434,6 +477,12 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 		return nil
 	}
 
+	// 触发 reorg 的块必须先持久化，否则 executeReorg 中 blockAtHash 找不到它。
+	if persist && bc.store != nil {
+		if v2s, ok := bc.store.(reorgStore); ok {
+			_ = v2s.SaveBlockDetached(b)
+		}
+	}
 	// 执行 reorg
 	return bc.executeReorg(node, persist)
 }
@@ -463,8 +512,16 @@ func (bc *Blockchain) extendChain(b *block.Block, persist bool) error {
 	}
 	bc.blocks = append(bc.blocks, b)
 	bc.utxo = newSet
-	// 同步更新 blocktree tip
-	if node := bc.tree.LookupNode(b.Header.Hash()); node != nil {
+	// 同步更新 blocktree：若节点尚不在树中则先加入，再设 tip。
+	// 1F 测试暴露：缺少 AddBlock 导致 BestTip 永久停留在 genesis，
+	// ShouldReorg 基于错误基准触发 premature reorg。
+	height := len(bc.blocks) - 1
+	node := bc.tree.LookupNode(b.Header.Hash())
+	if node == nil {
+		_, _ = bc.tree.AddBlock(b.Header.Hash(), b.Header.PrevBlockHash, height, b.Header.Bits, b.Header.Timestamp)
+		node = bc.tree.LookupNode(b.Header.Hash())
+	}
+	if node != nil {
 		_ = bc.tree.SetTip(node)
 	}
 	return nil
@@ -552,6 +609,10 @@ func (bc *Blockchain) utxoAtNode(node *blocktree.BlockNode) (*utxo.UTXOSet, erro
 }
 
 // blockAtHash 按哈希查找区块：先搜索内存中的 canonical 链，再回退到 storage。
+//
+// ⚠️ 调用方须知：本函数**不是** canonical 成员判据。storage 侧索引（v2 的
+// s.v2.records）同时登记 detached（非 canonical）区块，故「查得到」不等于
+// 「在 canonical 链上」。需要 canonical 判据时必须用 canonicalContains。
 func (bc *Blockchain) blockAtHash(hash [32]byte) (*block.Block, error) {
 	for _, b := range bc.blocks {
 		if b.Header.Hash() == hash {
@@ -562,6 +623,17 @@ func (bc *Blockchain) blockAtHash(hash [32]byte) (*block.Block, error) {
 		return bc.store.GetBlockByHash(hash)
 	}
 	return nil, storage.ErrNotFound
+}
+
+// canonicalContains 判定区块哈希是否已在 canonical 链（bc.blocks）上。
+// 只查内存 canonical 链，绝不回退 storage —— 见 blockAtHash 的调用方须知。
+func (bc *Blockchain) canonicalContains(hash [32]byte) bool {
+	for _, b := range bc.blocks {
+		if b.Header.Hash() == hash {
+			return true
+		}
+	}
+	return false
 }
 
 // executeReorg 执行完整的链重组：disconnect old → apply new → persist → update memory。
@@ -666,5 +738,25 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 	bc.blocks = newChain
 	bc.utxo = utxoSet
 	_ = bc.tree.SetTip(newTip)
+
+	// Build ReorgResult for service-layer mempool resurrection (REORG-1F).
+	var disconnectBlocks []*block.Block
+	for _, node := range disconnectPath {
+		if b, _ := bc.blockAtHash(node.Hash); b != nil {
+			disconnectBlocks = append(disconnectBlocks, b)
+		}
+	}
+	var connectBlocks []*block.Block
+	for _, node := range connectPath {
+		if b, _ := bc.blockAtHash(node.Hash); b != nil {
+			connectBlocks = append(connectBlocks, b)
+		}
+	}
+	bc.lastReorgResult = &ReorgResult{
+		OldTip:           oldTip,
+		NewTip:           newTip,
+		DisconnectBlocks: disconnectBlocks,
+		ConnectBlocks:    connectBlocks,
+	}
 	return nil
 }
