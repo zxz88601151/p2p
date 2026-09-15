@@ -16,3 +16,11 @@ coverage.out
 .idea/
 .vscode/
 .DS_Store
+
+# Runtime node data / secrets (GOV-1)
+# run-a/、run-b/ 下含明文 P-256 私钥 wallet.json，必须永不进入 Git
+/run-a/
+/run-b/
+*.dat
+*.lock
+wallet.json
