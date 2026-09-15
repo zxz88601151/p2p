@@ -615,7 +615,31 @@ func TestG08_DeleteBranch(t *testing.T) {
 	}
 }
 
-// TestG08_LegacyImmutableAndTruncateGuard legacy 区不可删、不可被 TIP 截断。
+// TestG08_LegacyImmutableAndTruncateGuard legacy 区不可删、legacy 字节不可改写；
+// canonical 归属（是否仍在该 TIP 的祖辈路径上）**可以**随 TIP 变化。
+//
+// ════════════════════════════════════════════════════════════════════════════
+// REORG-1J-G08-CONTRACT-EXCEPTION —— 受控 TEST CONTRACT UPDATE
+//
+// 旧的最后一条断言（「TruncateFromHeight(1) 必须返回 ErrTruncateOutOfRange」）
+// 把 **legacy canonical membership 永久不可变化** 写成了冻结契约。该行为已被
+// REORG-1J §1/§6/§7/§11 明确废止：canonical ownership 由 `TIP + hash linkage`
+// 决定，与记录的物理形态（legacy/v2）解耦；穿越 legacy prefix 的 reorg 必须
+// 被允许。
+//
+// 本次改写不变更 REORG 实现范围，只把「已废止的负向断言」替换为**更强的正向
+// acceptance test**。真正的安全性质 —— legacy storage immutability —— 全部保留
+// 并**加强**（新增逐字节比对 + 物理存在性 + detached 语义 + restart 一致性）。
+//
+// 必须继续保护的性质（逐条对应下方断言）：
+//  1. legacy block 不允许通过 DeleteBlock 删除；
+//  2. legacy bytes 不得被 rewrite（reorg 前后逐字节一致）；
+//  3. legacy 数据在 reorg 后仍然物理存在；
+//  4. canonical view 与 detached view 语义正确；
+//  5. reorg 后 active TIP 正确；
+//  6. 重新读取 legacy block 的内容与 reorg 前逐字节一致。
+//
+// ════════════════════════════════════════════════════════════════════════════
 func TestG08_LegacyImmutableAndTruncateGuard(t *testing.T) {
 	dir := t.TempDir()
 	blocks, undos := eChain(t, 3)
@@ -632,25 +656,85 @@ func TestG08_LegacyImmutableAndTruncateGuard(t *testing.T) {
 	}
 	// v2 追加高度 2
 	s := eMustOpenRW(t, dir)
+	defer s.Close()
 	if err := s.AppendCanonicalBlock(blocks[2], undos[2]); err != nil {
 		t.Fatal(err)
 	}
-	// legacy 区块不可删
+	// 性质 1：legacy 区块不可删（不变）
 	if err := s.DeleteBlock(blocks[0].Header.Hash()); !errors.Is(err, storage.ErrLegacyImmutable) {
 		t.Fatalf("legacy 区块删除未被拒绝: %v", err)
 	}
-	// 截断到 legacy 末尾（h=2 → 保留 0,1）允许
+	// 截断到 legacy 末尾（h=2 → 保留 0,1）允许（不变）
 	if err := s.TruncateFromHeight(2); err != nil {
 		t.Fatalf("截断到 legacy 末尾应允许: %v", err)
 	}
 	if h, _ := s.Height(); h != 1 {
 		t.Fatalf("高度 = %d, want 1", h)
 	}
-	// 再往 legacy 内部截断必须拒绝
-	if err := s.TruncateFromHeight(1); !errors.Is(err, storage.ErrTruncateOutOfRange) {
-		t.Fatalf("截入 legacy 前缀未被拒绝: %v", err)
+
+	// ── REORG-1J：穿越 legacy prefix 的 TIP 回退现在必须被允许 ──────────────
+	//
+	// 记录回退前状态与 legacy 物理字节，作为「不可变性」比对的基准。
+	sizeBefore := len(eRead(t, dir))
+	legacyBytesBefore := eRead(t, dir)
+	h1Hash := blocks[1].Header.Hash()
+	h1ContentBefore, err := s.GetBlockByHash(h1Hash)
+	if err != nil {
+		t.Fatalf("回退前读取 legacy h1 失败: %v", err)
 	}
-	defer s.Close()
+
+	// canonical TIP 回退到高度 0（h1 为 legacy 记录）—— 必须成功。
+	if err := s.TruncateFromHeight(1); err != nil {
+		t.Fatalf("REORG-1J：回退到 legacy 前缀内部应允许，实际被拒绝: %v", err)
+	}
+
+	// 性质 5：reorg 后 active TIP 正确（canonical tip = h0）。
+	if h, _ := s.Height(); h != 0 {
+		t.Fatalf("回退后高度 = %d, want 0", h)
+	}
+	tip, err := s.GetBlockByHeight(0)
+	if err != nil {
+		t.Fatalf("回退后读取高度 0 失败: %v", err)
+	}
+	if tip.Header.Hash() != blocks[0].Header.Hash() {
+		t.Fatalf("回退后 canonical tip 哈希不符：got %x want %x",
+			tip.Header.Hash(), blocks[0].Header.Hash())
+	}
+	if _, err := s.GetBlockByHeight(1); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("回退后高度 1 不应仍在 canonical 链上: %v", err)
+	}
+
+	// 性质 4：canonical / detached 语义正确 —— h1 不再是 canonical。
+	if ok, err := s.IsCanonical(h1Hash); err != nil || ok {
+		t.Fatalf("被旧链排除的 legacy h1 仍被标记 canonical (ok=%v err=%v)", ok, err)
+	}
+
+	// 性质 3：legacy 数据在 reorg 后仍然物理存在（未被删除）。
+	if !s.HasBlock(h1Hash) {
+		t.Fatal("REORG-1J 违反 I3/I4：被回退的 legacy 区块字节被删除")
+	}
+
+	// 性质 6：重新读取该 legacy block，内容与 reorg 前逐字节一致。
+	h1ContentAfter, err := s.GetBlockByHash(h1Hash)
+	if err != nil {
+		t.Fatalf("回退后按哈希取回 legacy h1 失败（detached 可用性被破坏）: %v", err)
+	}
+	if !bytes.Equal(h1ContentAfter.Encode(), h1ContentBefore.Encode()) {
+		t.Fatal("REORG-1J 违反 I8：legacy 区块内容在 reorg 后被改写")
+	}
+
+	// 性质 2：legacy bytes 不得被 rewrite —— 日志只允许**追加**（TIP 帧），
+	// 前缀部分必须与回退前逐字节一致。
+	after := eRead(t, dir)
+	if len(after) < sizeBefore {
+		t.Fatalf("日志被截短（%d < %d）：可能发生物理删除", len(after), sizeBefore)
+	}
+	if !bytes.Equal(after[:sizeBefore], legacyBytesBefore) {
+		t.Fatal("REORG-1J 违反 I8：回退后 legacy 前缀字节被改写（非纯追加）")
+	}
+	if len(after) <= sizeBefore {
+		t.Fatal("回退未追加任何字节：TIP 提交必须留下记录")
+	}
 }
 
 // ── G-09 API 层严格校验（SP-3 / SP-3b / 模式升级）────────────────────────

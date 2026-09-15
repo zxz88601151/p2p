@@ -30,11 +30,13 @@ import (
 type MessageType string
 
 const (
-	MsgHandshake  MessageType = "handshake"   // 握手：交换版本/高度/监听地址/已知节点
-	MsgNewBlock   MessageType = "new_block"   // 广播新区块（Payload = BlockPayload）
-	MsgNewTx      MessageType = "new_tx"      // 广播新交易（Payload = TxPayload）
-	MsgGetBlocks  MessageType = "get_blocks"  // 请求从某高度开始的区块（Payload = GetBlocksPayload）
-	MsgBlocksResp MessageType = "blocks_resp" // 区块请求响应（Payload = BlocksRespPayload）
+	MsgHandshake       MessageType = "handshake"          // 握手：交换版本/高度/工作量/链尾/监听地址/已知节点
+	MsgNewBlock        MessageType = "new_block"          // 广播新区块（Payload = BlockPayload）
+	MsgNewTx           MessageType = "new_tx"             // 广播新交易（Payload = TxPayload）
+	MsgGetBlocks       MessageType = "get_blocks"         // 请求从某高度开始的区块（Payload = GetBlocksPayload）
+	MsgBlocksResp      MessageType = "blocks_resp"        // 区块请求响应（Payload = BlocksRespPayload）
+	MsgGetBlockByHash  MessageType = "get_block_by_hash"  // 按哈希请求区块及其祖先（Payload = GetBlockByHashPayload）
+	MsgBlockByHashResp MessageType = "block_by_hash_resp" // 按哈希请求响应（Payload = BlockByHashRespPayload）
 )
 
 const (
@@ -42,6 +44,13 @@ const (
 	MaxMessageSize = 1 << 20
 	// MaxBlocksPerResp 单次同步响应最多携带的区块数。
 	MaxBlocksPerResp = 500
+	// MaxAncestorsPerResp 单次「按哈希取块」响应最多回溯的祖先数（REORG-1H）。
+	//
+	// 分支拉取必须**有界**：孤儿块不知道缺口有多深，若无上限，一个恶意/故障对端
+	// 可以诱导本节点在一条长链上无限回溯，把内存与带宽吃光。
+	// 64 个祖先足以覆盖「几分钟分区」级别的正常分叉；更深的缺口由请求方
+	// 分多轮补齐（每轮同样有上限与轮次上限）。
+	MaxAncestorsPerResp = 64
 	// handshakeTimeout 建立连接后必须在该时间内收到握手消息。
 	handshakeTimeout = 10 * time.Second
 	// readTimeout / writeTimeout 单次读写超时。
@@ -58,12 +67,20 @@ type Message struct {
 }
 
 // HandshakePayload 握手信息。
+//
+// REORG-1H 新增 ChainWork / TipHash 两个**可选**字段：
+//   - 两者都是「缺失即未知」语义（零值 = 对端未提供），旧版本节点发来的握手
+//     不含这两个字段，接收方自动退化为「按高度比较」的既有行为，协议向后兼容；
+//   - ChainWork 让同步判据从「谁更高」升级为「谁的工作量更大」（work-aware）；
+//   - TipHash 让本节点能发现「对端在一条我不认识的分支上」，从而按哈希拉分支。
 type HandshakePayload struct {
 	NodeID      string   `json:"node_id"`
 	ChainHeight int      `json:"chain_height"`
 	ListenAddr  string   `json:"listen_addr"`
 	GenesisHash string   `json:"genesis_hash"` // 用于快速识别网络不一致
 	KnownPeers  []string `json:"known_peers"`  // 节点发现：我方已知的其他节点
+	ChainWork   string   `json:"chain_work"`   // 链尾累积工作量（十进制字符串；空 = 未知）
+	TipHash     string   `json:"tip_hash"`     // 链尾区块哈希（十六进制；空 = 未知）
 }
 
 // BlockPayload 区块广播载荷（十六进制编码的规范区块字节）。
@@ -88,6 +105,27 @@ type BlocksRespPayload struct {
 	Done          bool     `json:"done"` // 是否已到请求方链尾
 }
 
+// GetBlockByHashPayload 按哈希请求一个区块及其祖先（REORG-1H）。
+//
+// 语义：请把哈希为 Hash 的区块给我，并沿其 PrevBlockHash 回溯最多 MaxAncestors 个祖先。
+// 接收方用于对缺父的孤儿块补齐缺口；MaxAncestors 由服务端按 MaxAncestorsPerResp 裁剪。
+type GetBlockByHashPayload struct {
+	Hash         string `json:"hash"`          // 请求的区块哈希（十六进制，64 字符）
+	MaxAncestors int    `json:"max_ancestors"` // 期望回溯的祖先数（服务端仍会裁剪）
+}
+
+// BlockByHashRespPayload 按哈希请求的响应（REORG-1H）。
+//
+// Blocks 的顺序固定为：**索引 0 = 被请求的区块，其后依次是父、祖父……（由新到旧）**。
+// 请求方从后往前应用即可天然满足「父先于子」的插入约束。
+// Hash 回显请求中的哈希，便于请求方在并发/多轮场景下定位在途请求。
+// Found=false 表示对端没有这个区块（响应体 Blocks 为空）。
+type BlockByHashRespPayload struct {
+	Hash   string   `json:"hash"`
+	Blocks []string `json:"blocks"`
+	Found  bool     `json:"found"`
+}
+
 // Handler 由上层（节点服务）实现，处理各类消息的业务语义。
 type Handler interface {
 	OnHandshake(peerAddr string, payload HandshakePayload)
@@ -95,6 +133,8 @@ type Handler interface {
 	OnNewTx(peerAddr string, raw json.RawMessage)
 	OnGetBlocks(peerAddr string, payload GetBlocksPayload)
 	OnBlocksResp(peerAddr string, payload BlocksRespPayload)
+	OnGetBlockByHash(peerAddr string, payload GetBlockByHashPayload)
+	OnBlockByHashResp(peerAddr string, payload BlockByHashRespPayload)
 }
 
 // Peer 一条已建立的连接及其状态。
@@ -116,6 +156,9 @@ type Node struct {
 	handler     Handler
 
 	heightFn func() int // 链高度提供者（由上层注入）
+	// statusFn 提供链尾工作量与链尾哈希（REORG-1H，work-aware 握手 + 分支发现）。
+	// 返回 (累积工作量十进制字符串, 链尾哈希十六进制字符串)；空串表示未知。
+	statusFn func() (work string, tipHash string)
 
 	mu       sync.RWMutex
 	peers    map[string]*Peer // 远端地址 → 连接
@@ -442,12 +485,15 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 
 // sendHandshake 发送本节点握手消息。
 func (n *Node) sendHandshake(p *Peer) {
+	work, tipHash := n.currentStatus()
 	payload := HandshakePayload{
 		NodeID:      n.nodeID,
 		ChainHeight: n.currentHeight(),
 		ListenAddr:  n.listenAddr,
 		GenesisHash: n.genesisHash,
 		KnownPeers:  n.KnownPeers(),
+		ChainWork:   work,
+		TipHash:     tipHash,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -475,6 +521,20 @@ func (n *Node) SetHeightProvider(f func() int) {
 	n.mu.Unlock()
 }
 
+// SetChainStatusProvider 注册「链尾工作量 + 链尾哈希」提供者（REORG-1H）。
+//
+// 这两个值让握手从「只比高度」升级为「比累积工作量 + 发现未知分支」：
+//   - work：十进制字符串（math/big.Int.String()），空串表示未知；
+//   - tipHash：十六进制字符串，空串表示未知。
+//
+// 提供者未注册或返回空串时，握手消息里对应字段为空，对端自动退化为按高度比较
+// ——这是与旧版本节点互通的兼容路径。
+func (n *Node) SetChainStatusProvider(f func() (work string, tipHash string)) {
+	n.mu.Lock()
+	n.statusFn = f
+	n.mu.Unlock()
+}
+
 // currentHeight 返回注入的链高度；未注入时返回 0。
 func (n *Node) currentHeight() int {
 	n.mu.RLock()
@@ -482,6 +542,17 @@ func (n *Node) currentHeight() int {
 	n.mu.RUnlock()
 	if f == nil {
 		return 0
+	}
+	return f()
+}
+
+// currentStatus 返回注入的链尾工作量与哈希；未注入时返回两个空串（= 未知）。
+func (n *Node) currentStatus() (work string, tipHash string) {
+	n.mu.RLock()
+	f := n.statusFn
+	n.mu.RUnlock()
+	if f == nil {
+		return "", ""
 	}
 	return f()
 }
@@ -519,6 +590,20 @@ func (n *Node) dispatch(peerAddr string, msg Message) {
 			return
 		}
 		n.handler.OnBlocksResp(peerAddr, payload)
+	case MsgGetBlockByHash:
+		var payload GetBlockByHashPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[p2p] 解析 GetBlockByHash 失败: %v", err)
+			return
+		}
+		n.handler.OnGetBlockByHash(peerAddr, payload)
+	case MsgBlockByHashResp:
+		var payload BlockByHashRespPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[p2p] 解析 BlockByHashResp 失败: %v", err)
+			return
+		}
+		n.handler.OnBlockByHashResp(peerAddr, payload)
 	default:
 		log.Printf("[p2p] 未知消息类型 %s（来自 %s），忽略", msg.Type, peerAddr)
 	}

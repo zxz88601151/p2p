@@ -18,6 +18,28 @@ type recordHandler struct {
 	txs        []string
 	getBlocks  []p2p.GetBlocksPayload
 	blockResps []p2p.BlocksRespPayload
+	// REORG-1H：by-hash 分支拉取消息
+	getByHash  []p2p.GetBlockByHashPayload
+	byHashResp []p2p.BlockByHashRespPayload
+}
+
+func (h *recordHandler) OnGetBlockByHash(_ string, payload p2p.GetBlockByHashPayload) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.getByHash = append(h.getByHash, payload)
+}
+
+func (h *recordHandler) OnBlockByHashResp(_ string, payload p2p.BlockByHashRespPayload) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.byHashResp = append(h.byHashResp, payload)
+}
+
+// byHashCounts 返回 by-hash 请求/响应的累计计数（供分支拉取相关断言使用）。
+func (h *recordHandler) byHashCounts() (int, int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.getByHash), len(h.byHashResp)
 }
 
 func (h *recordHandler) OnHandshake(_ string, payload p2p.HandshakePayload) {
@@ -271,4 +293,101 @@ func containsAddr(addrs []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// TestGetBlockByHashTravelsOverTCP 验证 REORG-1H 新增的两个消息类型
+//（MsgGetBlockByHash / MsgBlockByHashResp）真的能在真实 TCP 连接上完成往返，
+// 且握手能携带 chain_work / tip_hash（work-aware 同步的前提）。
+func TestGetBlockByHashTravelsOverTCP(t *testing.T) {
+	h1 := &recordHandler{}
+	h2 := &recordHandler{}
+	n1, addr1 := startTestNode(t, h1)
+	defer n1.Stop()
+	n2, _ := startTestNode(t, h2)
+	defer n2.Stop()
+
+	n1.SetHeightProvider(func() int { return 5 })
+	n1.SetChainStatusProvider(func() (string, string) { return "12345", "aabb" })
+
+	if err := n2.ConnectToPeer(addr1); err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	waitFor(t, func() bool { return n1.PeerCount() == 1 && n2.PeerCount() == 1 },
+		5*time.Second, "两节点未互联")
+
+	req, err := json.Marshal(p2p.GetBlockByHashPayload{Hash: "deadbeef", MaxAncestors: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2.Broadcast(p2p.Message{Type: p2p.MsgGetBlockByHash, Payload: req})
+
+	resp, err := json.Marshal(p2p.BlockByHashRespPayload{Hash: "deadbeef", Found: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n1.Broadcast(p2p.Message{Type: p2p.MsgBlockByHashResp, Payload: resp})
+
+	waitFor(t, func() bool {
+		reqN, _ := h1.byHashCounts()
+		return reqN >= 1
+	}, 5*time.Second, "n1 未收到 by-hash 请求")
+	waitFor(t, func() bool {
+		_, respN := h2.byHashCounts()
+		return respN >= 1
+	}, 5*time.Second, "n2 未收到 by-hash 响应")
+
+	// 请求/响应内容必须无损
+	h1.mu.Lock()
+	gotReq := h1.getByHash[0]
+	h1.mu.Unlock()
+	if gotReq.Hash != "deadbeef" || gotReq.MaxAncestors != 8 {
+		t.Fatalf("by-hash 请求内容不符: %+v", gotReq)
+	}
+	h2.mu.Lock()
+	gotResp := h2.byHashResp[0]
+	h2.mu.Unlock()
+	if gotResp.Hash != "deadbeef" || gotResp.Found {
+		t.Fatalf("by-hash 响应内容不符: %+v", gotResp)
+	}
+
+	// 握手必须携带工作量与链尾哈希（work-aware + 分支发现）
+	waitFor(t, func() bool {
+		h2.mu.Lock()
+		defer h2.mu.Unlock()
+		return len(h2.handshakes) > 0
+	}, 5*time.Second, "n2 未收到握手")
+	h2.mu.Lock()
+	hs := h2.handshakes[0]
+	h2.mu.Unlock()
+	if hs.ChainWork != "12345" || hs.TipHash != "aabb" {
+		t.Fatalf("握手未携带 chain_work/tip_hash: work=%q tip=%q", hs.ChainWork, hs.TipHash)
+	}
+}
+
+// TestHandshakeOmitsChainStatusWhenUnset 未注册 status provider 时，
+// 握手中的 chain_work / tip_hash 必须为空字符串（= 未知），
+// 以保证与旧版本节点的协议向后兼容（对端退化为按高度比较）。
+func TestHandshakeOmitsChainStatusWhenUnset(t *testing.T) {
+	h1 := &recordHandler{}
+	h2 := &recordHandler{}
+	n1, addr1 := startTestNode(t, h1)
+	defer n1.Stop()
+	n2, _ := startTestNode(t, h2)
+	defer n2.Stop()
+
+	if err := n2.ConnectToPeer(addr1); err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	waitFor(t, func() bool {
+		h2.mu.Lock()
+		defer h2.mu.Unlock()
+		return len(h2.handshakes) > 0
+	}, 5*time.Second, "n2 未收到握手")
+
+	h2.mu.Lock()
+	hs := h2.handshakes[0]
+	h2.mu.Unlock()
+	if hs.ChainWork != "" || hs.TipHash != "" {
+		t.Fatalf("未注册 provider 时握手字段应为空: work=%q tip=%q", hs.ChainWork, hs.TipHash)
+	}
 }

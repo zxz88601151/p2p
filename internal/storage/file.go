@@ -189,12 +189,14 @@ func (s *FileBlockStore) GetBlockByHeight(height int) (*block.Block, error) {
 
 // Height 返回当前 canonical 链尾高度；空库返回 -1。
 //
-// 纯 legacy 文件下等同于「记录数 - 1」（与 REORG-1E 之前一致）；
-// v2 模式下等于 TIP 提交的 canonical 高度。
+// REORG-1J（GAP-1I-A 修复）：高度**只**由 canonical 视图（byHeight）决定，
+// **不再**依赖 v2Mode / tipHeight 是否已被 TIP 推进。理由：canonical 视图是
+// 「TIP + 哈希链」的派生结果，物理存储模式（legacy/v2）与它无关。
+// 若 store 已有 canonical 链（无论 legacy 还是 v2 记录），则 Height() 必须描述它。
 func (s *FileBlockStore) Height() (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.v2.v2Mode {
+	if s.v2.hasTip {
 		return s.v2.tipHeight, nil
 	}
 	return len(s.byHeight) - 1, nil

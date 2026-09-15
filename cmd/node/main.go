@@ -135,6 +135,20 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	p2pNode := p2p.NewNode(cfg.ListenAddr, nodeWallet.Address(), genesis.Header.HashHex(), svc)
 	svc.net = p2pNode
 	p2pNode.SetHeightProvider(func() int { return chain.Height() })
+	// REORG-1H：握手携带链尾累积工作量与链尾哈希，让对端能按「工作量」而非
+	// 「高度」判断是否追赶，并发现彼此处于不同分支（work-aware 同步 + 分支发现）。
+	p2pNode.SetChainStatusProvider(func() (string, string) {
+		w := chain.BestTipWork()
+		work := ""
+		if w != nil {
+			work = w.String()
+		}
+		tipHash := ""
+		if tip, err := chain.Tip(); err == nil {
+			tipHash = tip.Header.HashHex()
+		}
+		return work, tipHash
+	})
 
 	// PHASE TEST-INFRASTRUCTURE-REMEDIATION-1：同步完成 P2P 端口绑定。
 	// Start 返回即 listener 已就绪（ListenAddr 就绪契约），消除

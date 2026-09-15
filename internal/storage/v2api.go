@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"sort"
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/utxo"
@@ -135,6 +137,15 @@ func (s *FileBlockStore) readFramePayloadAt(offset int64, wantType byte, wantHas
 //
 // 键值为「detached branch 必须能跨重启存活」（I3）：区块字节永久保留在日志中，
 // 是否 canonical 完全由 TIP 决定。
+//
+// REORG-1J（GAP-1I-A 修复）：本函数只写 BLOCK 帧，**绝不触碰 canonical 视图**。
+//   - 不重置 byHeight / byHash（它们仍描述旧 canonical chain）；
+//   - 不修改 tipHash / tipHeight / chainwork；
+//   - 不把 v2Mode 当作 canonical 权威（v2Mode 仅描述物理存储模式）；
+//   - 新区块只登记进 records（哈希索引）并标记为非 canonical。
+//
+// 因此写入后 Height() / TipHash() / BlockByHeight() / Chainwork() 仍继续描述
+// 旧 canonical chain —— 这与「detached write != canonical commit」完全一致。
 func (s *FileBlockStore) SaveBlockDetached(b *block.Block) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,7 +163,11 @@ func (s *FileBlockStore) SaveBlockDetached(b *block.Block) error {
 		return err
 	}
 	s.v2.v2Mode = true
-	s.registerBlock(b, h, cum, offs[0])
+	rec := s.registerBlock(b, h, cum, offs[0])
+	rec.canonical = false
+	// 显式强化 I9：detached 写入不改变任何 canonical 标量。
+	// 若此 store 尚无 canonical 视图（全新空库），保持 viewValid=false，
+	// 由后续 CommitTip/rebuildCanonicalView 建立（不得在此处隐式建立）。
 	return nil
 }
 
@@ -360,10 +375,22 @@ func (s *FileBlockStore) CommitReorg(
 	}
 
 	// Phase 2: build frames (pure computation)
+	//
+	// REORG-1J（GAP-1I-B 修复）：detachedUndos 是 map，迭代序不确定。
+	// 为保证「帧写入顺序」与「offset 记账顺序」严格一一对应（且确定性），
+	// 先按哈希字典序把 detachedUndos 展平为有序切片，再用同一序列构建帧与记账。
+	detachedOrder := make([][32]byte, 0, len(detachedUndos))
+	for hash := range detachedUndos {
+		detachedOrder = append(detachedOrder, hash)
+	}
+	sort.Slice(detachedOrder, func(i, j int) bool {
+		return bytes.Compare(detachedOrder[i][:], detachedOrder[j][:]) < 0
+	})
+
 	var frames [][]byte
-	for hash, undo := range detachedUndos {
+	for _, hash := range detachedOrder {
 		rec := s.v2.records[hash]
-		ub, _ := utxo.EncodeUndo(undo)
+		ub, _ := utxo.EncodeUndo(detachedUndos[hash])
 		frames = append(frames, encodeFrame(recTypeUndo, uint32(rec.height), hash, ub))
 	}
 	for _, p := range pending {
@@ -381,7 +408,15 @@ func (s *FileBlockStore) CommitReorg(
 	}
 
 	// Phase 4: update in-memory state (guaranteed to match disk now)
-	offIdx := len(detachedUndos)
+	offIdx := 0
+	for _, hash := range detachedOrder {
+		// REORG-1J（GAP-1I-B 修复）：必须记账**真实**写入偏移（offs[offIdx]），
+		// 不得使用常量 0 —— 否则 UndoFor 会从文件偏移 0 读取（legacy 记录头），
+		// 必然类型/哈希不匹配而失败。
+		rec := s.v2.records[hash]
+		s.v2.undoIndex[hash] = undoRecord{blockHash: hash, height: uint32(rec.height), offset: offs[offIdx]}
+		offIdx++
+	}
 	for _, p := range pending {
 		undoOff := offs[offIdx]
 		offIdx++
@@ -389,11 +424,6 @@ func (s *FileBlockStore) CommitReorg(
 		offIdx++
 		s.registerBlock(p.block, p.height, p.cum, blockOff)
 		s.v2.undoIndex[p.hash] = undoRecord{blockHash: p.hash, height: uint32(p.height), offset: undoOff}
-	}
-	for hash, undo := range detachedUndos {
-		h := s.v2.records[hash].height
-		_ = undo
-		s.v2.undoIndex[hash] = undoRecord{blockHash: hash, height: uint32(h), offset: 0}
 	}
 	tipOff := offs[len(offs)-1]
 	return s.commitTipAfterAppend(tipRec, tipOff)
@@ -554,10 +584,9 @@ func (s *FileBlockStore) TruncateFromHeight(h int) error {
 	if h < 1 || h > top {
 		return fmt.Errorf("%w: h=%d, canonical tip=%d（须 1 ≤ h ≤ tip）", ErrTruncateOutOfRange, h, top)
 	}
-	// 不得截入 legacy 不可变前缀
-	if s.v2.legacyLen > 0 && h < s.v2.legacyLen {
-		return fmt.Errorf("%w: h=%d 会截入 legacy 前缀（末尾高度 %d）", ErrTruncateOutOfRange, h, s.v2.legacyLen-1)
-	}
+	// REORG-1J（GAP-1I-C）：不再以 legacyLen 为截断下限。
+	// canonical 归属由 TIP + 哈希链决定，故允许回退到 legacy 前缀内部的高度。
+	// legacy 字节仍不可变（本函数只追加 TIP，不删/改任何字节）。
 	// 1) 构建并完整验证待删除集合
 	for i := h; i <= top; i++ {
 		hash := s.byHeight[i].Header.Hash()

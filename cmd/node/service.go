@@ -12,9 +12,12 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
+	"math/big"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/blockchain"
@@ -31,6 +34,33 @@ const MaxSyncBatch = 200
 // 与区块体积上限共同约束候选区块规模，避免产出被共识拒绝的超大区块。
 const MaxBlockTxs = 500
 
+// ---- REORG-1H：P2P 分支投递（by-hash 拉取桥接）的常量与边界 ----
+//
+// 目标（本阶段范围内）：让「合法但非 canonical 链尾后继」的区块能被网络送达
+// 并进入 blocktree/reorg 流水线。孤儿块缺父时，按哈希把缺口补齐。
+//
+// 明确**不做**（属 REORG-1G/B5 的完整 orphan pool，本阶段只做桥接）：
+//   - 不持久化孤儿（进程重启即丢弃）；
+//   - 不做无限深度追溯（有轮次上限）；
+//   - 不做孤儿块的定时重播/评分/封禁。
+const (
+	// MaxBranchAncestors 单次 by-hash 请求期望回溯的祖先数（服务端仍会按
+	// p2p.MaxAncestorsPerResp 再裁剪一次，双端都是有界的）。
+	MaxBranchAncestors = 64
+	// maxInflightBranch 在途 by-hash 请求上限：防止一次大规模分叉瞬间打出
+	// 成千上万条请求（请求风暴）。
+	maxInflightBranch = 64
+	// maxWaitingBlocks 等待父块的孤儿区块上限（纯内存）。
+	maxWaitingBlocks = 256
+	// maxBranchRounds 同一条孤儿链允许的「继续回溯」轮次上限。
+	//
+	// 为什么必须有限：若对端持续返回一段我们挂不上的链（例如彼此创世不同），
+	// 没有轮次上限就会形成「请求 → 响应 → 再请求」的无限循环。
+	maxBranchRounds = 8
+	// branchReqTTL 在途请求去重窗口：窗口内同一哈希绝不重复请求（幂等 + 防抖）。
+	branchReqTTL = 30 * time.Second
+)
+
 // nodeService 实现 p2p.Handler。
 type nodeService struct {
 	chain *blockchain.Blockchain
@@ -43,6 +73,23 @@ type nodeService struct {
 	pending int
 	// syncing 表示当前正在追赶（本地落后于对端），用于抑制重复触发。
 	syncing bool
+
+	// ---- REORG-1H：分支拉取运行时状态（全部由 mu 保护，纯内存，绝不持久化）----
+	//
+	// 不持久化的理由：孤儿是「到达顺序」问题，重启后本节点会重新走握手 +
+	// 批量同步 + 分支拉取，状态可完全重建；把它落盘只会引入又一份需要在
+	// 崩溃恢复中证明正确性的状态（完整 orphan pool 属 REORG-1G/B5）。
+	inflight map[[32]byte]time.Time      // 已发出、尚未回来的 by-hash 请求
+	waiting  map[[32]byte][]*block.Block // 缺父哈希 → 等待该父块的孤儿区块
+	rounds   map[[32]byte]int            // 按哈希请求 → 已回溯轮次（有界追溯）
+	// syncResume 记录「批量同步因缺父转入分支拉取」时的对端地址；
+	// 分支补齐后由 resumeSync 恢复下一批 GetBlocks，避免 syncing 永久卡死。
+	syncResume string
+
+	// ---- 观测计数器（诊断与测试证据，不参与共识）----
+	branchReqSent  atomic.Int64 // 已发出的 by-hash 请求数
+	branchRespRecv atomic.Int64 // 收到的 by-hash 响应数
+	branchApplied  atomic.Int64 // 经分支拉取成功上链的区块数
 	// tipChanged 为容量 1 的信号通道：链尾变化时通知挖矿循环放弃当前候选区块。
 	// 用缓冲通道 + 非阻塞发送实现「合并多次通知为一次唤醒」。
 	tipChanged chan struct{}
@@ -92,6 +139,9 @@ func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *
 		pool:       pool,
 		miner:      miner,
 		tipChanged: make(chan struct{}, 1),
+		inflight:   make(map[[32]byte]time.Time),
+		waiting:    make(map[[32]byte][]*block.Block),
+		rounds:     make(map[[32]byte]int),
 	}
 	// atomic.Value 必须先 Store 再 Load，否则 Load 返回 nil 接口导致类型断言 panic。
 	s.mineState.Store(miningState(MiningStopped))
@@ -117,18 +167,97 @@ func drainTipChanged(s *nodeService) {
 
 // ---- p2p.Handler 实现 ----
 
-// OnHandshake 对方握手：若对方链更高，则请求缺失区块追赶。
+// OnHandshake 对方握手：按「工作量优先、高度兜底」决定是否追赶，
+// 并在发现对端处于未知分支时按哈希拉取其链尾（REORG-1H M4）。
+//
+// 修复前：只要 `PrevBlockHash != 当前链尾` 的区块就被就地丢弃（service.go:154），
+// 真实分叉块永远进不了 blocktree —— 跨节点 reorg 在物理上不可能发生。
 func (s *nodeService) OnHandshake(peerAddr string, payload p2p.HandshakePayload) {
 	localHeight := s.chain.Height()
-	log.Printf("[node] 握手完成: 对端=%s 对端高度=%d 本地高度=%d", peerAddr, payload.ChainHeight, localHeight)
+	localWork := s.chain.BestTipWork()
+	log.Printf("[node] 握手完成: 对端=%s 对端高度=%d 本地高度=%d 对端工作量=%q 对端链尾=%s",
+		peerAddr, payload.ChainHeight, localHeight, payload.ChainWork, shortHash(payload.TipHash))
 
-	if payload.ChainHeight <= localHeight {
-		return
+	// (1) 追赶：工作量更大（或工作量未知时高度更高）才值得拉批次。
+	if shouldSyncFrom(payload.ChainWork, payload.ChainHeight, localWork, localHeight) {
+		s.requestSync(peerAddr, localHeight+1)
 	}
-	s.requestSync(peerAddr, localHeight+1)
+
+	// (2) 分支发现：对端链尾我没见过，且它的工作量不低于我 → 它可能在我
+	//     不知道的分支上（或领先我）。按哈希把它的链尾拉过来，交由共识层
+	//     做 fork-choice；缺父则由 by-hash 分支补齐。
+	if tip, ok := parseHash32(payload.TipHash); ok && !s.chain.HasBlockHash(tip) &&
+		workAtLeast(payload.ChainWork, payload.ChainHeight, localWork, localHeight) {
+		s.requestBranch(peerAddr, tip)
+	}
 }
 
-// OnNewBlock 收到区块广播：校验并追加，成功则清理交易池、继续中继。
+// shouldSyncFrom 判断是否应向对端发起批量追赶。
+//
+// 判据优先级：
+//  1. 双方工作量都已知 → **只比工作量**（work-aware）。
+//     这是 M4 的实质：难度浮动后「更高」不再等于「更重」，只看高度会被
+//     一条低难度长链牵走。
+//  2. 任一方工作量未知（旧版本节点不填 chain_work）→ 退化为比高度，
+//     行为与 REORG-1H 之前完全一致（向后兼容）。
+func shouldSyncFrom(peerWork string, peerHeight int, localWork *big.Int, localHeight int) bool {
+	peer, ok := parseWork(peerWork)
+	if !ok || localWork == nil {
+		return peerHeight > localHeight
+	}
+	return peer.Cmp(localWork) > 0
+}
+
+// workAtLeast 判断对端工作量是否**不低于**本节点（用于「要不要拉对端分支」）。
+// 工作量未知时退化为「对端高度不低于本地高度」。
+func workAtLeast(peerWork string, peerHeight int, localWork *big.Int, localHeight int) bool {
+	peer, ok := parseWork(peerWork)
+	if !ok || localWork == nil {
+		return peerHeight >= localHeight
+	}
+	return peer.Cmp(localWork) >= 0
+}
+
+// parseWork 解析十进制工作量字符串；空串/非法值返回 false（= 未知）。
+func parseWork(s string) (*big.Int, bool) {
+	if s == "" {
+		return nil, false
+	}
+	w, ok := new(big.Int).SetString(s, 10)
+	if !ok || w.Sign() < 0 {
+		return nil, false
+	}
+	return w, true
+}
+
+// parseHash32 解析 32 字节十六进制哈希；空串/长度不符返回 false。
+func parseHash32(s string) ([32]byte, bool) {
+	var h [32]byte
+	if s == "" {
+		return h, false
+	}
+	raw, err := hex.DecodeString(s)
+	if err != nil || len(raw) != 32 {
+		return h, false
+	}
+	copy(h[:], raw)
+	return h, true
+}
+
+// shortHash 把十六进制哈希截断为前 8 字符，仅供日志（避免刷屏）。
+func shortHash(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
+}
+
+// OnNewBlock 收到区块广播：分叉块不再被就地丢弃（REORG-1H M1）。
+//
+// 三种结局：
+//   - 已在 canonical 链上 → 静默幂等（重复广播）；
+//   - 父已知（延长链 / 分叉 / 触发 reorg）→ 交给共识层，成功后中继；
+//   - 父未知（orphan）→ 登记等待并按哈希把缺口补齐。
 func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 	var payload p2p.BlockPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -146,24 +275,18 @@ func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 		return
 	}
 
-	tip, err := s.chain.Tip()
-	if err != nil {
-		log.Printf("[node] 读取链尾失败: %v", err)
-		return
-	}
-	if b.Header.PrevBlockHash != tip.Header.Hash() {
-		// 重复广播（其父块已不是链尾）或分叉区块。单链实现不处理 reorg，
-		// 分叉场景已在 blockchain 包文档中列为后续工作项。
-		log.Printf("[node] 忽略区块 %s（父块不是当前链尾，可能为重复广播或分叉）", b.Header.HashHex())
-		return
-	}
-
-	if err := s.addBlockAndUpdatePool(b); err != nil {
+	applied, orphan, err := s.ingestBlock(peerAddr, b)
+	switch {
+	case err != nil:
 		log.Printf("[node] 区块拒绝（来自 %s）: %v", peerAddr, err)
 		return
+	case orphan:
+		log.Printf("[node] 区块 %s 父块 %s 未知，已发起 by-hash 分支拉取",
+			b.Header.HashHex(), shortHash(hex.EncodeToString(b.Header.PrevBlockHash[:])))
+		return
+	case applied:
+		s.relayBlock(b, peerAddr)
 	}
-	// 继续中继给其它对等节点（except 来源方向，避免回环风暴）
-	s.relayBlock(b, peerAddr)
 }
 
 // OnNewTx 收到交易广播：校验后入池，成功则继续中继。
@@ -218,36 +341,315 @@ func (s *nodeService) OnGetBlocks(peerAddr string, payload p2p.GetBlocksPayload)
 }
 
 // OnBlocksResp 处理同步响应：按序校验并追加区块，未到链尾则继续请求下一批。
+//
+// REORG-1H：批量同步里同样可能出现「缺父」的区块（对端在我们不知道的分支上）。
+// 修复前这里遇到任何 AddBlock 失败就 `return`，既不复位 syncing/pending
+// （标志永久卡死，节点再也不会发起同步），也不会去补齐缺口。
+// 现在改为：非法块 → 终止本批并复位；缺父块 → 登记为孤儿并触发 by-hash 拉取，
+// 等分支补齐后由 resumeSync 继续拉下一批。
 func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayload) {
-	applied := 0
+	applied, deferred := 0, 0
 	for _, enc := range payload.EncodedBlocks {
 		rawBytes, err := hex.DecodeString(enc)
 		if err != nil {
 			log.Printf("[node] 同步区块编码非法: %v", err)
+			s.endSync("")
 			return
 		}
 		b, err := block.DecodeBlock(rawBytes)
 		if err != nil {
 			log.Printf("[node] 同步区块解码失败: %v", err)
+			s.endSync("")
 			return
 		}
-		if err := s.addBlockAndUpdatePool(b); err != nil {
+		ok, orphan, err := s.ingestBlock(peerAddr, b)
+		if err != nil {
 			log.Printf("[node] 同步区块拒绝: %v", err)
+			s.endSync("")
 			return
 		}
-		applied++
+		switch {
+		case orphan:
+			deferred++
+		case ok:
+			applied++
+		}
 	}
-	log.Printf("[node] 同步进度: 应用 %d 个区块，本地高度=%d，对方已到链尾=%v",
-		applied, s.chain.Height(), payload.Done)
+	log.Printf("[node] 同步进度: 应用 %d 个区块，缺父待补 %d 个，本地高度=%d，对方已到链尾=%v",
+		applied, deferred, s.chain.Height(), payload.Done)
 
-	if payload.Done || applied == 0 {
-		s.mu.Lock()
+	s.mu.Lock()
+	s.pending = 0
+	resume := ""
+	switch {
+	case deferred > 0:
+		// 转入分支拉取：批量请求让位，分支补齐后由 resumeSync 续拉。
+		s.syncing = true
+		s.syncResume = peerAddr
+	case payload.Done || applied == 0:
 		s.syncing = false
-		s.pending = 0
+		s.syncResume = ""
+	default:
+		s.syncing = true
+		resume = peerAddr
+	}
+	s.mu.Unlock()
+
+	if resume != "" {
+		s.requestSync(resume, s.chain.Height()+1)
+	}
+}
+
+// endSync 复位批量同步状态（正常结束或异常终止），并清空待恢复目标。
+func (s *nodeService) endSync(resume string) {
+	s.mu.Lock()
+	s.syncing = false
+	s.pending = 0
+	s.syncResume = resume
+	s.mu.Unlock()
+}
+
+// resumeSync 在分支补齐后恢复被打断的批量同步。
+// 没有待恢复目标（syncResume 为空）时是空操作，绝不主动发起新同步。
+func (s *nodeService) resumeSync() {
+	s.mu.Lock()
+	target := s.syncResume
+	s.syncing = false
+	s.pending = 0
+	s.syncResume = ""
+	s.mu.Unlock()
+	if target == "" {
+		return
+	}
+	s.requestSync(target, s.chain.Height()+1)
+}
+
+// ---- REORG-1H：分叉投递 / 分支拉取 ----
+
+// ingestBlock 把一个来自网络的区块送入共识层，并给出可操作的分类结果。
+//
+// 返回：
+//   - applied=true ：共识层接受（延长了链、作为分叉块入树、或触发了 reorg）。
+//     注意「入树但未 reorg」也算 applied —— 它已是合法候选，占住了分支。
+//   - orphan=true  ：父区块未知，已登记等待并触发 by-hash 分支拉取。
+//   - err != nil   ：被共识拒绝（非法区块），调用方只应记录日志，不得中继。
+func (s *nodeService) ingestBlock(peerAddr string, b *block.Block) (applied bool, orphan bool, err error) {
+	hash := b.Header.Hash()
+	// 已在 canonical 链上：重复投递，静默幂等（既不报错也不重复应用）。
+	if s.chain.IsCanonicalHash(hash) {
+		return false, false, nil
+	}
+	if err := s.addBlockAndUpdatePool(b); err != nil {
+		if errors.Is(err, blockchain.ErrOrphanParent) {
+			s.deferOrphan(peerAddr, b)
+			return false, true, nil
+		}
+		return false, false, err
+	}
+	s.clearInflight(hash)
+	return true, false, nil
+}
+
+// deferOrphan 登记一个缺父的孤儿区块，并向来源对端请求它缺的父块。
+func (s *nodeService) deferOrphan(peerAddr string, b *block.Block) {
+	parent := b.Header.PrevBlockHash
+
+	s.mu.Lock()
+	existing := len(s.waiting[parent])
+	if existing == 0 && len(s.waiting) >= maxWaitingBlocks {
+		s.mu.Unlock()
+		log.Printf("[node] 等待父块的孤儿区块已达上限 %d，丢弃 %s", maxWaitingBlocks, b.Header.HashHex())
+		return
+	}
+	s.waiting[parent] = append(s.waiting[parent], b)
+	s.mu.Unlock()
+
+	s.requestBranch(peerAddr, parent)
+}
+
+// requestBranch 按哈希向指定对端请求一个区块及其祖先（分支补齐）。
+//
+// 防风暴三重约束：
+//  1. 在途请求数上限 maxInflightBranch；
+//  2. 同一哈希在 branchReqTTL 窗口内**绝不重复请求**（去重，杜绝请求循环）；
+//  3. 单次回溯深度上限 MaxBranchAncestors（服务端再按 MaxAncestorsPerResp 裁剪）。
+func (s *nodeService) requestBranch(peerAddr string, hash [32]byte) {
+	s.mu.Lock()
+	if len(s.inflight) >= maxInflightBranch {
 		s.mu.Unlock()
 		return
 	}
-	s.requestSync(peerAddr, s.chain.Height()+1)
+	if t, ok := s.inflight[hash]; ok && time.Since(t) < branchReqTTL {
+		s.mu.Unlock()
+		return // 已在途：幂等，不再发一次
+	}
+	s.inflight[hash] = time.Now()
+	s.mu.Unlock()
+
+	payload, err := json.Marshal(p2p.GetBlockByHashPayload{
+		Hash:         hex.EncodeToString(hash[:]),
+		MaxAncestors: MaxBranchAncestors,
+	})
+	if err != nil {
+		log.Printf("[node] 构造 by-hash 请求失败: %v", err)
+		return
+	}
+	if err := s.net.SendTo(peerAddr, p2p.Message{Type: p2p.MsgGetBlockByHash, Payload: payload}); err != nil {
+		log.Printf("[node] 发送 by-hash 请求给 %s 失败: %v", peerAddr, err)
+		s.clearInflight(hash)
+		return
+	}
+	s.branchReqSent.Add(1)
+	log.Printf("[node] 已向 %s 请求分支区块 %s（最多回溯 %d 个祖先）",
+		peerAddr, shortHash(hex.EncodeToString(hash[:])), MaxBranchAncestors)
+}
+
+// OnGetBlockByHash 响应 by-hash 分支请求：返回该区块及其祖先（M2 服务端）。
+//
+// 只提供**本节点已知**的区块（canonical + 已落盘的 detached 分叉块）。
+// 不认识的哈希返回 Found=false，不猜测、不伪造（禁止 Fake Implementation）。
+func (s *nodeService) OnGetBlockByHash(peerAddr string, payload p2p.GetBlockByHashPayload) {
+	hash, ok := parseHash32(payload.Hash)
+	if !ok {
+		log.Printf("[node] by-hash 请求哈希非法（来自 %s）: %q", peerAddr, payload.Hash)
+		return
+	}
+	n := payload.MaxAncestors
+	if n <= 0 || n > p2p.MaxAncestorsPerResp {
+		n = p2p.MaxAncestorsPerResp
+	}
+	chain := s.chain.BlockByHashWithAncestors(hash, n)
+
+	encoded := make([]string, 0, len(chain))
+	for _, b := range chain {
+		encoded = append(encoded, hex.EncodeToString(b.Encode()))
+	}
+	respPayload, err := json.Marshal(p2p.BlockByHashRespPayload{
+		Hash:   hex.EncodeToString(hash[:]),
+		Blocks: encoded,
+		Found:  len(encoded) > 0,
+	})
+	if err != nil {
+		log.Printf("[node] 构造 by-hash 响应失败: %v", err)
+		return
+	}
+	if err := s.net.SendTo(peerAddr, p2p.Message{Type: p2p.MsgBlockByHashResp, Payload: respPayload}); err != nil {
+		log.Printf("[node] 发送 by-hash 响应给 %s 失败: %v", peerAddr, err)
+		return
+	}
+	log.Printf("[node] 已响应 by-hash: 对端=%s 请求=%s 返回=%d 个区块",
+		peerAddr, shortHash(hex.EncodeToString(hash[:])), len(encoded))
+}
+
+// OnBlockByHashResp 处理 by-hash 响应：挂载点定位 → 父先于子应用 → 级联孤儿（M3）。
+//
+// 响应约定：Blocks[0] = 被请求块，其后依次是父、祖父（由新到旧）。
+// 因此先找到第一个「父已知」的下标 i，再从 i 递减到 0 应用，即可满足
+// 共识层「父必须先于子存在」的要求——**不依赖 map 迭代顺序**（BT-1 教训）。
+func (s *nodeService) OnBlockByHashResp(peerAddr string, payload p2p.BlockByHashRespPayload) {
+	s.branchRespRecv.Add(1)
+
+	decoded := make([]*block.Block, 0, len(payload.Blocks))
+	for _, enc := range payload.Blocks {
+		rawBytes, err := hex.DecodeString(enc)
+		if err != nil {
+			log.Printf("[node] by-hash 响应编码非法: %v", err)
+			return
+		}
+		b, err := block.DecodeBlock(rawBytes)
+		if err != nil {
+			log.Printf("[node] by-hash 响应解码失败: %v", err)
+			return
+		}
+		decoded = append(decoded, b)
+	}
+
+	reqHash, _ := parseHash32(payload.Hash)
+	if len(decoded) == 0 {
+		// 对端没有这块：清理在途，放弃（完整 orphan 重播策略属 B5）。
+		s.clearInflight(reqHash)
+		log.Printf("[node] by-hash: 对端 %s 没有区块 %s，放弃该分支", peerAddr, shortHash(payload.Hash))
+		return
+	}
+
+	start := -1
+	for i, b := range decoded {
+		s.clearInflight(b.Header.Hash())
+		if s.chain.KnowsParent(b.Header.PrevBlockHash) {
+			start = i
+			break
+		}
+	}
+
+	if start < 0 {
+		// 整段都挂不上：缺口更深。继续回溯，但有轮次上限——
+		// 否则对端持续返回接不上的链时会形成请求/响应无限循环。
+		s.mu.Lock()
+		round := s.rounds[reqHash]
+		s.mu.Unlock()
+		if round >= maxBranchRounds {
+			s.clearInflight(reqHash)
+			log.Printf("[node] by-hash 回溯已达 %d 轮上限，放弃分支 %s", maxBranchRounds, shortHash(payload.Hash))
+			return
+		}
+		deeper := decoded[len(decoded)-1].Header.PrevBlockHash
+		s.clearInflight(reqHash)
+		s.mu.Lock()
+		s.rounds[deeper] = round + 1
+		s.mu.Unlock()
+		s.requestBranch(peerAddr, deeper)
+		return
+	}
+
+	s.mu.Lock()
+	delete(s.rounds, reqHash)
+	s.mu.Unlock()
+
+	for i := start; i >= 0; i-- {
+		s.applyResolved(peerAddr, decoded[i])
+	}
+	// 分支补齐后恢复此前被打断的批量同步。
+	s.resumeSync()
+}
+
+// applyResolved 应用一个「父已就位」的分支区块，并级联处理等待它的孤儿。
+// 级联用显式队列 + 有界展开，不递归（避免深度分支导致栈膨胀）。
+func (s *nodeService) applyResolved(peerAddr string, b *block.Block) {
+	queue := []*block.Block{b}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		applied, orphan, err := s.ingestBlock(peerAddr, cur)
+		switch {
+		case err != nil:
+			log.Printf("[node] 分支区块被拒绝: %s: %v", cur.Header.HashHex(), err)
+			continue
+		case orphan:
+			// 又缺父：已登记并继续回溯拉取，等下一次响应再级联。
+			continue
+		case applied:
+			s.branchApplied.Add(1)
+			s.relayBlock(cur, peerAddr)
+		}
+		queue = append(queue, s.takeWaiting(cur.Header.Hash())...)
+	}
+}
+
+// takeWaiting 取出并清空等待该父哈希的孤儿区块。
+func (s *nodeService) takeWaiting(parentHash [32]byte) []*block.Block {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.waiting[parentHash]
+	delete(s.waiting, parentHash)
+	return out
+}
+
+// clearInflight 清除一个哈希的在途请求标记（收到块或放弃后调用）。
+func (s *nodeService) clearInflight(hash [32]byte) {
+	s.mu.Lock()
+	delete(s.inflight, hash)
+	s.mu.Unlock()
 }
 
 // ---- 内部工具 ----

@@ -32,6 +32,16 @@ var (
 	ErrMerkleMismatch      = errors.New("区块头 Merkle 根与交易列表不匹配")
 	ErrBlockTooLarge       = errors.New("区块超过最大体积限制")
 	ErrBadTxLayout         = errors.New("区块交易布局非法（coinbase 位置/数量）")
+
+	// ErrOrphanParent 是 ErrInvalidPrevHash 的特化：区块自身结构可被解析，
+	// 但它的父区块不在本地区块树中（P2P 到达顺序导致的 orphan）。
+	//
+	// 以 fmt.Errorf("%w", ErrInvalidPrevHash) 构造，故
+	// errors.Is(err, ErrInvalidPrevHash) 依然为 true —— 「非链尾父哈希一律
+	// ErrInvalidPrevHash」的全部既有断言保持成立；新增该哨兵只是让上层 P2P 能
+	// 区分「已知父的合法分叉块」（走 reorg 决策）与「缺父的孤块」（走 by-hash
+	// 分支拉取）。REORG-1H 依赖这一区分。
+	ErrOrphanParent = fmt.Errorf("%w: 父区块未知（orphan）", ErrInvalidPrevHash)
 )
 
 const (
@@ -439,8 +449,13 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 	}
 	parentNode := bc.tree.LookupNode(parentHash)
 	if parentNode == nil {
-		// 父不存在：可能是 orphan（P2P 到达顺序问题），现阶段直接拒绝
-		return fmt.Errorf("%w: parent %x not in tree", ErrInvalidPrevHash, parentHash[:4])
+		// 父不存在：orphan（P2P 到达顺序问题）。
+		//
+		// REORG-1H：这里必须用 ErrOrphanParent 而非裸 ErrInvalidPrevHash——
+		// 上层 P2P 需要据此区分「已知父的合法分叉块」与「缺父孤块」，
+		// 对后者触发 by-hash 分支拉取把祖先补齐，跨节点 reorg 才可能发生。
+		// errors.Is(err, ErrInvalidPrevHash) 仍为 true，既有断言不受影响。
+		return fmt.Errorf("%w: parent %x not in tree", ErrOrphanParent, parentHash[:4])
 	}
 
 	// 加入 blocktree（轻量级元数据索引）

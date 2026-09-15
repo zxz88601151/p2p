@@ -108,6 +108,9 @@ type tipRecord struct {
 
 // v2State 承载 REORG-1E 引入的全部 v2 语义状态；与 legacy 视图（byHeight/byHash）解耦。
 type v2State struct {
+	// v2Mode 仅描述**物理存储模式**（日志中是否已出现 v2 帧），
+	// **绝不**表示 canonical 权威。REORG-1J/I9：v2Mode 不得决定 Height()/TipHash()
+	// 等 canonical 视图；canonical 视图一律由 rebuildCanonicalView 从 TIP + 哈希链派生。
 	v2Mode    bool
 	records   map[[32]byte]*blockRecord // 全部区块（legacy + v2），统一哈希索引
 	undoIndex map[[32]byte]undoRecord   // blockHash → UNDO 帧
@@ -120,12 +123,15 @@ type v2State struct {
 	// 必须与 records 分开保存：records 以哈希去重，无法表达 legacy 的
 	// 「同一区块占据两个高度」这一历史形态（既有 P0 测试即该形态）。
 	legacySeq    []*block.Block
-	legacyLen    int      // = len(legacySeq)
-	legacyCum    *big.Int // legacy 前缀的累积工作量
+	legacyLen    int      // = len(legacySeq)（物理记录计数 / 诊断；不再作 canonical 硬度闸门）
+	legacyCum    *big.Int // legacy 前缀的累积工作量（REBUILD 无 TIP 时的 canonical chainwork）
 	v2Blocks     int      // 已落盘的 v2 BLOCK 记录数（物理记录统计用）
 	danglingUndo int      // 未被任何 BLOCK 引用的悬空 UNDO 帧数（崩溃残留，已忽略）
 	logSize      int64    // 日志物理长度（append 定位用）
 	recoveryMode string   // 最近一次加载采用的恢复模式（诊断/证据）
+	// viewValid 标记 canonical 视图是否已建立。false 仅存在于「尚未写入任何区块」
+	// 的全新 store。任何 canonical 变更都必须经由 rebuildCanonicalView 使其为 true。
+	viewValid bool
 }
 
 func (s *FileBlockStore) initV2() {
@@ -566,6 +572,12 @@ func (s *FileBlockStore) ingestV2Block(fr frameInfo, offset int64) error {
 }
 
 // validateTipCandidate 校验一枚 TIP 候选是否可用于确定 canonical 状态（I1）。
+//
+// REORG-1J（GAP-1I-C）：Gate 1（「TIP 高度不得低于 legacy 前缀末尾」）已**移除**。
+// 该检查用物理记录序号冒充共识约束，导致任何穿越 legacy 前缀的 reorg 被拒。
+// 取而代之的是下方**确定性哈希链校验**：从候选回溯到高度 0，逐级验证
+// height 连续性与父哈希链接。只要哈希链完整有效，canonical 归属即成立——
+// 无论路径上某一高度是 legacy 记录还是 v2 帧。
 func (s *FileBlockStore) validateTipCandidate(t tipRecord) error {
 	rec, ok := s.v2.records[t.hash]
 	if !ok {
@@ -574,10 +586,7 @@ func (s *FileBlockStore) validateTipCandidate(t tipRecord) error {
 	if int(t.height) != rec.height {
 		return fmt.Errorf("%w: tip=%d 区块=%d", ErrTipHeightMismatch, t.height, rec.height)
 	}
-	// legacy 前缀不可被 TIP 截断（M2：legacy = 已提交历史前缀）
-	if s.v2.legacyLen > 0 && rec.height < s.v2.legacyLen-1 {
-		return fmt.Errorf("%w: tip 高度 %d 低于 legacy 前缀末尾 %d", ErrTipHeightMismatch, rec.height, s.v2.legacyLen-1)
-	}
+	// 确定性哈希链校验：TIP → parent → ... → genesis
 	cur := rec
 	for cur.height > 0 {
 		p, ok := s.v2.records[cur.parent]
@@ -586,6 +595,9 @@ func (s *FileBlockStore) validateTipCandidate(t tipRecord) error {
 		}
 		if p.height != cur.height-1 {
 			return fmt.Errorf("%w: %d -> %d", ErrInvalidHeight, cur.height, p.height)
+		}
+		if p.hash != cur.parent {
+			return fmt.Errorf("%w: 哈希链接断裂", ErrCorruptStore)
 		}
 		cur = p
 	}
@@ -609,6 +621,14 @@ func (s *FileBlockStore) validateTipCandidate(t tipRecord) error {
 }
 
 // setCanonicalFrom 依据给定 tip 重建 canonical 视图（byHeight/byHash + canonical 标记）。
+//
+// REORG-1J（GAP-1I-C / OPTION A + C）：
+//   - Gate 2（「legacy 槽位不得由 v2 区块占据」）已**移除**。canonical 归属由
+//     TIP + 哈希链决定，与记录的物理形态（legacy/v2）**无关**；
+//   - 取而代之的是**确定性哈希链校验**（下方 path 回溯）：路径必须逐级满足
+//     `p.height == cur.height-1` 与 `cur.parent == p.hash`，且终止于高度 0 的零父哈希。
+//     该校验比旧的物理格式限制**更强**（它约束的是链，而非容器）。
+//   - legacy 字节永不改写：被新 TIP 排除的 legacy 记录仅由 canonical 标记翻转体现。
 func (s *FileBlockStore) setCanonicalFrom(tipHash [32]byte) error {
 	rec, ok := s.v2.records[tipHash]
 	if !ok {
@@ -628,21 +648,24 @@ func (s *FileBlockStore) setCanonicalFrom(tipHash [32]byte) error {
 		if p.height != cur.height-1 {
 			return fmt.Errorf("%w: %d -> %d", ErrInvalidHeight, cur.height, p.height)
 		}
+		if p.hash != cur.parent {
+			return fmt.Errorf("%w: 哈希链接断裂", ErrCorruptStore)
+		}
 		cur = p
+	}
+	if cur.parent != ([32]byte{}) {
+		return fmt.Errorf("%w: 高度 0 的父哈希非零", ErrZeroParentHash)
 	}
 	// 反转成 低→高
 	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
 		path[i], path[j] = path[j], path[i]
 	}
-	// legacy 前缀必须逐高度哈希一致（legacy 不可变）
+	// 路径必须自高度 0 起逐高度连续（既有校验，保留为确定性约束）
 	byHeight := make([]*block.Block, 0, len(path))
 	byHash := make(map[[32]byte]int, len(path))
 	for h, r := range path {
 		if r.height != h {
 			return fmt.Errorf("%w: 路径高度不连续（位置 %d 高度 %d）", ErrCorruptStore, h, r.height)
-		}
-		if h < s.v2.legacyLen && r.isV2 {
-			return fmt.Errorf("%w: 高度 %d 由 v2 区块占据（legacy 前缀不可变）", ErrCorruptStore, h)
 		}
 		byHeight = append(byHeight, r.block)
 		byHash[r.hash] = h
@@ -655,6 +678,7 @@ func (s *FileBlockStore) setCanonicalFrom(tipHash [32]byte) error {
 	}
 	s.byHeight = byHeight
 	s.byHash = byHash
+	s.v2.viewValid = true
 	return nil
 }
 
