@@ -1,7 +1,9 @@
 package blocktree
 
 import (
+	"bytes"
 	"math/big"
+	"sort"
 	"testing"
 )
 
@@ -233,6 +235,19 @@ func TestI_RestartLikeReconstruction(t *testing.T) {
 	for _, n := range orig.nodes {
 		flat = append(flat, hdr{n.Hash, n.ParentHash, n.Height, n.Bits, n.Timestamp})
 	}
+
+	// BT-1 修复（AUTH-2-BT1-FIX）：orig.nodes 是 map，迭代序随机，可能把 child
+	// 排在 parent 之前，触发 AddBlock 的 ErrMissingParent 前置条件（父必须先
+	// 存在，blocktree.go「parent == nil → ErrMissingParent」）。按 height 升序、
+	// 同高度按哈希字典序做确定性排序，与生产 rebuildTree（blockchain.go，按
+	// bc.blocks slice 高度序回放）的 parent-before-child 构造模型一致。
+	// 仅修复测试构造，不改 AddBlock、不改断言、不引入 retry/skip。
+	sort.Slice(flat, func(i, j int) bool {
+		if flat[i].height != flat[j].height {
+			return flat[i].height < flat[j].height
+		}
+		return bytes.Compare(flat[i].hash[:], flat[j].hash[:]) < 0
+	})
 
 	// 重建（模拟节点重启后从存储恢复）
 	rebuilt := NewBlockTree()
