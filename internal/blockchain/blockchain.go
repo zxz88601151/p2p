@@ -10,16 +10,23 @@
 package blockchain
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"p2pchain/internal/block"
 	"p2pchain/internal/blocktree"
+	"p2pchain/internal/obs"
 	"p2pchain/internal/pow"
 	"p2pchain/internal/storage"
 	"p2pchain/internal/utxo"
 )
+
+// obsHashHex 观测专用：[32]byte → 完整十六进制字符串。
+func obsHashHex(h [32]byte) string { return hex.EncodeToString(h[:]) }
 
 var (
 	ErrInvalidPrevHash     = errors.New("区块的前置哈希与当前链尾不匹配")
@@ -66,6 +73,17 @@ type Blockchain struct {
 	// tree 是区块的内存树索引（REORG-1C），用于 fork detection、chainwork 比较、
 	// common ancestor 计算。不持久化，启动时从 storage 重建。
 	tree *blocktree.BlockTree
+
+	// hashIndex 是 C-1（AUTH-2-C1）引入的内存 hash→block 索引：bc.blocks 的
+	// 派生投影，仅用于降低 blockAtHash 的查找成本（O(h) 线性扫描 → 平均 O(1)）。
+	// key = Header.Hash()；value = 与 bc.blocks 共享的 *block.Block（不复制）。
+	// 非共识状态、绝不持久化；重启后由 NewBlockchainWithGenesis /
+	// NewBlockchainFromStore（recovery 回放）路径自动重建。
+	// 维护不变量：hashIndex 的 key 集合 ≡ bc.blocks 的哈希集合。仅有的两个
+	// mutation 点是 extendChain 的 canonical append（同步写入）与 executeReorg
+	// 的整链替换（同步重建），二者都必须与 bc.blocks 在同一 bc.mu 临界区内
+	// 完成。index 命中 ≠ canonical 判据（同 blockAtHash 的调用方须知）。
+	hashIndex map[[32]byte]*block.Block
 
 	// activationHeight 是难度浮动/新时间戳-MTP/新版本强制生效的高度。
 	// 默认取共识常量 pow.ActivationHeight（2000，> 当前生产高度，保证存量链不破）；
@@ -114,12 +132,26 @@ func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 		return nil, fmt.Errorf("创世区块加入树索引失败: %w", err)
 	}
 	_ = tree.SetTip(node)
-	return &Blockchain{
+	bc := &Blockchain{
 		blocks:           []*block.Block{genesis},
 		utxo:             genesisSet,
 		tree:             tree,
 		activationHeight: pow.ActivationHeight,
-	}, nil
+	}
+	// C-1：创世块进入 hash index（此后 recovery 回放经 extendChain 逐块补全）。
+	bc.hashIndex = map[[32]byte]*block.Block{genesis.Header.Hash(): genesis}
+	return bc, nil
+}
+
+// rebuildHashIndexLocked 从当前 bc.blocks 全量重建 hashIndex（C-1）。
+// 调用方必须持有 bc.mu 写锁（当前唯一调用点在 executeReorg 临界区内）。
+// O(len(bc.blocks))，相对 reorg 本身的成本可忽略。
+func (bc *Blockchain) rebuildHashIndexLocked() {
+	idx := make(map[[32]byte]*block.Block, len(bc.blocks))
+	for _, b := range bc.blocks {
+		idx[b.Header.Hash()] = b
+	}
+	bc.hashIndex = idx
 }
 
 // NewBlockchainWithGenesisAndActivation 同 NewBlockchainWithGenesis，但允许显式指定
@@ -489,6 +521,9 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 				_ = v2s.SaveBlockDetached(b)
 			}
 		}
+		// I0/§8：fork choice 拒绝 —— 新块未能赢得 canonical 竞争（合法，非缺陷）。
+		obs.Emit("REORG_REJECT", "block", b.Header.HashHex(), "fork_height", height,
+			"canonical_height", len(bc.blocks)-1, "reason", "chainwork_not_won")
 		return nil
 	}
 
@@ -526,6 +561,15 @@ func (bc *Blockchain) extendChain(b *block.Block, persist bool) error {
 		}
 	}
 	bc.blocks = append(bc.blocks, b)
+	// C-1：canonical append 同步写入 hash index（唯一 append mutation 点，
+	// 与 bc.blocks 同一临界区，维持「index ≡ bc.blocks 哈希集合」不变量）。
+	if bc.hashIndex == nil {
+		// 防御路径：正常构造链路（NewBlockchainWithGenesis）必已初始化；
+		// 若因异常缺失则全量重建，避免部分投影。
+		bc.rebuildHashIndexLocked()
+	} else {
+		bc.hashIndex[b.Header.Hash()] = b
+	}
 	bc.utxo = newSet
 	// 同步更新 blocktree：若节点尚不在树中则先加入，再设 tip。
 	// 1F 测试暴露：缺少 AddBlock 导致 BestTip 永久停留在 genesis，
@@ -542,9 +586,42 @@ func (bc *Blockchain) extendChain(b *block.Block, persist bool) error {
 	return nil
 }
 
+// obsBlockLookups 是 I0/§9 观测计数器：blockAtHash 的累计调用次数。
+// validateForkBlock 用「前后快照差值」得到单次 fork 校验的 lookup 数；
+// 由于校验路径全程持有 bc.mu 写锁，差值在同锁串行下是精确的。
+var obsBlockLookups atomic.Uint64
+
 // validateForkBlock 对一条 fork branch 上的区块执行共识校验。
 // 需要重建父节点处的 UTXO 状态（replay from genesis）。
+//
+// I0/§9：本函数只包了一层观测（START/END + 计时 + lookup 增量），
+// 校验逻辑在 validateForkBlockInner 中逐字节保持不变。禁止在此路径引入
+// Header.Hash() 记忆化 / 共识缓存 / 增量 UTXO —— 只观测，不修复。
 func (bc *Blockchain) validateForkBlock(b *block.Block, parentNode *blocktree.BlockNode) error {
+	start := time.Now()
+	lookups0 := obsBlockLookups.Load()
+	pathLen := len(parentNode.PathToRoot())
+	forkHeight := parentNode.Height + 1
+	obs.Emit("FORK_VALIDATION_START", "fork_height", forkHeight,
+		"canonical_height", len(bc.blocks)-1, "path_length", pathLen)
+	err := bc.validateForkBlockInner(b, parentNode)
+	result := "ok"
+	if err != nil {
+		result = "rejected"
+	}
+	obs.Emit("FORK_VALIDATION_END", "fork_height", forkHeight,
+		"canonical_height", len(bc.blocks)-1, "path_length", pathLen,
+		"block_lookup_count", obsBlockLookups.Load()-lookups0,
+		"duration_us", time.Since(start).Microseconds(), "result", result)
+	obs.Inc("fork_validation_total")
+	if err != nil {
+		obs.Inc("fork_validation_rejected")
+	}
+	return err
+}
+
+// validateForkBlockInner 是 validateForkBlock 的原始实现体（I0 拆分，仅观测包装变更）。
+func (bc *Blockchain) validateForkBlockInner(b *block.Block, parentNode *blocktree.BlockNode) error {
 	baseUTXO, err := bc.utxoAtNode(parentNode)
 	if err != nil {
 		return fmt.Errorf("rebuild parent UTXO failed: %w", err)
@@ -623,16 +700,26 @@ func (bc *Blockchain) utxoAtNode(node *blocktree.BlockNode) (*utxo.UTXOSet, erro
 	return set, nil
 }
 
-// blockAtHash 按哈希查找区块：先搜索内存中的 canonical 链，再回退到 storage。
+// blockAtHash 按哈希查找区块：先查内存 hash index（C-1），再回退到 storage。
 //
-// ⚠️ 调用方须知：本函数**不是** canonical 成员判据。storage 侧索引（v2 的
-// s.v2.records）同时登记 detached（非 canonical）区块，故「查得到」不等于
-// 「在 canonical 链上」。需要 canonical 判据时必须用 canonicalContains。
+// ⚠️ 调用方须知：本函数**不是** canonical 成员判据。hash index 是 bc.blocks
+// 的派生投影，storage 侧索引（v2 的 s.v2.records）同时登记 detached（非
+// canonical）区块，故「查得到」不等于「在 canonical 链上」。需要 canonical
+// 判据时必须用 canonicalContains。
+//
+// C-1（AUTH-2-C1）语义保持说明：
+//   - lookup 计数（obsBlockLookups.Add(1)）位置与语义逐字节不变（I0 KPI 连续性）；
+//   - index 与 bc.blocks 在同一 bc.mu 临界区内维护（extendChain append /
+//     executeReorg 重建两个 mutation 点），key 集合 ≡ bc.blocks 哈希集合，
+//     故「index 命中」与原线性扫描命中返回完全相同的 *block.Block 指针；
+//   - index miss 时不再做 O(h) 线性扫描，直接走既有 store fallback：canonical
+//     块均已在 store 登记（v2 AppendCanonicalBlock / legacy SaveBlock / recovery
+//     回放源自 store），store 未命中时返回 storage.ErrNotFound —— 与原实现的
+//     线性扫描 miss 后回退 store 的最终结果完全一致，仅省去必败扫描。
 func (bc *Blockchain) blockAtHash(hash [32]byte) (*block.Block, error) {
-	for _, b := range bc.blocks {
-		if b.Header.Hash() == hash {
-			return b, nil
-		}
+	obsBlockLookups.Add(1) // I0/§9：lookup 计数（纯观测，不改查找语义）
+	if b, ok := bc.hashIndex[hash]; ok {
+		return b, nil
 	}
 	if bc.store != nil {
 		return bc.store.GetBlockByHash(hash)
@@ -652,11 +739,21 @@ func (bc *Blockchain) canonicalContains(hash [32]byte) bool {
 }
 
 // executeReorg 执行完整的链重组：disconnect old → apply new → persist → update memory。
+//
+// I0/§8：ATTEMPT 在入口、ACCEPT 在成功尾部、FAILED 在错误返回（defer 判定）。
+// 目的不是改变 reorg，而是事后能回答「孤儿是否来自正常 canonical 链替换」。
 func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) error {
+	start := time.Now()
 	oldTip := bc.tree.BestTip()
 	if oldTip == nil {
 		return errors.New("no active tip")
 	}
+	obs.Emit("REORG_ATTEMPT", "old_tip", obsHashHex(oldTip.Hash), "old_height", oldTip.Height,
+		"new_tip", obsHashHex(newTip.Hash), "new_height", newTip.Height)
+	defer func() {
+		obs.Emit("REORG_DURATION_US", "old_tip", obsHashHex(oldTip.Hash), "new_tip", obsHashHex(newTip.Hash),
+			"duration_us", time.Since(start).Microseconds())
+	}()
 
 	ancestor := bc.tree.FindCommonAncestor(oldTip, newTip)
 	if ancestor == nil {
@@ -751,6 +848,9 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 	}
 
 	bc.blocks = newChain
+	// C-1：整链替换后全量重建 hash index（disconnect 旧链块随之移出投影，
+	// connect 新链块随之进入），与 bc.blocks 同一临界区。
+	bc.rebuildHashIndexLocked()
 	bc.utxo = utxoSet
 	_ = bc.tree.SetTip(newTip)
 
@@ -773,5 +873,10 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 		DisconnectBlocks: disconnectBlocks,
 		ConnectBlocks:    connectBlocks,
 	}
+	// I0/§8：REORG_ACCEPT —— canonical 链替换完成（detached/attached 为分支规模）。
+	obs.Emit("REORG_ACCEPT", "old_tip", obsHashHex(oldTip.Hash), "old_height", oldTip.Height,
+		"new_tip", obsHashHex(newTip.Hash), "new_height", newTip.Height,
+		"detached_count", len(disconnectPath), "attached_count", len(connectPath))
+	obs.Inc("reorg_accepted")
 	return nil
 }
