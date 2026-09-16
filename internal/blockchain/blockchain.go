@@ -85,6 +85,19 @@ type Blockchain struct {
 	// 完成。index 命中 ≠ canonical 判据（同 blockAtHash 的调用方须知）。
 	hashIndex map[[32]byte]*block.Block
 
+	// canonicalSet 是 C-d（AUTH-2-Cd）引入的内存 canonical member hash set：
+	// bc.blocks 的纯派生投影，把 canonicalContains 的 membership 判定由
+	// O(h) 线性扫描降为平均 O(1)。key = Header.Hash()。
+	// 非共识状态、绝不持久化；重启后由 NewBlockchainWithGenesis /
+	// NewBlockchainFromStore（recovery 回放经 extendChain）路径自动重建。
+	// 维护不变量：canonicalSet ≡ { b.Header.Hash() : b ∈ bc.blocks }（双向集合相等）。
+	// 仅有的两个 mutation 点是 extendChain 的 canonical append（同步插入）与
+	// executeReorg 的整链替换（同步全量重建），二者都必须与 bc.blocks 在同一
+	// bc.mu 临界区内完成。
+	// 与 hashIndex 的区别：hashIndex 的「命中」不等于 canonical 判据（其查找
+	// 路径含 store 侧扩展语义）；本 set 仅投影 bc.blocks，故「命中」即 canonical。
+	canonicalSet map[[32]byte]struct{}
+
 	// activationHeight 是难度浮动/新时间戳-MTP/新版本强制生效的高度。
 	// 默认取共识常量 pow.ActivationHeight（2000，> 当前生产高度，保证存量链不破）；
 	// 测试可注入更小的高度以越过激活边界而无需真挖 2000 块。
@@ -140,6 +153,8 @@ func NewBlockchainWithGenesis(genesis *block.Block) (*Blockchain, error) {
 	}
 	// C-1：创世块进入 hash index（此后 recovery 回放经 extendChain 逐块补全）。
 	bc.hashIndex = map[[32]byte]*block.Block{genesis.Header.Hash(): genesis}
+	// C-d：创世块进入 canonical member hash set（同上，recovery 回放经 extendChain 补全）。
+	bc.canonicalSet = map[[32]byte]struct{}{genesis.Header.Hash(): {}}
 	return bc, nil
 }
 
@@ -152,6 +167,17 @@ func (bc *Blockchain) rebuildHashIndexLocked() {
 		idx[b.Header.Hash()] = b
 	}
 	bc.hashIndex = idx
+}
+
+// rebuildCanonicalSetLocked 从当前 bc.blocks 全量重建 canonicalSet（C-d）。
+// 调用方必须持有 bc.mu 写锁（唯一常规调用点在 executeReorg 临界区内；另在
+// extendChain 的防御路径中使用）。O(len(bc.blocks))，相对 reorg 本身的成本可忽略。
+func (bc *Blockchain) rebuildCanonicalSetLocked() {
+	set := make(map[[32]byte]struct{}, len(bc.blocks))
+	for _, b := range bc.blocks {
+		set[b.Header.Hash()] = struct{}{}
+	}
+	bc.canonicalSet = set
 }
 
 // NewBlockchainWithGenesisAndActivation 同 NewBlockchainWithGenesis，但允许显式指定
@@ -570,6 +596,14 @@ func (bc *Blockchain) extendChain(b *block.Block, persist bool) error {
 	} else {
 		bc.hashIndex[b.Header.Hash()] = b
 	}
+	// C-d：canonical append 同步写入 canonical member hash set（同一 append
+	// mutation 点、同一 bc.mu 临界区，维持「set ≡ bc.blocks 哈希集合」不变量）。
+	if bc.canonicalSet == nil {
+		// 防御路径：同 hashIndex——正常构造链路（NewBlockchainWithGenesis）必已初始化。
+		bc.rebuildCanonicalSetLocked()
+	} else {
+		bc.canonicalSet[b.Header.Hash()] = struct{}{}
+	}
 	bc.utxo = newSet
 	// 同步更新 blocktree：若节点尚不在树中则先加入，再设 tip。
 	// 1F 测试暴露：缺少 AddBlock 导致 BestTip 永久停留在 genesis，
@@ -729,13 +763,20 @@ func (bc *Blockchain) blockAtHash(hash [32]byte) (*block.Block, error) {
 
 // canonicalContains 判定区块哈希是否已在 canonical 链（bc.blocks）上。
 // 只查内存 canonical 链，绝不回退 storage —— 见 blockAtHash 的调用方须知。
+//
+// C-d（AUTH-2-Cd）语义保持说明：
+//   - membership 判定由 canonical member hash set（bc.canonicalSet）承担，
+//     复杂度由 O(h) 线性扫描降为平均 O(1)；
+//   - set 与 bc.blocks 在同一 bc.mu 临界区内维护（extendChain 的 append 同步插入、
+//     executeReorg 的整链重建两个 mutation 点），不变量为
+//     set ≡ { b.Header.Hash() : b ∈ bc.blocks }（双向集合相等），故「set 命中」
+//     与原线性扫描命中返回完全相同的 bool 结果；
+//   - set miss ≡ 原线性扫描 miss：均返回 false，且都不回退 storage；
+//   - 锁语义不变：本函数自身不加锁（与改写前一致），写路径 addBlock 持写锁、
+//     读路径 IsCanonicalHash 持读锁。
 func (bc *Blockchain) canonicalContains(hash [32]byte) bool {
-	for _, b := range bc.blocks {
-		if b.Header.Hash() == hash {
-			return true
-		}
-	}
-	return false
+	_, ok := bc.canonicalSet[hash]
+	return ok
 }
 
 // executeReorg 执行完整的链重组：disconnect old → apply new → persist → update memory。
@@ -851,6 +892,9 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 	// C-1：整链替换后全量重建 hash index（disconnect 旧链块随之移出投影，
 	// connect 新链块随之进入），与 bc.blocks 同一临界区。
 	bc.rebuildHashIndexLocked()
+	// C-d：整链替换后全量重建 canonical member hash set（同上语义：
+	// disconnect 旧链块移出投影、connect 新链块进入投影）。
+	bc.rebuildCanonicalSetLocked()
 	bc.utxo = utxoSet
 	_ = bc.tree.SetTip(newTip)
 
