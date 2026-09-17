@@ -2,14 +2,20 @@
 // 查询状态、查看余额与提交交易。
 //
 // 设计取舍：
-//   - 只做本机控制，不做远程钱包服务。默认绑定 127.0.0.1，且没有任何鉴权，
-//     因此绝不可绑定到公网地址（需要远程访问时应加 TLS + 认证，属本阶段范围外）。
+//   - 只做本机控制，不做远程钱包服务。默认绑定 127.0.0.1。
+//   - 读端点（GET /status /balance /utxos /block /blocks /logs）无鉴权——
+//     回环绑定即是其安全边界（Explorer 依赖这些端点，保持免认证）。
+//   - mutation 端点（POST /send /mine /stop）自 PHASE CONTROL-AUTH-1 起要求
+//     Bearer Token（授权头：Authorization: Bearer <token>），认证失败统一 401
+//     并带固定延迟；未配置 token 时 fail-closed（一律 401）。
+//   - 即便如此仍绝不可绑定到公网地址（远程管理走 SSH 隧道，属 Option A 基线）。
 //   - 本包不依赖 blockchain / mempool / utxo——它只声明一个 Node 接口，
 //     由 cmd/node 侧的节点服务实现（消费方定义接口）。这样协议与业务状态解耦，
 //     本包可以用假实现独立测试。
 package control
 
 import (
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,7 +23,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -231,10 +240,50 @@ type Server struct {
 	// 未注入时 /stop 返回 501（能力未启用）——绝不假装有能力。
 	stopHook func()
 	stopOnce sync.Once
+
+	// authToken 为 mutation 端点（/send /mine /stop）的 Bearer Token
+	//（PHASE CONTROL-AUTH-1，Option E-lite 冻结设计）。
+	// 为空（未配置）时 mutation 端点 fail-closed：一律 401；读端点不受影响。
+	authToken string
+	// authFailureDelay 为认证失败后的固定延迟（防爆破）。
+	// 设计冻结 500ms；测试可覆写为小值。无锁定/无黑名单/无全局限流。
+	authFailureDelay time.Duration
 }
 
+// defaultAuthFailureDelay 认证失败固定延迟（设计报告 §8 冻结值）。
+const defaultAuthFailureDelay = 500 * time.Millisecond
+
+// token 长度边界（LoadTokenFile 归一化校验用，冻结于实现报告）。
+const (
+	minTokenLen = 16
+	maxTokenLen = 1024
+)
+
 // NewServer 创建服务端。
-func NewServer(node Node) *Server { return &Server{node: node} }
+func NewServer(node Node) *Server {
+	return &Server{node: node, authFailureDelay: defaultAuthFailureDelay}
+}
+
+// SetAuthToken 设置 mutation 端点（/send /mine /stop）的 Bearer Token。
+// 必须在 Start 之前调用。传入空串等价于「未配置」：mutation 端点保持
+// fail-closed（一律 401）。token 来源文件请用 LoadTokenFile 读取，
+// 绝不通过命令行参数或环境变量传递 token 本身。
+func (s *Server) SetAuthToken(tok string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authToken = tok
+}
+
+// SetAuthFailureDelay 覆写认证失败固定延迟（仅供测试；生产保持默认 500ms）。
+// 传入 0 表示测试中禁用延迟。不允许负值。
+func (s *Server) SetAuthFailureDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authFailureDelay = d
+}
 
 // Handler 返回路由（便于测试直接挂到 httptest）。
 func (s *Server) Handler() http.Handler {
@@ -242,12 +291,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/balance", s.handleBalance)
 	mux.HandleFunc("/utxos", s.handleUTXOs)
-	mux.HandleFunc("/send", s.handleSend)
-	mux.HandleFunc("/mine", s.handleMine)
+	mux.HandleFunc("/send", s.requireAuth(s.handleSend))
+	mux.HandleFunc("/mine", s.requireAuth(s.handleMine))
 	mux.HandleFunc("/block", s.handleBlock)
 	mux.HandleFunc("/blocks", s.handleBlocks)
 	mux.HandleFunc("/logs", s.handleLogs)
-	mux.HandleFunc("/stop", s.handleStop)
+	mux.HandleFunc("/stop", s.requireAuth(s.handleStop))
 	// 根路径提供本机 Developer Console 页面（单页、零外部资源）。
 	// 放在最后注册：ServeMux 以「最长前缀」匹配，不会遮蔽上面的精确路由。
 	mux.HandleFunc("/", s.handleConsole)
@@ -531,6 +580,79 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 	s.stopOnce.Do(hook)
+}
+
+// requireAuth 包装 mutation 端点：强制 Bearer Token 认证（PHASE CONTROL-AUTH-1）。
+//
+// 契约（CONTROL-PLANE AUTH DESIGN 冻结）：
+//   - 缺失/无效/过期/被撤销 token 统一返回 401，响应不区分具体原因；
+//   - 认证失败先做固定延迟 authFailureDelay（防爆破；无锁定/无黑名单/无全局限流）；
+//   - token 比较使用 constant-time（crypto/subtle），不引入自研密码学；
+//   - 不打印、不回显 Authorization 头；失败响应体最小化（固定 "unauthorized"）。
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 方法契约优先：非 POST 请求不可能是 mutation，直接交给既有方法守卫，
+		// 保持「GET /stop → 405 + Allow: POST」的既有行为（不因新增认证而改变）。
+		if r.Method != http.MethodPost {
+			next(w, r)
+			return
+		}
+
+		s.mu.Lock()
+		expected := s.authToken
+		delay := s.authFailureDelay
+		s.mu.Unlock()
+
+		given := bearerToken(r)
+		ok := expected != "" && given != "" &&
+			subtle.ConstantTimeCompare([]byte(expected), []byte(given)) == 1
+		if !ok {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// bearerToken 提取 Authorization: Bearer <token>；头缺失或格式不符返回空串。
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return ""
+	}
+	return h[len(prefix):]
+}
+
+// LoadTokenFile 从 path 读取 Bearer Token 并做归一化。
+//
+// 归一化语义（实现报告冻结）：去除首尾空白（兼容编辑器追加的换行/CRLF）；
+// 归一化后长度必须在 [minTokenLen, maxTokenLen] 区间。
+// Unix 上要求文件权限 owner-only（0600），group/other 位非零即拒绝；
+// Windows 文件系统不表达 POSIX 权限位，跳过该检查。
+// 错误信息只描述原因与文件路径，绝不包含文件内容。
+func LoadTokenFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("读取 token 文件 %s 失败: %w", path, err)
+	}
+	tok := strings.TrimSpace(string(raw))
+	if n := len(tok); n < minTokenLen {
+		return "", fmt.Errorf("token 文件 %s 内容无效（归一化后长度 %d，要求 >= %d）", path, n, minTokenLen)
+	} else if n > maxTokenLen {
+		return "", fmt.Errorf("token 文件 %s 内容无效（归一化后长度 %d，要求 <= %d）", path, n, maxTokenLen)
+	}
+	if runtime.GOOS != "windows" {
+		if fi, statErr := os.Stat(path); statErr == nil {
+			if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+				return "", fmt.Errorf("token 文件 %s 权限过宽（%04o，要求 owner-only 0600）", path, perm)
+			}
+		}
+	}
+	return tok, nil
 }
 
 // requireMethod 校验请求方法；不符时写 405 并返回 false。

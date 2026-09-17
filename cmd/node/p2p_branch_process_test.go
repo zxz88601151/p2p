@@ -26,7 +26,7 @@ import (
 // mineRealNode 通过真实控制接口让子进程挖 count 个区块（按需出块，非挖矿循环）。
 func mineRealNode(t *testing.T, n *realNode, count int) {
 	t.Helper()
-	resp, err := control.NewClient(n.rpc).Mine(count)
+	resp, err := authedClient(n.rpc).Mine(count)
 	if err != nil {
 		t.Fatalf("按需出块失败: %v\n节点输出:\n%s", err, n.output.String())
 	}
@@ -228,8 +228,8 @@ func TestRealProcessPairConvergesToSameTip(t *testing.T) {
 	// 历史：**同一条链**截断出短链 ⇒ A 与 B 拥有真正共同的前缀 3
 	// （若分别独立挖两条链，会因钱包不同而从高度 1 起就分叉，那测的是另一回事）。
 	prefix := 3
-	histLong := mineChainOffline(t, prefix+2)          // 高度 5
-	histShort := truncateLegacy(t, histLong, prefix)   // 高度 3（同一条链的前缀）
+	histLong := mineChainOffline(t, prefix+2)        // 高度 5
+	histShort := truncateLegacy(t, histLong, prefix) // 高度 3（同一条链的前缀）
 
 	// 起点（对数据本身断言，避免与「一握手就同步」赛跑）：A=5，B=3，且 B 是 A 的真前缀
 	if got := initialHeightFromLegacy(t, histLong); got != 5 {

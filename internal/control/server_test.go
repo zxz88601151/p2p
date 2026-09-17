@@ -99,11 +99,35 @@ func (f *fakeNode) BlockJSONByHash(hash [32]byte) (control.BlockJSON, error) {
 	return f.blockJSON, nil
 }
 
+// testToken 供 newTestPair 注入的 mutation 测试 token（PHASE CONTROL-AUTH-1）。
+// 仅测试用临时凭据，严禁在测试中出现真实生产 token。
+const testToken = "test-token-0123456789abcdef"
+
 func newTestPair(t *testing.T, node control.Node) (*control.Client, *httptest.Server) {
 	t.Helper()
-	srv := httptest.NewServer(control.NewServer(node).Handler())
+	s := control.NewServer(node)
+	s.SetAuthToken(testToken)
+	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
-	return control.NewClient(strings.TrimPrefix(srv.URL, "http://")), srv
+	c := control.NewClient(strings.TrimPrefix(srv.URL, "http://"))
+	c.SetToken(testToken)
+	return c, srv
+}
+
+// postAuth 以携带测试 token 的 POST 请求访问 srv 的 mutation 端点。
+func postAuth(t *testing.T, url, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 // TestServerClientRoundTrip 状态/余额/UTXO 的完整 HTTP 往返。
@@ -251,10 +275,7 @@ func TestMineEndpoint(t *testing.T) {
 	}
 
 	for _, bad := range []string{`{"count":0}`, `{"count":-1}`, `{"count":99999}`} {
-		r, err := http.Post(srv.URL+"/mine", "application/json", strings.NewReader(bad))
-		if err != nil {
-			t.Fatal(err)
-		}
+		r := postAuth(t, srv.URL+"/mine", bad)
 		_ = r.Body.Close()
 		if r.StatusCode != http.StatusBadRequest {
 			t.Fatalf("count=%s 状态码 = %d, want 400", bad, r.StatusCode)
@@ -263,10 +284,7 @@ func TestMineEndpoint(t *testing.T) {
 
 	// 节点报告业务冲突（例如正在持续挖矿）→ 409
 	node.mineErr = errors.New("节点正在持续挖矿")
-	r, err := http.Post(srv.URL+"/mine", "application/json", strings.NewReader(`{"count":1}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := postAuth(t, srv.URL+"/mine", `{"count":1}`)
 	_ = r.Body.Close()
 	if r.StatusCode != http.StatusConflict {
 		t.Fatalf("业务冲突状态码 = %d, want 409", r.StatusCode)

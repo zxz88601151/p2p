@@ -16,8 +16,9 @@ const DefaultAddr = "127.0.0.1:6689"
 
 // Client 控制接口客户端。
 type Client struct {
-	base string
-	hc   *http.Client
+	base  string
+	hc    *http.Client
+	token string
 }
 
 // NewClient 创建客户端；addr 为空时使用 DefaultAddr。
@@ -30,6 +31,11 @@ func NewClient(addr string) *Client {
 		hc:   &http.Client{Timeout: 15 * time.Second},
 	}
 }
+
+// SetToken 设置 mutation 请求（POST /send /mine /stop）携带的 Bearer Token；
+// 空串表示不携带。token 仅保存在内存中，绝不写入日志或错误信息。
+// 非 goroutine-safe：调用方应在并发使用前完成设置。
+func (c *Client) SetToken(tok string) { c.token = tok }
 
 // Status 查询节点状态。
 func (c *Client) Status() (*StatusInfo, error) {
@@ -141,6 +147,11 @@ func (c *Client) post(path string, body any, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// mutation 端点自 PHASE CONTROL-AUTH-1 起要求 Bearer Token；已设置则自动携带。
+	// 仅 POST（mutation）携带；GET（read 端点）保持原行为。
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	return c.do(req, out)
 }
 

@@ -282,6 +282,7 @@ func cmdSend(args []string, stdout, stderr io.Writer) int {
 	to := fs.String("to", "", "收款地址（必填）")
 	amount := fs.Uint64("amount", 0, "转账金额（必填，最小单位）")
 	fee := fs.Uint64("fee", 0, "手续费（最小单位，默认 0）")
+	tokenFile := fs.String("token-file", "secrets/control-token", "mutation token 文件（0600；相对工作目录）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -295,8 +296,14 @@ func cmdSend(args []string, stdout, stderr io.Writer) int {
 	if err := wallet.ValidateAddress(*to); err != nil {
 		return fail(stderr, "收款地址非法: %v", err)
 	}
+	tok, err := control.LoadTokenFile(*tokenFile)
+	if err != nil {
+		return fail(stderr, "%v", err)
+	}
 
-	resp, err := control.NewClient(*rpc).Send(control.SendRequest{To: *to, Amount: *amount, Fee: *fee})
+	client := control.NewClient(*rpc)
+	client.SetToken(tok)
+	resp, err := client.Send(control.SendRequest{To: *to, Amount: *amount, Fee: *fee})
 	if err != nil {
 		return fail(stderr, "%v", err)
 	}
@@ -313,14 +320,21 @@ func cmdMine(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("mine", stderr)
 	rpc := fs.String("rpc", control.DefaultAddr, "节点控制接口地址")
 	count := fs.Int("count", 1, "立即挖出的区块数量")
+	tokenFile := fs.String("token-file", "secrets/control-token", "mutation token 文件（0600；相对工作目录）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *count <= 0 {
 		return fail(stderr, "-count 必须大于 0，实际 %d", *count)
 	}
+	tok, err := control.LoadTokenFile(*tokenFile)
+	if err != nil {
+		return fail(stderr, "%v", err)
+	}
 
-	resp, err := control.NewClient(*rpc).Mine(*count)
+	client := control.NewClient(*rpc)
+	client.SetToken(tok)
+	resp, err := client.Mine(*count)
 	if err != nil {
 		return fail(stderr, "%v\n（提示：请先用 `node` 启动节点，且不要在 -mine 持续挖矿模式下调用）", err)
 	}
@@ -348,6 +362,7 @@ const stopPollInterval = 100 * time.Millisecond
 func cmdStop(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("stop", stderr)
 	rpc := fs.String("rpc", control.DefaultAddr, "节点控制接口地址")
+	tokenFile := fs.String("token-file", "secrets/control-token", "mutation token 文件（0600；相对工作目录）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -357,6 +372,12 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 	if _, err := client.Status(); err != nil {
 		return fail(stderr, "%v\n（提示：请先用 `node` 启动节点）", err)
 	}
+	// PHASE CONTROL-AUTH-1：/stop 为 mutation 端点，需要 Bearer Token。
+	tok, err := control.LoadTokenFile(*tokenFile)
+	if err != nil {
+		return fail(stderr, "%v", err)
+	}
+	client.SetToken(tok)
 
 	// 节点可能在写出响应前就关闭了连接——这是「已经在退出了」的正常表现，
 	// 因此不把它当失败；最终结论以「节点是否真的退出」为准。

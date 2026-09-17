@@ -43,13 +43,14 @@ const MempoolSize = 2048
 
 // nodeConfig 节点启动参数。
 type nodeConfig struct {
-	ListenAddr string
-	RPCAddr    string
-	Seeds      []string
-	DataDir    string
-	Mine       bool
-	MaxBlocks  int
-	Miners     int // 并行挖矿 worker 数，<=1 表示单线程
+	ListenAddr    string
+	RPCAddr       string
+	Seeds         []string
+	DataDir       string
+	Mine          bool
+	MaxBlocks     int
+	Miners        int    // 并行挖矿 worker 数，<=1 表示单线程
+	AuthTokenFile string // mutation 端点 Bearer Token 文件（路径可上命令行，token 本身绝不）
 }
 
 // nodeRuntime 一个已启动节点的全部运行时组件。
@@ -162,6 +163,15 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	}
 
 	ctl := control.NewServer(svc)
+	// PHASE CONTROL-AUTH-1：mutation 端点（/send /mine /stop）启用 Bearer Token。
+	// token 文件缺失/无效时 fail-closed：mutation 一律 401，读端点不受影响。
+	// 日志只记路径与结论，绝不记 token 内容。
+	if tok, tokErr := control.LoadTokenFile(cfg.AuthTokenFile); tokErr != nil {
+		log.Printf("[node] 警告：mutation token 不可用（%v）；/send /mine /stop 已禁用（fail-closed），读端点不受影响", tokErr)
+	} else {
+		ctl.SetAuthToken(tok)
+		log.Printf("[node] mutation 端点认证已启用（token 文件: %s）", cfg.AuthTokenFile)
+	}
 	actualRPC, err := ctl.Start(cfg.RPCAddr)
 	if err != nil {
 		p2pNode.Stop()
@@ -180,7 +190,7 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	}
 	rt.connectSeeds() // 首次连接
 	rt.watchSeeds()   // 断线后自动重连
-	initDone = true  // 初始化完成：上面的 defer 释放兜底不再触发
+	initDone = true   // 初始化完成：上面的 defer 释放兜底不再触发
 	return rt, nil
 }
 
@@ -273,13 +283,14 @@ func runNodeUI(args []string) { startNode(args, true) }
 // 若两处各写一份，形如 `-datadir X verify` 的组合会在「预扫描认为选项在哪里结束」
 // 与「实际解析认为选项在哪里结束」之间产生分歧，P1 会以另一种形式复发。
 type nodeFlags struct {
-	listen    string
-	rpc       string
-	seed      string
-	dataDir   string
-	mine      bool
-	maxBlocks int
-	miners    int
+	listen      string
+	rpc         string
+	seed        string
+	dataDir     string
+	mine        bool
+	maxBlocks   int
+	miners      int
+	authTokFile string
 }
 
 // newNodeFlagSet 创建节点选项集。
@@ -292,7 +303,12 @@ func newNodeFlagSet(errHandling flag.ErrorHandling) (*flag.FlagSet, *nodeFlags) 
 	nf := &nodeFlags{}
 	fs := flag.NewFlagSet("node", errHandling)
 	fs.StringVar(&nf.listen, "listen", ":6688", "本节点监听地址")
-	fs.StringVar(&nf.rpc, "rpc", control.DefaultAddr, "控制接口监听地址（仅本机，无鉴权）")
+	fs.StringVar(&nf.rpc, "rpc", control.DefaultAddr, "控制接口监听地址（仅本机）")
+	// PHASE CONTROL-AUTH-1：mutation 端点 token 文件。相对路径按工作目录解析，
+	// 服务端（WorkingDirectory）与 CLI/ExecStop 同目录运行时天然一致。
+	// 只传路径，token 本身绝不进命令行/环境变量/日志。
+	fs.StringVar(&nf.authTokFile, "auth-token-file", "secrets/control-token",
+		"mutation 端点（/send /mine /stop）Bearer Token 文件（0600；相对工作目录；缺省 secrets/control-token）")
 	fs.StringVar(&nf.seed, "seed", "", "种子节点地址，多个用逗号分隔；留空表示作为第一个节点启动")
 	fs.StringVar(&nf.dataDir, "datadir", defaultDataDir(), "数据目录（存放区块数据与钱包）")
 	fs.BoolVar(&nf.mine, "mine", false, "是否启用挖矿")
@@ -321,13 +337,14 @@ func startNode(args []string, openConsole bool) {
 	}()
 
 	rt2, err := newNodeRuntime(nodeConfig{
-		ListenAddr: nf.listen,
-		RPCAddr:    nf.rpc,
-		Seeds:      splitSeeds(nf.seed),
-		DataDir:    nf.dataDir,
-		Mine:       nf.mine,
-		MaxBlocks:  nf.maxBlocks,
-		Miners:     nf.miners,
+		ListenAddr:    nf.listen,
+		RPCAddr:       nf.rpc,
+		Seeds:         splitSeeds(nf.seed),
+		DataDir:       nf.dataDir,
+		Mine:          nf.mine,
+		MaxBlocks:     nf.maxBlocks,
+		Miners:        nf.miners,
+		AuthTokenFile: nf.authTokFile,
 	})
 	if err != nil {
 		// 数据目录被另一节点占用时给出明确、可执行的用户级错误（与「数据损坏」区分）。

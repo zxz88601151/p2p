@@ -28,17 +28,22 @@ import (
 func startTestRuntime(t *testing.T, mine bool) (*nodeRuntime, *control.Client, string) {
 	t.Helper()
 	dir := t.TempDir()
+	// PHASE CONTROL-AUTH-1：mutation 端点需要 token；测试统一走共享测试凭据。
+	tokenFile := writeTestTokenFile(t)
 	rt, err := newNodeRuntime(nodeConfig{
-		ListenAddr: "127.0.0.1:0",
-		RPCAddr:    "127.0.0.1:0",
-		DataDir:    dir,
-		Mine:       mine,
+		ListenAddr:    "127.0.0.1:0",
+		RPCAddr:       "127.0.0.1:0",
+		DataDir:       dir,
+		Mine:          mine,
+		AuthTokenFile: tokenFile,
 	})
 	if err != nil {
 		t.Fatalf("启动节点失败: %v", err)
 	}
 	t.Cleanup(rt.Close)
-	return rt, control.NewClient(rt.ctl.Addr()), dir
+	client := control.NewClient(rt.ctl.Addr())
+	client.SetToken(testToken)
+	return rt, client, dir
 }
 
 // mineBlocks 连续挖出 n 个区块（走真实挖矿路径，含交易池打包）。

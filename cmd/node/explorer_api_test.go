@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 )
 
@@ -182,10 +181,8 @@ func TestExplorerRegressionRealChain(t *testing.T) {
 	}
 
 	// POST /mine（mine=false 节点 → 按需出块可用）
-	mresp, err := http.Post(base+"/mine", "application/json", strings.NewReader(`{"count":1}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// /mine 为 mutation 端点：PHASE CONTROL-AUTH-1 起需携带 Bearer Token。
+	mresp := postAuthed(t, base+"/mine", `{"count":1}`)
 	defer mresp.Body.Close()
 	var mineBody struct {
 		Mined  int `json:"mined"`

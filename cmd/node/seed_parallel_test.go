@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"p2pchain/internal/control"
 	"p2pchain/internal/pow"
 )
 
@@ -73,10 +72,11 @@ func TestParallelMiningProducesValidBlock(t *testing.T) {
 	const miners = 4
 	dir := t.TempDir()
 	rt, err := newNodeRuntime(nodeConfig{
-		ListenAddr: "127.0.0.1:0",
-		RPCAddr:    "127.0.0.1:0",
-		DataDir:    dir,
-		Miners:     miners,
+		ListenAddr:    "127.0.0.1:0",
+		RPCAddr:       "127.0.0.1:0",
+		DataDir:       dir,
+		Miners:        miners,
+		AuthTokenFile: writeTestTokenFile(t),
 	})
 	if err != nil {
 		t.Fatalf("启动节点失败: %v", err)
@@ -86,7 +86,7 @@ func TestParallelMiningProducesValidBlock(t *testing.T) {
 		t.Fatalf("miners 配置未生效: %d", rt.svc.miners)
 	}
 
-	client := control.NewClient(rt.ctl.Addr())
+	client := authedClient(rt.ctl.Addr())
 	resp, err := client.Mine(6)
 	if err != nil {
 		t.Fatalf("按需出块失败: %v", err)

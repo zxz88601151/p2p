@@ -258,10 +258,8 @@ func TestBlockLegacyHeightContractUnchanged(t *testing.T) {
 func TestMineContractUnchanged(t *testing.T) {
 	node := &fakeNode{}
 	_, srv := newTestPair(t, node)
-	resp, err := http.Post(srv.URL+"/mine", "application/json", strings.NewReader(`{"count":2}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// /mine 为 mutation 端点，PHASE CONTROL-AUTH-1 起需携带 token（postAuth 已带）。
+	resp := postAuth(t, srv.URL+"/mine", `{"count":2}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || node.lastMineN != 2 {
 		t.Fatalf("/mine 契约回归: code=%d lastMineN=%d", resp.StatusCode, node.lastMineN)

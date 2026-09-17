@@ -59,12 +59,13 @@ func freePort(t *testing.T) string {
 
 // realNode 一个通过真实二进制启动的节点子进程。
 type realNode struct {
-	t      *testing.T
-	dir    string
-	rpc    string
-	cmd    *exec.Cmd
-	output *bytes.Buffer
-	exited chan error
+	t         *testing.T
+	dir       string
+	rpc       string
+	tokenFile string // PHASE CONTROL-AUTH-1：子进程节点的 mutation token 文件
+	cmd       *exec.Cmd
+	output    *bytes.Buffer
+	exited    chan error
 
 	waitErr error
 }
@@ -75,8 +76,10 @@ func startRealNode(t *testing.T, dir string, extra ...string) *realNode {
 	bin := buildNodeBinary(t)
 	rpc := freePort(t)
 	listen := freePort(t)
+	// PHASE CONTROL-AUTH-1：子进程节点同样启用 mutation 认证（fail-closed 契约）。
+	tokenFile := writeTestTokenFile(t)
 
-	args := []string{"-datadir", dir, "-listen", listen, "-rpc", rpc}
+	args := []string{"-datadir", dir, "-listen", listen, "-rpc", rpc, "-auth-token-file", tokenFile}
 	args = append(args, extra...)
 
 	cmd := exec.Command(bin, args...)
@@ -86,7 +89,7 @@ func startRealNode(t *testing.T, dir string, extra ...string) *realNode {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("启动节点子进程失败: %v", err)
 	}
-	n := &realNode{t: t, dir: dir, rpc: rpc, cmd: cmd, output: &out, exited: make(chan error, 1)}
+	n := &realNode{t: t, dir: dir, rpc: rpc, tokenFile: tokenFile, cmd: cmd, output: &out, exited: make(chan error, 1)}
 	go func() { n.exited <- cmd.Wait() }()
 	// 无论测试成败都必须回收子进程，避免残留进程占用数据目录
 	t.Cleanup(n.kill)
@@ -142,7 +145,7 @@ func (n *realNode) waitExit(timeout time.Duration) bool {
 func (n *realNode) stopViaCLI() (int, string) {
 	n.t.Helper()
 	var out, errBuf bytes.Buffer
-	code := cmdStop([]string{"-rpc", n.rpc}, &out, &errBuf)
+	code := cmdStop([]string{"-rpc", n.rpc, "-token-file", n.tokenFile}, &out, &errBuf)
 	return code, out.String() + errBuf.String()
 }
 
@@ -207,6 +210,8 @@ func TestStopEndpointRequiresPOST(t *testing.T) {
 	defer rt.Close()
 
 	srv := control.NewServer(rt.svc)
+	// PHASE CONTROL-AUTH-1：/stop 属 mutation 端点，测试需以有效 token 访问。
+	srv.SetAuthToken(testToken)
 	addr, err := srv.Start("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("启动控制接口失败: %v", err)
@@ -214,7 +219,7 @@ func TestStopEndpointRequiresPOST(t *testing.T) {
 	defer func() { _ = srv.Stop() }()
 
 	// 未注入 hook：POST 应返回 501（不假装有能力）
-	if _, err := control.NewClient(addr).Stop(); err == nil {
+	if _, err := authedClient(addr).Stop(); err == nil {
 		t.Fatal("未注入停止回调时 POST /stop 应失败")
 	} else if !strings.Contains(err.Error(), "501") {
 		t.Fatalf("应返回 501，实际: %v", err)
@@ -236,6 +241,7 @@ func TestStopHookFiresOnce(t *testing.T) {
 	defer rt.Close()
 
 	srv := control.NewServer(rt.svc)
+	srv.SetAuthToken(testToken)
 	addr, err := srv.Start("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("启动控制接口失败: %v", err)
@@ -246,7 +252,7 @@ func TestStopHookFiresOnce(t *testing.T) {
 	srv.SetStopHook(func() { calls++ })
 
 	for i := 0; i < 3; i++ {
-		resp, err := control.NewClient(addr).Stop()
+		resp, err := authedClient(addr).Stop()
 		if err != nil {
 			t.Fatalf("第 %d 次 POST /stop 失败: %v", i+1, err)
 		}
@@ -310,7 +316,7 @@ func TestStopPreservesChainAndWallet(t *testing.T) {
 	dir := t.TempDir()
 	n := startRealNode(t, dir)
 
-	if _, err := control.NewClient(n.rpc).Mine(3); err != nil {
+	if _, err := authedClient(n.rpc).Mine(3); err != nil {
 		t.Fatalf("挖矿失败: %v", err)
 	}
 	before := map[string][]byte{}
@@ -345,7 +351,7 @@ func TestStopPreservesChainAndWallet(t *testing.T) {
 func TestStopThenRestartNeedsNoForce(t *testing.T) {
 	dir := t.TempDir()
 	n1 := startRealNode(t, dir)
-	if _, err := control.NewClient(n1.rpc).Mine(2); err != nil {
+	if _, err := authedClient(n1.rpc).Mine(2); err != nil {
 		t.Fatalf("挖矿失败: %v", err)
 	}
 	if code, out := n1.stopViaCLI(); code != 0 {
@@ -371,7 +377,7 @@ func TestStopThenRestartNeedsNoForce(t *testing.T) {
 func TestStopThenVerifyConsistent(t *testing.T) {
 	dir := t.TempDir()
 	n1 := startRealNode(t, dir)
-	if _, err := control.NewClient(n1.rpc).Mine(5); err != nil {
+	if _, err := authedClient(n1.rpc).Mine(5); err != nil {
 		t.Fatalf("挖矿失败: %v", err)
 	}
 	st1, err := n1.status()
@@ -437,19 +443,19 @@ func TestStopWhileMining(t *testing.T) {
 func TestStopAfterTransaction(t *testing.T) {
 	dir := t.TempDir()
 	n := startRealNode(t, dir)
-	if _, err := control.NewClient(n.rpc).Mine(12); err != nil {
+	if _, err := authedClient(n.rpc).Mine(12); err != nil {
 		t.Fatalf("挖矿失败: %v", err)
 	}
 	st, err := n.status()
 	if err != nil {
 		t.Fatalf("取状态失败: %v", err)
 	}
-	if _, err := control.NewClient(n.rpc).Send(control.SendRequest{
+	if _, err := authedClient(n.rpc).Send(control.SendRequest{
 		To: st.Address, Amount: 1, Fee: 1,
 	}); err != nil {
 		t.Fatalf("发送交易失败: %v", err)
 	}
-	if _, err := control.NewClient(n.rpc).Mine(1); err != nil {
+	if _, err := authedClient(n.rpc).Mine(1); err != nil {
 		t.Fatalf("打包失败: %v", err)
 	}
 
@@ -524,7 +530,7 @@ func TestResetAfterGracefulStopNeedsNoForce(t *testing.T) {
 		t.Fatalf("取状态失败: %v", err)
 	}
 	genesisBefore := st0.TipHash // 高度 0 时链尾即创世
-	if _, err := control.NewClient(n.rpc).Mine(4); err != nil {
+	if _, err := authedClient(n.rpc).Mine(4); err != nil {
 		t.Fatalf("挖矿失败: %v", err)
 	}
 	if code, out := n.stopViaCLI(); code != 0 {
