@@ -10,6 +10,7 @@
 package control
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,12 @@ import (
 
 // ErrAddressRequired 请求缺少 address 参数。
 var ErrAddressRequired = errors.New("缺少 address 参数")
+
+// ErrBlockNotFound 按哈希查询的区块不存在（HTTP 404）。
+var ErrBlockNotFound = errors.New("区块不存在")
+
+// ErrAmbiguousBlockQuery 同时提供 height 与 hash 参数（二者互斥）。
+var ErrAmbiguousBlockQuery = errors.New("height 与 hash 参数只能提供其一")
 
 // ErrStopUnsupported 节点未启用远程停止（未注入停止回调）。
 var ErrStopUnsupported = errors.New("该节点未启用远程停止")
@@ -39,6 +46,15 @@ type Node interface {
 	Send(to string, amount, fee uint64) (SendResponse, error)
 	// BlockHex 按高度返回区块的规范编码（十六进制）。
 	BlockHex(height int) (string, error)
+	// BlocksPage 按高度批量返回 canonical 主链区块的 Explorer JSON 视图。
+	// from 为起始高度（含），count 为请求块数（1..MaxBlocksPerPage）。
+	// 一次调用一次临界区完成批量读取（复用 blockchain.BlocksFrom），
+	// 空区间（from 超过链尾）返回空 blocks 列表而非错误。
+	BlocksPage(from, count int) (BlocksPageResult, error)
+	// BlockJSONByHash 按区块哈希（32 字节）返回区块的 Explorer JSON 视图。
+	// 复用 blockchain.BlockByHash（canonical 链 → store fallback）；
+	// 未命中返回 ErrBlockNotFound（由 HTTP 层映射为 404）。
+	BlockJSONByHash(hash [32]byte) (BlockJSON, error)
 	// Mine 按需立即挖出 count 个区块（测试网/开发用，对标 bitcoind 的 generatetoaddress）。
 	// 若节点正在持续挖矿（-mine）则返回错误，避免两个挖矿路径互相干扰。
 	Mine(count int) (MineResponse, error)
@@ -129,6 +145,68 @@ type MineResponse struct {
 	Height int `json:"height"`
 }
 
+// MaxBlocksPerPage GET /blocks 单次请求的区块数上限（PHASE EXPLORER-API-IMPLEMENTATION-1 冻结预算）。
+const MaxBlocksPerPage = 100
+
+// TxJSON Explorer 交易摘要。
+//
+// 字段全部来自 transaction.Transaction 真实结构，无虚构：
+// TxID = serializeForHash 的 SHA-256；coinbase 由 IsCoinbase() 判定；
+// total_out = Σoutputs.Value。
+//
+// Fee 仅在可**零成本诚实计算**时出现（coinbase 恒为 0）：普通交易的输入金额
+// 需要历史输出索引（被花费的输出已不在当前 UTXO 快照中，当前无该索引，
+// 属设计审计登记的 Tier 2 能力）→ 省略该字段，绝不伪装成 0。
+type TxJSON struct {
+	TxID        string `json:"txid"`
+	Coinbase    bool   `json:"coinbase"`
+	InputCount  int    `json:"input_count"`
+	OutputCount int    `json:"output_count"`
+	TotalOut    uint64 `json:"total_out"`
+	Fee         *int64 `json:"fee,omitempty"`
+}
+
+// BlockJSON 单个区块的 Explorer JSON 视图。
+//
+// 字段全部来自 block.Header / block.Block / 派生量（设计审计 §5 冻结契约）：
+// hash = SerializeHeader 的双 SHA-256；difficulty = 2^(Bits-MaxTargetBits)（纯展示）；
+// size = len(Encode())；consensus_era 按硬分叉激活高度标注（纯展示，不改共识）。
+//
+// Height 仅在真实可知时出现：canonical 块高度可得；detached 块无公开高度
+// 来源（新增高度索引需触碰 blockchain 边界，本阶段禁止）→ 省略。
+type BlockJSON struct {
+	Height       *int     `json:"height,omitempty"`
+	Hash         string   `json:"hash"`
+	PreviousHash string   `json:"previous_hash"`
+	Timestamp    int64    `json:"timestamp"`
+	Version      uint32   `json:"version"`
+	Bits         uint32   `json:"bits"`
+	Difficulty   float64  `json:"difficulty"`
+	Nonce        uint64   `json:"nonce"`
+	MerkleRoot   string   `json:"merkle_root"`
+	Size         int      `json:"size"`
+	TxCount      int      `json:"tx_count"`
+	Canonical    bool     `json:"canonical"`
+	Persisted    bool     `json:"persisted"`
+	Transactions []TxJSON `json:"transactions"`
+	// ConsensusEra "pre-hardfork"（height < 激活高度）或 "post-hardfork"。
+	ConsensusEra string `json:"consensus_era"`
+}
+
+// BlocksPageResult GET /blocks 响应。
+//
+// blocks 按**高度升序**（链序）返回；latest-first 分页语义由调用方以
+// from = max(0, 链尾高度-页大小+1) 表达（设计审计 §6 冻结的页面语义）。
+// at_tip = 本次返回区间已到达链尾（from 超过链尾时同样为 true，blocks 为空）。
+type BlocksPageResult struct {
+	From      int         `json:"from"`
+	Requested int         `json:"requested"`
+	Returned  int         `json:"returned"`
+	AtTip     bool        `json:"at_tip"`
+	Height    int         `json:"height"` // 查询时刻的链尾高度（供分页计算）
+	Blocks    []BlockJSON `json:"blocks"`
+}
+
 // errorResponse 统一错误体。
 type errorResponse struct {
 	Error string `json:"error"`
@@ -167,6 +245,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/send", s.handleSend)
 	mux.HandleFunc("/mine", s.handleMine)
 	mux.HandleFunc("/block", s.handleBlock)
+	mux.HandleFunc("/blocks", s.handleBlocks)
 	mux.HandleFunc("/logs", s.handleLogs)
 	mux.HandleFunc("/stop", s.handleStop)
 	// 根路径提供本机 Developer Console 页面（单页、零外部资源）。
@@ -311,6 +390,39 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
+	// PHASE EXPLORER-API-IMPLEMENTATION-1：新增 hash= 查询路径（与 height= 互斥）。
+	// 既有 height= → hex 编码契约保持逐字节不变（回归由既有测试保证）。
+	hashRaw := r.URL.Query().Get("hash")
+	if hashRaw != "" {
+		if r.URL.Query().Get("height") != "" {
+			writeError(w, http.StatusBadRequest, ErrAmbiguousBlockQuery)
+			return
+		}
+		// 严格遵循现有编码规范：64 个十六进制字符 = 32 字节区块哈希。
+		if len(hashRaw) != 64 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("hash 长度非法: 需要 64 个十六进制字符，实际 %d", len(hashRaw)))
+			return
+		}
+		hashBytes, err := hex.DecodeString(hashRaw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("hash 非法十六进制: %w", err))
+			return
+		}
+		var hash [32]byte
+		copy(hash[:], hashBytes)
+		bj, err := s.node.BlockJSONByHash(hash)
+		if err != nil {
+			if errors.Is(err, ErrBlockNotFound) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, bj)
+		return
+	}
+
 	raw := r.URL.Query().Get("height")
 	height, err := strconv.Atoi(raw)
 	if err != nil {
@@ -323,6 +435,44 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"height": height, "encoded": encoded})
+}
+
+// handleBlocks 处理 GET /blocks?from=&count=（PHASE EXPLORER-API-IMPLEMENTATION-1）。
+//
+// 契约（授权 §4 冻结）：
+//   - from/count 均为必填整数；from < 0、count 不在 1..MaxBlocksPerPage → 400；
+//   - from 超过链尾 = 合法空区间 → 200 + 空 blocks 列表（不是 500）；
+//   - 仅返回 canonical 主链区块（由 Node 实现经 blockchain.BlocksFrom 保证，
+//     detached 块绝不混入）；
+//   - 一次 Node 调用一次临界区完成批量读取，禁止 N 次 /block 分页。
+func (s *Server) handleBlocks(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	from, err := strconv.Atoi(r.URL.Query().Get("from"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("from 参数非法: %q", r.URL.Query().Get("from")))
+		return
+	}
+	if from < 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("from 不能为负，实际 %d", from))
+		return
+	}
+	count, err := strconv.Atoi(r.URL.Query().Get("count"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("count 参数非法: %q", r.URL.Query().Get("count")))
+		return
+	}
+	if count < 1 || count > MaxBlocksPerPage {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("count 必须在 1..%d 之间，实际 %d", MaxBlocksPerPage, count))
+		return
+	}
+	page, err := s.node.BlocksPage(from, count)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) handleMine(w http.ResponseWriter, r *http.Request) {

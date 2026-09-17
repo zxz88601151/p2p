@@ -14,6 +14,7 @@ import (
 	"math"
 	"sort"
 
+	"p2pchain/internal/block"
 	"p2pchain/internal/control"
 	"p2pchain/internal/pow"
 	"p2pchain/internal/txbuild"
@@ -162,6 +163,125 @@ func (s *nodeService) BlockHex(height int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b.Encode()), nil
+}
+
+// BlocksPage 实现 control.Node.BlocksPage（PHASE EXPLORER-API-IMPLEMENTATION-1）。
+//
+// 数据路径：**单次** blockchain.BlocksFrom(from,count) 完成 canonical 主链批量
+// 读取（该方法本就是 P2P 同步用的公开分页原语，天然只含 canonical 链），
+// 随后在 nodeapi 侧做纯展示派生（hash/难度/体积/交易摘要），零新增内部扫描、
+// 零存储触碰、零锁策略改动。
+//
+// canonical 块的 height 直接来自 BlocksFrom 的索引位置；persisted 恒为 true：
+// 内存 canonical 链完全源自 blocks.dat 回放/appendFrames 提交（blocks.dat 唯一真值）。
+func (s *nodeService) BlocksPage(from, count int) (control.BlocksPageResult, error) {
+	blocks, atTip := s.chain.BlocksFrom(from, count)
+	out := make([]control.BlockJSON, 0, len(blocks))
+	for i, b := range blocks {
+		h := from + i
+		out = append(out, blockToExplorerJSON(b, &h, true))
+	}
+	return control.BlocksPageResult{
+		From:      from,
+		Requested: count,
+		Returned:  len(out),
+		AtTip:     atTip,
+		Height:    s.chain.Height(),
+		Blocks:    out,
+	}, nil
+}
+
+// BlockJSONByHash 实现 control.Node.BlockJSONByHash（PHASE EXPLORER-API-IMPLEMENTATION-1）。
+//
+// 数据路径：复用既有 blockchain.BlockByHash（canonical 内存链 → store fallback，
+// detached 命中走既有机制，零新扫描算法）+ IsCanonicalHash 判定展示标签。
+//
+// canonical 块的高度解析：经**单次**公开 BlocksFrom(0, 链高+1) 取回整链指针
+// 切片后在 nodeapi 侧匹配（一次临界区；与既有 by-hash 公开路径同为 O(h) 量级，
+// 不引入任何 blockchain 内部新路径）。detached 块无公开高度来源 → Height 省略。
+func (s *nodeService) BlockJSONByHash(hash [32]byte) (control.BlockJSON, error) {
+	b, ok := s.chain.BlockByHash(hash)
+	if !ok {
+		return control.BlockJSON{}, control.ErrBlockNotFound
+	}
+	canonical := s.chain.IsCanonicalHash(hash)
+	var height *int
+	if canonical {
+		if h, found := s.canonicalHeightOf(hash); found {
+			height = &h
+		}
+	}
+	return blockToExplorerJSON(b, height, canonical), nil
+}
+
+// canonicalHeightOf 在 canonical 链上解析区块高度（单次公开 BlocksFrom 读，nodeapi 侧匹配）。
+func (s *nodeService) canonicalHeightOf(hash [32]byte) (int, bool) {
+	tip := s.chain.Height()
+	if tip < 0 {
+		return 0, false
+	}
+	blocks, _ := s.chain.BlocksFrom(0, tip+1)
+	for i, b := range blocks {
+		if b.Header.Hash() == hash {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// blockToExplorerJSON 把 *block.Block 派生为 Explorer JSON 视图（纯展示，无共识参与）。
+//
+// height 为 nil 时（detached 块）省略字段；canonical=false 的块经 by-hash 命中，
+// 必然已落盘（store fallback 命中即落盘证据）→ persisted 恒为 true。
+// fee 仅对 coinbase 诚实给出 0；普通交易无历史输出索引 → 省略（见 control.TxJSON 注释）。
+func blockToExplorerJSON(b *block.Block, height *int, canonical bool) control.BlockJSON {
+	txs := make([]control.TxJSON, 0, len(b.Transactions))
+	for _, tx := range b.Transactions {
+		var totalOut uint64
+		for _, o := range tx.Outputs {
+			totalOut += o.Value
+		}
+		tj := control.TxJSON{
+			TxID:        tx.HashHex(),
+			Coinbase:    tx.IsCoinbase(),
+			InputCount:  len(tx.Inputs),
+			OutputCount: len(tx.Outputs),
+			TotalOut:    totalOut,
+		}
+		if tj.Coinbase {
+			zero := int64(0)
+			tj.Fee = &zero
+		}
+		txs = append(txs, tj)
+	}
+
+	era := "pre-hardfork"
+	if height != nil && *height >= pow.ActivationHeight {
+		era = "post-hardfork"
+	} else if height == nil {
+		// 高度未知（detached）：era 无法从高度判定 → 不猜，按 pre-hardfork 之外
+		// 的第三态不引入新枚举，保守省略判据（见实施报告 known limitations）。
+		era = "unknown"
+	}
+
+	bj := control.BlockJSON{
+		Hash:         b.Header.HashHex(),
+		PreviousHash: hex.EncodeToString(b.Header.PrevBlockHash[:]),
+		Timestamp:    b.Header.Timestamp,
+		Version:      b.Header.Version,
+		Bits:         b.Header.Bits,
+		Difficulty:   relativeDifficulty(b.Header.Bits),
+		Nonce:        b.Header.Nonce,
+		MerkleRoot:   hex.EncodeToString(b.Header.MerkleRoot[:]),
+		Size:         b.Size(),
+		TxCount:      len(b.Transactions),
+		Canonical:    canonical,
+		Persisted:    true,
+		Transactions: txs,
+		ConsensusEra: era,
+	}
+	bj.Height = height
+	return bj
 }
 
 // Mine 按需立即挖出 count 个区块（测试网/开发便利功能）。

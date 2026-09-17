@@ -13,23 +13,30 @@ import (
 // fakeNode 是 control.Node 的测试替身：仅验证协议层行为，
 // 不代表真实共识逻辑（真实实现的端到端测试在 cmd/node）。
 type fakeNode struct {
-	status   control.StatusInfo
-	balance  control.BalanceInfo
-	utxos    []control.UTXOInfo
-	sendResp control.SendResponse
-	blockHex string
-	mineResp control.MineResponse
+	status    control.StatusInfo
+	balance   control.BalanceInfo
+	utxos     []control.UTXOInfo
+	sendResp  control.SendResponse
+	blockHex  string
+	mineResp  control.MineResponse
+	blocks    control.BlocksPageResult
+	blockJSON control.BlockJSON
 
-	balanceErr error
-	sendErr    error
-	blockErr   error
-	mineErr    error
+	balanceErr   error
+	sendErr      error
+	blockErr     error
+	mineErr      error
+	blocksErr    error
+	blockJSONErr error
 
 	lastAddress string
 	lastTo      string
 	lastAmount  uint64
 	lastFee     uint64
 	lastMineN   int
+	lastFrom    int
+	lastCount   int
+	lastHash    [32]byte
 }
 
 func (f *fakeNode) Status() (control.StatusInfo, error) { return f.status, nil }
@@ -74,6 +81,22 @@ func (f *fakeNode) Mine(count int) (control.MineResponse, error) {
 		r.Mined = count
 	}
 	return r, nil
+}
+
+func (f *fakeNode) BlocksPage(from, count int) (control.BlocksPageResult, error) {
+	f.lastFrom, f.lastCount = from, count
+	if f.blocksErr != nil {
+		return control.BlocksPageResult{}, f.blocksErr
+	}
+	return f.blocks, nil
+}
+
+func (f *fakeNode) BlockJSONByHash(hash [32]byte) (control.BlockJSON, error) {
+	f.lastHash = hash
+	if f.blockJSONErr != nil {
+		return control.BlockJSON{}, f.blockJSONErr
+	}
+	return f.blockJSON, nil
 }
 
 func newTestPair(t *testing.T, node control.Node) (*control.Client, *httptest.Server) {
