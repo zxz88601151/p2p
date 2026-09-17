@@ -332,3 +332,24 @@ func sortUTXOs(list []control.UTXOInfo) {
 		return list[i].OutPoint < list[j].OutPoint
 	})
 }
+
+// StartMining 启动持续挖矿（PHASE MINING-LIFECYCLE-1，控制面 POST /mine/start 后端）。
+//
+// 单飞与状态冲突语义由 minerLifecycle.start 保证（CAS + FAILED 终态 gate）；
+// 冲突以 *control.MineConflictError 返回（HTTP 409），响应 state 为受理瞬间状态，
+// 最终状态以 GET /status 为准（runtime 是唯一事实源）。
+func (s *nodeService) StartMining() (control.MineStartResponse, error) {
+	if err := s.minerLife.Load().start(0); err != nil {
+		return control.MineStartResponse{}, err
+	}
+	st, _ := s.miningStateSnapshot()
+	return control.MineStartResponse{Accepted: true, State: string(st), Height: s.chain.Height()}, nil
+}
+
+// StopMining 仅停止挖矿（停挖 ≠ 停节点）：节点 / P2P / RPC / Explorer 全部存活。
+// 幂等：从未启动、已停止、重复 STOP 均成功；FAILED 状态保持不变（证据保留）。
+func (s *nodeService) StopMining() (control.MineStopResponse, error) {
+	s.minerLife.Load().stop()
+	st, _ := s.miningStateSnapshot()
+	return control.MineStopResponse{Accepted: true, State: string(st)}, nil
+}

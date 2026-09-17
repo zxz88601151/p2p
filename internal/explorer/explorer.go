@@ -9,13 +9,18 @@
 //     直接访问）。
 //
 // F-1 边界（PHASE EXPLORER-F1-REMEDIATION-DESIGN 冻结 / OPTION A + P1 + GET-only）：
-//   - Explorer 不提供通用 /api/* 反向代理。未命中 readOnlyRoutes 的 /api/*
-//     请求（含 /mine /send /stop /console 与 /balance /utxos /logs 等）
-//     一律由 Explorer 本地拒绝，【上游零接触】（upstreamHits == 0）。
+//   - Explorer 不提供通用 /api/* 反向代理。未命中 readOnlyRoutes 与
+//     mutationRoutes 的 /api/* 请求（含 /send /stop /console 与 /balance
+//     /utxos /logs 等）一律由 Explorer 本地拒绝，【上游零接触】（upstreamHits == 0）。
 //   - Explorer API 数据面为 GET-only（冻结决策 D-HEAD：不提供 HEAD 能力）。
 //     错误方法在 Explorer 边缘被拒，不依赖上游 control 的 requireMethod 守卫。
-//   - Node 控制面本身（127.0.0.1:17881）仍然存在且无鉴权，其加固为独立项
-//     F-2（OPEN）。本包不涉及、不得据此宣称控制面已安全或 MODE B 就绪。
+//   - Node 控制面本身（127.0.0.1:17881）的鉴权已于 PHASE CONTROL-AUTH-1 落地
+//     （mutation 端点 Bearer Token）。LAN/公网暴露仍为独立项 F-2（OPEN）。
+//
+// PHASE MINING-LIFECYCLE-1（方案 A 冻结）：新增 mutationRoutes 白名单——
+// 仅 POST /api/mine/start、/api/mine/stop 两条；token 只存在于 Explorer
+// 进程内（-token-file 读入），转发时在服务端注入 Authorization，浏览器
+// 零接触（禁止 JS/localStorage/URL/HTML/cookie 任何通道）。
 //
 // 本包不 import blockchain/storage/wallet 等核心包——Explorer 与链核心
 // 完全隔离（PHASE EXPLORER-UI-READINESS-AUDIT §4 DATA SOURCE MATRIX 冻结）。
@@ -34,7 +39,7 @@ import (
 //go:embed ui
 var uiFS embed.FS
 
-// readOnlyRoutes 是 Explorer 允许代理的唯一上游映射（冻结白名单）。
+// readOnlyRoutes 是 Explorer 允许代理的只读上游映射（冻结白名单）。
 // key = Explorer 暴露的路径；value = 上游 control 路径。
 // 新增条目 = 显式扩大 Explorer 攻击面，必须走独立安全授权。
 var readOnlyRoutes = map[string]string{
@@ -43,13 +48,27 @@ var readOnlyRoutes = map[string]string{
 	"/api/block":  "/block",
 }
 
+// mutationRoutes 是 Explorer 允许代理的 mutation 上游映射（PHASE
+// MINING-LIFECYCLE-1 方案 A 冻结白名单）。**仅此两条**：/send（价值转移）、
+// /stop（节点停机）、/console 等一律不在表内 ⇒ 本地 404，上游零接触。
+// 新增条目 = 显式扩大 Explorer 攻击面，必须走独立安全授权。
+var mutationRoutes = map[string]string{
+	"/api/mine/start": "/mine/start",
+	"/api/mine/stop":  "/mine/stop",
+}
+
 // NewHandler 返回 Explorer 完整 HTTP handler：
 //   - GET /api/status、/api/blocks、/api/block → 反向代理到 controlAddr
 //     （前缀语义由白名单显式给出，不再做通用前缀变换）；
+//   - POST /api/mine/start、/api/mine/stop → 服务端注入 Bearer token 后代理
+//     （token=="" 时 fail-closed：本地 503，不发上游请求）；
 //   - 其余 /api/*（任何方法：控制端点、敏感读、未知路径）→ Explorer 本地拒绝，
 //     不产生任何上游请求（F-1 上游零接触不变量）；
 //   - 其余路径 → 静态 UI（SPA 使用 hash 路由，统一回落到 index.html）。
-func NewHandler(controlAddr string) (http.Handler, error) {
+//
+// mutationToken 为上游 mutation 端点的 Bearer Token：只存在于本进程内存，
+// 永不出现在任何响应体 / URL / 日志中（方案 A 冻结红线）。
+func NewHandler(controlAddr, mutationToken string) (http.Handler, error) {
 	target, err := url.Parse(controlAddr)
 	if err != nil {
 		return nil, err
@@ -69,15 +88,32 @@ func NewHandler(controlAddr string) (http.Handler, error) {
 		writeLocalError(w, http.StatusBadGateway, "explorer upstream unavailable")
 	}
 
+	// mutation 代理：独立 Director（查 mutationRoutes 表 + 服务端 token 注入）。
+	mutProxy := httputil.NewSingleHostReverseProxy(target)
+	mutOrigDirector := mutProxy.Director
+	mutProxy.Director = func(req *http.Request) {
+		upstream := mutationRoutes[req.URL.Path]
+		mutOrigDirector(req)
+		req.URL.Path = upstream
+		req.Host = target.Host
+		// 方案 A 核心：Authorization 在【服务端】注入。浏览器请求必须不含
+		// token——Explorer 不读取请求中的任何凭据，注入值只来自 -token-file。
+		req.Header.Set("Authorization", "Bearer "+mutationToken)
+	}
+	mutProxy.ErrorHandler = proxy.ErrorHandler
+
 	mux := http.NewServeMux()
 	for exposed := range readOnlyRoutes {
 		mux.Handle(exposed, methodGate(proxy))
 	}
+	for exposed := range mutationRoutes {
+		mux.Handle(exposed, mutationGate(mutProxy, mutationToken))
+	}
 	// 白名单之外的 /api/* → 本地 404，上游零接触。
 	// 注意：这些路径【未注册】精确模式，因此任何方法（含 GET）都是 404；
-	// 405 + Allow: GET 只出现在三条已注册读路径收到错误方法时。
+	// 405 + Allow: GET/POST 只出现在已注册路径收到错误方法时。
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		writeLocalError(w, http.StatusNotFound, "endpoint 不在 Explorer 只读白名单内")
+		writeLocalError(w, http.StatusNotFound, "endpoint 不在 Explorer 白名单内")
 	})
 	mux.Handle("/", staticHandler())
 	return mux, nil
@@ -90,6 +126,43 @@ func methodGate(next http.Handler) http.Handler {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
 			writeLocalError(w, http.StatusMethodNotAllowed, "Explorer 只读接口仅允许 GET 方法")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// mutationGate 在 Explorer 边缘收紧 mutation 通道（PHASE MINING-LIFECYCLE-1，
+// 方案 A 冻结）。逐层守卫，任一层不过即本地拒绝、上游零接触：
+//
+//  1. fail-closed：token 未配置（只读模式）→ 503，绝不转发；
+//  2. 方法：仅 POST → 405 + Allow: POST；
+//  3. Origin：请求携带 Origin 头时必须是本源（http(s)://<Host>）→ 否则 403。
+//     浏览器对 POST 恒发 Origin（含同源），跨站表单/no-cors fetch 因此被拦；
+//     无 Origin 头 = 非浏览器客户端（curl/脚本），放行（运维兼容）；
+//  4. Content-Type：必须 application/json（含 charset 后缀）→ 否则 403。
+//     简单表单（x-www-form-urlencoded / text/plain）因此无法触达 mutation。
+//
+// 通过后由 mutProxy.Director 注入 Authorization 并转发。
+func mutationGate(next http.Handler, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			writeLocalError(w, http.StatusServiceUnavailable, "mutation 未配置凭据（只读模式，fail-closed）")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeLocalError(w, http.StatusMethodNotAllowed, "mutation 接口仅允许 POST 方法")
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if origin != "http://"+r.Host && origin != "https://"+r.Host {
+				writeLocalError(w, http.StatusForbidden, "origin 不被允许")
+				return
+			}
+		}
+		if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			writeLocalError(w, http.StatusForbidden, "mutation 请求必须使用 application/json")
 			return
 		}
 		next.ServeHTTP(w, r)

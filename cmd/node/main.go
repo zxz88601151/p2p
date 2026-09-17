@@ -390,21 +390,27 @@ func startNode(args []string, openConsole bool) {
 	defer signal.Stop(sigCh)
 
 	if nf.mine {
-		// P2 修复（PHASE P2-SIGTERM-REMEDIATION-1/2）：挖矿路径下 main goroutine
-		// 被 runMiner 同步占用，sigCh 原先无人消费——SIGTERM/SIGINT 被 Notify 捕获
-		// 后缓冲进通道即被静默吞掉，进程永不退出（Linux 实证）。
-		// 该桥接 goroutine 把信号转译为既有 requestStop()，与 `node stop` 汇聚到
-		// 同一个 stopCh 单出口；stopOnce 保证幂等，不产生第二套 shutdown 状态机。
-		// runMiner 返回后本 goroutine 经 stopCh case 返回，无泄漏（进程生命周期内）。
-		go func() {
-			select {
-			case <-sigCh:
-				log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
-				requestStop()
-			case <-stopCh:
-			}
-		}()
-		runMiner(rt.svc, nf.maxBlocks, stopCh)
+		// PHASE MINING-LIFECYCLE-1：-mine boot 语义不变（按既有 flag 拉起持续挖矿），
+		// 但挖矿 goroutine 的停止源改为生命周期管理器的 minerStopCh（与 node stopCh
+		// 分离；节点停机时 main 在 rt.Close() 前先停挖并等待退出——「先 minerStop
+		// 后既有关闭链」的冻结次序）。挖矿改后台运行后，主 goroutine 与全节点路径
+		// 共用同一 shutdown 等待；原信号桥接 goroutine 不再需要（主 select 直接
+		// 消费 sigCh，P2-SIGTERM 修复语义保持：信号必然触发关闭）。
+		if err := rt.svc.minerLife.Load().start(nf.maxBlocks); err != nil {
+			// boot 时状态恒为 STOPPED，此处仅防御性分支（理论上不可达）。
+			log.Printf("[node] 启动挖矿失败: %v", err)
+			return
+		}
+		select {
+		case <-sigCh:
+			log.Printf("[node] 收到退出信号，正在关闭（释放数据目录锁）...")
+		case <-stopCh:
+			log.Printf("[node] 收到停止请求，正在关闭（释放数据目录锁）...")
+		}
+		// 先停挖并等待挖矿 goroutine 退出，再由最外层 defer 执行 rt.Close()
+		// （store 关闭不与在途 AddBlock 并发，STOP-INV-05；在途块自然完成——
+		// MINING-LIFECYCLE 设计冻结 §10 语义）。
+		rt.svc.minerLife.Load().beginShutdown()
 		log.Printf("[node] 正在关闭（释放数据目录锁）...")
 		return
 	}
@@ -415,6 +421,10 @@ func startNode(args []string, openConsole bool) {
 	case <-stopCh:
 		log.Printf("[node] 收到停止请求，正在关闭（释放数据目录锁）...")
 	}
+	// PHASE MINING-LIFECYCLE-1：runtime START 的挖矿循环可能仍在后台运行
+	// （控制面 POST /mine/start）。停机关闭链开始前同样先停挖并等待退出，
+	// 保证 rt.Close() 与 AddBlock 互斥（STOP-INV-05）。幂等：未挖矿时为零开销。
+	rt.svc.minerLife.Load().beginShutdown()
 	// 落到这里后由最外层 defer 执行 rt.Close()：
 	// 控制接口 → P2P → 区块存储 → 数据目录锁，顺序固定且幂等。
 }

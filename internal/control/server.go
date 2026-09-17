@@ -67,6 +67,13 @@ type Node interface {
 	// Mine 按需立即挖出 count 个区块（测试网/开发用，对标 bitcoind 的 generatetoaddress）。
 	// 若节点正在持续挖矿（-mine）则返回错误，避免两个挖矿路径互相干扰。
 	Mine(count int) (MineResponse, error)
+	// StartMining 启动持续挖矿（PHASE MINING-LIFECYCLE-1，设计冻结）。
+	// 单飞语义：同一时间最多一个 miner instance；重复/并发 START 返回
+	// *MineConflictError（HTTP 409），无副作用；FAILED 状态拒绝且不自动清除。
+	StartMining() (MineStartResponse, error)
+	// StopMining 仅停止挖矿（停挖 ≠ 停节点）：节点/P2P/RPC/Explorer 全部存活。
+	// 幂等：从未启动、已停止、重复 STOP 均成功返回；绝不触碰 node stopCh。
+	StopMining() (MineStopResponse, error)
 }
 
 // StatusInfo 节点状态。
@@ -153,6 +160,29 @@ type MineResponse struct {
 	Mined  int `json:"mined"`
 	Height int `json:"height"`
 }
+
+// MineStartResponse POST /mine/start 的结果（PHASE MINING-LIFECYCLE-1，设计冻结契约）。
+type MineStartResponse struct {
+	Accepted bool   `json:"accepted"`
+	State    string `json:"state"`
+	Height   int    `json:"height"`
+}
+
+// MineStopResponse POST /mine/stop 的结果。STOP 幂等：重复/空闲时 Accepted 仍为
+// true，State 返回真实 runtime 状态（STOPPING / STOPPED / FAILED）。
+type MineStopResponse struct {
+	Accepted bool   `json:"accepted"`
+	State    string `json:"state"`
+}
+
+// MineConflictError 表示 START/STOP 与当前 mining lifecycle 状态冲突（HTTP 409）。
+// State 携带当前 runtime 状态，供响应体 {"error","state"} 使用。
+type MineConflictError struct {
+	Message string
+	State   string
+}
+
+func (e *MineConflictError) Error() string { return e.Message }
 
 // MaxBlocksPerPage GET /blocks 单次请求的区块数上限（PHASE EXPLORER-API-IMPLEMENTATION-1 冻结预算）。
 const MaxBlocksPerPage = 100
@@ -293,6 +323,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/utxos", s.handleUTXOs)
 	mux.HandleFunc("/send", s.requireAuth(s.handleSend))
 	mux.HandleFunc("/mine", s.requireAuth(s.handleMine))
+	// PHASE MINING-LIFECYCLE-1：持续挖矿生命周期控制（设计冻结契约）。
+	// /mine/start 与 /mine/stop 仅影响挖矿循环（独立 minerStop 通道），
+	// 绝不触碰节点停机路径（/stop 语义保持不变）。
+	mux.HandleFunc("/mine/start", s.requireAuth(s.handleMineStart))
+	mux.HandleFunc("/mine/stop", s.requireAuth(s.handleMineStop))
 	mux.HandleFunc("/block", s.handleBlock)
 	mux.HandleFunc("/blocks", s.handleBlocks)
 	mux.HandleFunc("/logs", s.handleLogs)
@@ -551,6 +586,55 @@ func (s *Server) handleMine(w http.ResponseWriter, r *http.Request) {
 
 // MaxMineCount 单次按需出块的上限，避免一次请求长时间占用节点。
 const MaxMineCount = 1000
+
+// handleMineStart 启动持续挖矿（PHASE MINING-LIFECYCLE-1，设计冻结契约）。
+//
+// 契约：body 可省略或 {}（DisallowUnknownFields，未知字段 400——保留扩展位但不静默吞错）；
+// 200 {"accepted","state","height"}；409 {"error","state"}（已在跑/FAILED/STOPPING，
+// reject-duplicate 语义，无副作用）；401 认证失败（requireAuth）；405 非 POST。
+// 状态以 runtime 为唯一事实源：响应只反映受理瞬间状态，最终状态以 GET /status 为准。
+func (s *Server) handleMineStart(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	if r.Body != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12))
+		dec.DisallowUnknownFields()
+		var req struct{}
+		if err := dec.Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败（仅接受空体或 {}）: %w", err))
+			return
+		}
+	}
+	resp, err := s.node.StartMining()
+	if err != nil {
+		var cf *MineConflictError
+		if errors.As(err, &cf) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": cf.Message, "state": cf.State})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleMineStop 仅停止挖矿，绝不停节点（PHASE MINING-LIFECYCLE-1，设计冻结契约）。
+//
+// 幂等：从未启动 / 已停止 / 重复 STOP 一律 200 Accepted=true，State 返回真实
+// runtime 状态；FAILED 状态下无可停 miner，保持 FAILED（不抹掉失败证据）。
+// 响应返回受理状态（STOPPING），最终 STOPPED 由挖矿循环收尾后经 /status 可见。
+func (s *Server) handleMineStop(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	resp, err := s.node.StopMining()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
 
 // handleStop 请求节点优雅停止（PHASE PRODUCT-DEV-1B）。
 //

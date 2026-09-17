@@ -22,6 +22,7 @@ import (
 	"p2pchain/internal/block"
 	"p2pchain/internal/blockchain"
 	"p2pchain/internal/mempool"
+	"p2pchain/internal/obs"
 	"p2pchain/internal/p2p"
 	"p2pchain/internal/transaction"
 	"p2pchain/internal/wallet"
@@ -86,6 +87,10 @@ type nodeService struct {
 	// 分支补齐后由 resumeSync 恢复下一批 GetBlocks，避免 syncing 永久卡死。
 	syncResume string
 
+	// obsReqIDs 是纯观测辅助映射（I0）：hash → 最近一次在途请求的 request_id。
+	// 只被观测代码读写，绝不参与任何业务分支判断；删除条目时一并清理。
+	obsReqIDs map[[32]byte]uint64
+
 	// ---- 观测计数器（诊断与测试证据，不参与共识）----
 	branchReqSent  atomic.Int64 // 已发出的 by-hash 请求数
 	branchRespRecv atomic.Int64 // 收到的 by-hash 响应数
@@ -129,6 +134,11 @@ type nodeService struct {
 	// 保证任一时刻只有一个候选区块在被求解。
 	mineMu sync.Mutex
 
+	// minerLife 是持续挖矿生命周期管理器（PHASE MINING-LIFECYCLE-1）。
+	// 持有与 node stopCh 完全分离的 minerStop 通道；构造时即创建，
+	// 之后只读（atomic.Pointer 保证 StartMining/StopMining 的无锁安全读取）。
+	minerLife atomic.Pointer[minerLifecycle]
+
 	// miners 是并行挖矿的 worker 数（<=1 表示单线程，结果确定）。
 	miners int
 }
@@ -142,10 +152,14 @@ func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *
 		inflight:   make(map[[32]byte]time.Time),
 		waiting:    make(map[[32]byte][]*block.Block),
 		rounds:     make(map[[32]byte]int),
+		obsReqIDs:  make(map[[32]byte]uint64),
 	}
 	// atomic.Value 必须先 Store 再 Load，否则 Load 返回 nil 接口导致类型断言 panic。
 	s.mineState.Store(miningState(MiningStopped))
 	s.mineReason.Store("init")
+	// PHASE MINING-LIFECYCLE-1：生命周期管理器随服务创建（惰性使用；
+	// 未 START 前完全不活动）。构造即挂载 ⇒ StartMining/StopMining 无 nil 分支。
+	s.minerLife.Store(newMinerLifecycle(s))
 	return s
 }
 
@@ -252,6 +266,16 @@ func shortHash(s string) string {
 	return s[:8]
 }
 
+// hashHex32 观测专用：把 32 字节哈希编码为完整十六进制（事件字段用）。
+func hashHex32(h [32]byte) string { return hex.EncodeToString(h[:]) }
+
+// waitingChildren 观测专用：返回当前等待该父哈希的孤儿块数（只读，不影响行为）。
+func (s *nodeService) waitingChildren(parent [32]byte) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.waiting[parent])
+}
+
 // OnNewBlock 收到区块广播：分叉块不再被就地丢弃（REORG-1H M1）。
 //
 // 三种结局：
@@ -285,6 +309,9 @@ func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 			b.Header.HashHex(), shortHash(hex.EncodeToString(b.Header.PrevBlockHash[:])))
 		return
 	case applied:
+		// I0/§7：父块经 OnNewBlock 到达 —— 此路径**没有** takeWaiting 级联（B-1 证据点）。
+		obs.Emit("WAITING_PARENT_RESCAN_TRIGGER", "parent", hashHex32(b.Header.Hash()),
+			"waiting_children", s.waitingChildren(b.Header.Hash()), "via", "on_new_block")
 		s.relayBlock(b, peerAddr)
 	}
 }
@@ -334,8 +361,12 @@ func (s *nodeService) OnGetBlocks(peerAddr string, payload p2p.GetBlocksPayload)
 	}
 	if err := s.net.SendTo(peerAddr, p2p.Message{Type: p2p.MsgBlocksResp, Payload: respPayload}); err != nil {
 		log.Printf("[node] 发送同步响应给 %s 失败: %v", peerAddr, err)
+		obs.Emit("SYNC_RESPONSE", "peer", peerAddr, "from_height", payload.FromHeight,
+			"block_count", len(blocks), "at_tip", atTip, "result", "send_failed")
 		return
 	}
+	obs.Emit("SYNC_RESPONSE", "peer", peerAddr, "from_height", payload.FromHeight,
+		"block_count", len(blocks), "at_tip", atTip, "result", "sent")
 	log.Printf("[node] 已响应同步请求: 对端=%s 起始高度=%d 返回=%d 个区块 到链尾=%v",
 		peerAddr, payload.FromHeight, len(blocks), atTip)
 }
@@ -348,23 +379,32 @@ func (s *nodeService) OnGetBlocks(peerAddr string, payload p2p.GetBlocksPayload)
 // 现在改为：非法块 → 终止本批并复位；缺父块 → 登记为孤儿并触发 by-hash 拉取，
 // 等分支补齐后由 resumeSync 继续拉下一批。
 func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayload) {
+	// I0/§6：批生命周期 —— 收到批（含 cursor_before）。
+	obs.Emit("SYNC_BATCH_RECEIVED", "peer", peerAddr, "batch_size", len(payload.EncodedBlocks),
+		"done", payload.Done, "cursor_before", s.chain.Height())
 	applied, deferred := 0, 0
 	for _, enc := range payload.EncodedBlocks {
 		rawBytes, err := hex.DecodeString(enc)
 		if err != nil {
 			log.Printf("[node] 同步区块编码非法: %v", err)
+			obs.Emit("SYNC_BATCH_DROPPED", "peer", peerAddr, "reason", "bad_encoding",
+				"applied_so_far", applied, "cursor_after", s.chain.Height())
 			s.endSync("")
 			return
 		}
 		b, err := block.DecodeBlock(rawBytes)
 		if err != nil {
 			log.Printf("[node] 同步区块解码失败: %v", err)
+			obs.Emit("SYNC_BATCH_DROPPED", "peer", peerAddr, "reason", "bad_decode",
+				"applied_so_far", applied, "cursor_after", s.chain.Height())
 			s.endSync("")
 			return
 		}
 		ok, orphan, err := s.ingestBlock(peerAddr, b)
 		if err != nil {
 			log.Printf("[node] 同步区块拒绝: %v", err)
+			obs.Emit("SYNC_BATCH_REJECTED", "peer", peerAddr, "block", b.Header.HashHex(),
+				"applied_so_far", applied, "cursor_after", s.chain.Height())
 			s.endSync("")
 			return
 		}
@@ -373,8 +413,14 @@ func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayloa
 			deferred++
 		case ok:
 			applied++
+			// I0/§7：父块经 OnBlocksResp 到达 —— 此路径**没有** takeWaiting 级联（B-1 证据点）。
+			obs.Emit("WAITING_PARENT_RESCAN_TRIGGER", "parent", hashHex32(b.Header.Hash()),
+				"waiting_children", s.waitingChildren(b.Header.Hash()), "via", "on_blocks_resp")
 		}
 	}
+	// I0/§6：批应用汇总（含 cursor_after 与 deferred 计数）。
+	obs.Emit("SYNC_BATCH_APPLIED", "peer", peerAddr, "applied", applied, "deferred", deferred,
+		"done", payload.Done, "cursor_after", s.chain.Height())
 	log.Printf("[node] 同步进度: 应用 %d 个区块，缺父待补 %d 个，本地高度=%d，对方已到链尾=%v",
 		applied, deferred, s.chain.Height(), payload.Done)
 
@@ -453,17 +499,27 @@ func (s *nodeService) ingestBlock(peerAddr string, b *block.Block) (applied bool
 // deferOrphan 登记一个缺父的孤儿区块，并向来源对端请求它缺的父块。
 func (s *nodeService) deferOrphan(peerAddr string, b *block.Block) {
 	parent := b.Header.PrevBlockHash
+	// I0/§3：ORPHAN_SEEN —— 孤儿高度在父未知时不可知，记 -1（UNKNOWN，禁止猜测）。
+	obs.Emit("ORPHAN_SEEN", "orphan", b.Header.HashHex(), "parent", hashHex32(parent),
+		"orphan_height", -1, "peer", peerAddr)
 
 	s.mu.Lock()
 	existing := len(s.waiting[parent])
 	if existing == 0 && len(s.waiting) >= maxWaitingBlocks {
 		s.mu.Unlock()
+		obs.Emit("RECOVERY_DROPPED", "orphan", b.Header.HashHex(), "parent", hashHex32(parent),
+			"reason", "waiting_limit", "waiting_total", len(s.waiting), "peer", peerAddr)
 		log.Printf("[node] 等待父块的孤儿区块已达上限 %d，丢弃 %s", maxWaitingBlocks, b.Header.HashHex())
 		return
 	}
 	s.waiting[parent] = append(s.waiting[parent], b)
 	s.mu.Unlock()
 
+	// I0/§3+§7：登记成功 → 具备恢复资格；同时记录 waiting-add 观测点。
+	obs.Emit("RECOVERY_ELIGIBLE", "orphan", b.Header.HashHex(), "parent", hashHex32(parent),
+		"waiting_children", existing+1, "peer", peerAddr)
+	obs.Emit("WAITING_PARENT_ADD", "parent", hashHex32(parent), "orphan", b.Header.HashHex(),
+		"waiting_children", existing+1, "via", "defer_orphan")
 	s.requestBranch(peerAddr, parent)
 }
 
@@ -476,15 +532,36 @@ func (s *nodeService) deferOrphan(peerAddr string, b *block.Block) {
 func (s *nodeService) requestBranch(peerAddr string, hash [32]byte) {
 	s.mu.Lock()
 	if len(s.inflight) >= maxInflightBranch {
+		n := len(s.inflight)
 		s.mu.Unlock()
+		// I0/§3+§4：撞在途上限被静默抑制（原实现无日志无事件——本事件是 173→64 的直接观测点）。
+		obs.Emit("RECOVERY_SUPPRESSED_LIMIT", "parent", hashHex32(hash), "request_id", uint64(0),
+			"inflight", n, "max_inflight", maxInflightBranch, "peer", peerAddr)
+		obs.Inc("recovery_suppressed_limit")
 		return
 	}
 	if t, ok := s.inflight[hash]; ok && time.Since(t) < branchReqTTL {
 		s.mu.Unlock()
+		// I0/§3+§4：TTL 窗口内去重抑制（幂等路径的显式观测）。
+		obs.Emit("RECOVERY_SUPPRESSED_INFLIGHT", "parent", hashHex32(hash), "request_id", uint64(0),
+			"age_s", time.Since(t).Seconds(), "peer", peerAddr)
+		obs.Inc("recovery_suppressed_inflight")
 		return // 已在途：幂等，不再发一次
 	}
+	if t, ok := s.inflight[hash]; ok {
+		// I0/§4：存在但已过 TTL —— 旧条目被覆盖重发（RECOVERY_TIMEOUT 语义观测点）。
+		obs.Emit("RECOVERY_TIMEOUT", "parent", hashHex32(hash), "request_id", uint64(0),
+			"age_s", time.Since(t).Seconds(), "peer", peerAddr)
+	}
+	reqID := obs.NextRequestID()
 	s.inflight[hash] = time.Now()
+	s.obsReqIDs[hash] = reqID
+	n := len(s.inflight)
 	s.mu.Unlock()
+
+	// I0/§4：inflight 生命周期 —— 创建（含 current/max）。
+	obs.Emit("INFLIGHT_CREATED", "request_id", reqID, "parent", hashHex32(hash),
+		"peer", peerAddr, "inflight", n, "max_inflight", maxInflightBranch)
 
 	payload, err := json.Marshal(p2p.GetBlockByHashPayload{
 		Hash:         hex.EncodeToString(hash[:]),
@@ -492,14 +569,25 @@ func (s *nodeService) requestBranch(peerAddr string, hash [32]byte) {
 	})
 	if err != nil {
 		log.Printf("[node] 构造 by-hash 请求失败: %v", err)
+		obs.Emit("INFLIGHT_CANCEL", "request_id", reqID, "parent", hashHex32(hash),
+			"peer", peerAddr, "reason", "marshal_failed")
+		s.clearInflight(hash)
 		return
 	}
 	if err := s.net.SendTo(peerAddr, p2p.Message{Type: p2p.MsgGetBlockByHash, Payload: payload}); err != nil {
 		log.Printf("[node] 发送 by-hash 请求给 %s 失败: %v", peerAddr, err)
+		obs.Emit("INFLIGHT_CANCEL", "request_id", reqID, "parent", hashHex32(hash),
+			"peer", peerAddr, "reason", "send_failed")
 		s.clearInflight(hash)
 		return
 	}
 	s.branchReqSent.Add(1)
+	// I0/§3+§4：请求真正发出（RECOVERY_REQUESTED / INFLIGHT_SENT）。
+	obs.Emit("INFLIGHT_SENT", "request_id", reqID, "parent", hashHex32(hash),
+		"peer", peerAddr, "inflight", n, "max_inflight", maxInflightBranch)
+	obs.Emit("RECOVERY_REQUESTED", "parent", hashHex32(hash), "request_id", reqID,
+		"peer", peerAddr, "max_ancestors", MaxBranchAncestors)
+	obs.Inc("recovery_requested")
 	log.Printf("[node] 已向 %s 请求分支区块 %s（最多回溯 %d 个祖先）",
 		peerAddr, shortHash(hex.EncodeToString(hash[:])), MaxBranchAncestors)
 }
@@ -548,6 +636,9 @@ func (s *nodeService) OnGetBlockByHash(peerAddr string, payload p2p.GetBlockByHa
 // 共识层「父必须先于子存在」的要求——**不依赖 map 迭代顺序**（BT-1 教训）。
 func (s *nodeService) OnBlockByHashResp(peerAddr string, payload p2p.BlockByHashRespPayload) {
 	s.branchRespRecv.Add(1)
+	// I0/§3：RECOVERY_RESPONSE —— 响应到达（Found=false 亦记录，不混入失败笼统口径）。
+	obs.Emit("RECOVERY_RESPONSE", "req_hash", payload.Hash, "block_count", len(payload.Blocks),
+		"found", payload.Found, "peer", peerAddr)
 
 	decoded := make([]*block.Block, 0, len(payload.Blocks))
 	for _, enc := range payload.Blocks {
@@ -567,6 +658,7 @@ func (s *nodeService) OnBlockByHashResp(peerAddr string, payload p2p.BlockByHash
 	reqHash, _ := parseHash32(payload.Hash)
 	if len(decoded) == 0 {
 		// 对端没有这块：清理在途，放弃（完整 orphan 重播策略属 B5）。
+		obs.Emit("RECOVERY_DROPPED", "req_hash", payload.Hash, "reason", "not_found", "peer", peerAddr)
 		s.clearInflight(reqHash)
 		log.Printf("[node] by-hash: 对端 %s 没有区块 %s，放弃该分支", peerAddr, shortHash(payload.Hash))
 		return
@@ -580,6 +672,9 @@ func (s *nodeService) OnBlockByHashResp(peerAddr string, payload p2p.BlockByHash
 			break
 		}
 	}
+	// I0/§7：挂载点扫描结果（找到 start 下标或整段挂不上）。
+	obs.Emit("WAITING_PARENT_SCAN", "req_hash", payload.Hash, "blocks_scanned", len(decoded),
+		"start_index", start, "via", "on_block_by_hash_resp")
 
 	if start < 0 {
 		// 整段都挂不上：缺口更深。继续回溯，但有轮次上限——
@@ -588,6 +683,8 @@ func (s *nodeService) OnBlockByHashResp(peerAddr string, payload p2p.BlockByHash
 		round := s.rounds[reqHash]
 		s.mu.Unlock()
 		if round >= maxBranchRounds {
+			obs.Emit("RECOVERY_DROPPED", "req_hash", payload.Hash, "reason", "rounds_limit",
+				"rounds", round, "peer", peerAddr)
 			s.clearInflight(reqHash)
 			log.Printf("[node] by-hash 回溯已达 %d 轮上限，放弃分支 %s", maxBranchRounds, shortHash(payload.Hash))
 			return
@@ -630,9 +727,17 @@ func (s *nodeService) applyResolved(peerAddr string, b *block.Block) {
 			continue
 		case applied:
 			s.branchApplied.Add(1)
+			// I0/§3+§7：级联路径应用成功 —— 这是唯一会 takeWaiting 重扫的父块来源。
+			obs.Emit("RECOVERY_APPLIED", "block", cur.Header.HashHex(),
+				"height", s.chain.Height(), "via", "on_block_by_hash_resp_cascade")
+			obs.Emit("WAITING_PARENT_APPLY", "parent", hashHex32(cur.Header.Hash()),
+				"via", "on_block_by_hash_resp_cascade")
 			s.relayBlock(cur, peerAddr)
 		}
-		queue = append(queue, s.takeWaiting(cur.Header.Hash())...)
+		kids := s.takeWaiting(cur.Header.Hash())
+		obs.Emit("WAITING_PARENT_MATCH", "parent", hashHex32(cur.Header.Hash()),
+			"children", len(kids), "via", "take_waiting_cascade")
+		queue = append(queue, kids...)
 	}
 }
 
@@ -648,8 +753,17 @@ func (s *nodeService) takeWaiting(parentHash [32]byte) []*block.Block {
 // clearInflight 清除一个哈希的在途请求标记（收到块或放弃后调用）。
 func (s *nodeService) clearInflight(hash [32]byte) {
 	s.mu.Lock()
+	_, existed := s.inflight[hash]
 	delete(s.inflight, hash)
+	reqID := s.obsReqIDs[hash]
+	delete(s.obsReqIDs, hash)
+	n := len(s.inflight)
 	s.mu.Unlock()
+	if existed {
+		// I0/§4：inflight 释放（释放原因由相邻的 RECOVERY_* 事件区分）。
+		obs.Emit("INFLIGHT_RELEASED", "request_id", reqID, "parent", hashHex32(hash),
+			"inflight", n, "max_inflight", maxInflightBranch)
+	}
 }
 
 // ---- 内部工具 ----
@@ -703,12 +817,18 @@ func (s *nodeService) requestSync(peerAddr string, from int) {
 	s.mu.Lock()
 	if s.pending > 0 {
 		s.mu.Unlock()
+		// I0/§6：请求被在途批抑制（抑制也是 SYNC 生命周期的合法状态）。
+		obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from,
+			"suppressed", true, "reason", "pending_in_flight")
 		return // 已有请求在途，等待响应即可
 	}
 	s.pending++
 	s.syncing = true
 	s.mu.Unlock()
 
+	// I0/§6：SYNC_REQUEST 真正发出。
+	obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from, "suppressed", false,
+		"batch", MaxSyncBatch)
 	payload, err := json.Marshal(p2p.GetBlocksPayload{FromHeight: from, Count: MaxSyncBatch})
 	if err != nil {
 		log.Printf("[node] 构造同步请求失败: %v", err)
@@ -716,6 +836,8 @@ func (s *nodeService) requestSync(peerAddr string, from int) {
 	}
 	if err := s.net.SendTo(peerAddr, p2p.Message{Type: p2p.MsgGetBlocks, Payload: payload}); err != nil {
 		log.Printf("[node] 发送同步请求给 %s 失败: %v", peerAddr, err)
+		obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from,
+			"suppressed", false, "result", "send_failed")
 		s.mu.Lock()
 		s.pending = 0
 		s.syncing = false

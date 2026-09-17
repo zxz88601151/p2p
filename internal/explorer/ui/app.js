@@ -193,15 +193,23 @@ function drawOverview(status, page) {
       el("div", { class: "stat-sub", text: "node wallet" }))
   );
 
-  // -- mining panel（只读状态呈现；F-1/P1：Explorer 不提供任何挖矿控制）--
+  // -- mining panel（PHASE MINING-LIFECYCLE-1：只读状态 + 最小控制面）--
+  // 控制面契约（设计冻结 §11）：浏览器不持有凭据（token 由 Explorer 服务端注入）；
+  // 按钮状态是 /status mining_state 的纯投影，浏览器绝不自行推断挖矿状态；
+  // 409 = 状态冲突（reject-duplicate），呈现为当前真实状态而非错误；
+  // HTTP timeout ≠ mining stopped —— 任何操作后立即轮询 /status 复核。
   const ms = status.mining_state || "UNKNOWN";
   const reasonLine = status.mining_reason ? " · " + status.mining_reason : "";
   const miningPanel = el("div", { class: "panel" },
-    el("h2", { text: "Mining（只读状态）" }),
+    el("h2", { text: "Mining" }),
     el("div", { class: "mine-row" },
       el("span", { class: "state-chip " + ms, text: ms }),
-      el("span", { class: "mine-msg", text: "continuous(-mine): " + (status.mining ? "ON" : "OFF") + " · pow_attempts: " + (status.pow_attempts ?? "—") + reasonLine })),
-    el("div", { class: "stat-sub", style: "margin-top:8px", text: "Explorer 为只读浏览器，不提供按需出块；挖矿操作属于节点控制面（17881），不在本界面。" }));
+      el("span", { class: "mine-msg", text: "continuous: " + (status.mining ? "ON" : "OFF") + " · pow_attempts: " + dashIfUndef(status.pow_attempts) + reasonLine })),
+    mineControlRow(ms, status),
+    el("div", { class: "stat-sub", style: "margin-top:8px",
+      text: "accepted_blocks: " + dashIfUndef(status.accepted_blocks) + " · bits: " + dashIfUndef(status.bits)
+        + " · difficulty: " + dashIfUndef(status.difficulty) + " · retries: " + dashIfUndef(status.mining_retries)
+        + " · hashrate: —（无可靠来源，不展示）" }));
 
   // -- recent blocks --
   const recent = (!page.blocks || page.blocks.length === 0)
@@ -224,8 +232,61 @@ function drawOverview(status, page) {
 }
 
 /* ---------------- Route: Blocks ---------------- */
-// （F-1/P1：挖矿调用函数与 POST /api/mine 请求已随 Mine 按钮一并移除；
-//   Explorer UI 现在只构造 GET /api/status、/api/blocks、/api/block。）
+// （历史注记：F-1/P1 曾移除 Mine 按钮与 POST /api/mine 请求；
+//   PHASE MINING-LIFECYCLE-1 方案 A 冻结后，以最小控制面恢复——
+//   仅 POST /api/mine/start 与 /api/mine/stop 两条白名单 mutation，
+//   token 由 Explorer 服务端注入，浏览器零凭据。）
+
+/* ---- mining control（最小控制面；状态为 /status 投影，非本地推断） ---- */
+let mineBusy = false;                 // 在途防重入（双击防护第一层；第二层=服务端 409）
+let mineMsg = null;                   // { text, cls, until } 短暂操作反馈（10s 内可见）
+
+function mineControlRow(ms, status) {
+  let label, action = null, disabled;
+  if (ms === "STOPPING") { label = "STOPPING..."; disabled = true; }
+  else if (ms === "FAILED") { label = "START MINING"; disabled = true; }  // FAILED 终态：拒绝，需重启节点
+  else if (ms === "STARTING") { label = "STARTING..."; disabled = true; }
+  else if (status.mining) { label = "STOP MINING"; action = "/mine/stop"; disabled = false; }
+  else { label = "START MINING"; action = "/mine/start"; disabled = false; }
+
+  const attrs = { class: "btn", text: label };
+  if (disabled || mineBusy) attrs.disabled = "disabled";
+  if (action) attrs.onclick = () => mineAction(action);
+  const row = el("div", { class: "mine-row", style: "margin-top:10px" }, el("button", attrs));
+  if (mineMsg && Date.now() < mineMsg.until) {
+    row.append(el("span", { class: "mine-msg " + (mineMsg.cls || ""), text: mineMsg.text }));
+  }
+  return row;
+}
+
+async function mineAction(action) {
+  if (mineBusy) return;               // 双击/重复点击防护（Case G：服务端 409 兜底）
+  mineBusy = true;
+  try {
+    const res = await fetch("/api" + action, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (res.status === 409) {
+      // 状态冲突（已在跑/FAILED/STOPPING）：不是错误——立即轮询呈现真实状态。
+      mineMsg = { text: "状态已更新（服务端拒绝重复操作）", cls: "", until: Date.now() + 10000 };
+    } else if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { const b = await res.json(); if (b && b.error) msg = b.error; } catch (_) { /* 保留 HTTP 码 */ }
+      mineMsg = { text: "操作失败：" + msg, cls: "err", until: Date.now() + 10000 };
+    } else {
+      mineMsg = { text: "已受理（以 mining_state 为准）", cls: "ok", until: Date.now() + 10000 };
+    }
+  } catch (e) {
+    // 网络失败/超时：绝不推断结果（冻结 §12），立即轮询 /status 复核。
+    mineMsg = { text: "请求未完成，正在复核真实状态…", cls: "conflict", until: Date.now() + 10000 };
+  } finally {
+    mineBusy = false;
+    pollTick();                       // HTTP timeout ≠ mining stopped —— 立即复核
+  }
+}
+
 function renderBlocks(fromParam) {
   const routeKey = "blocks:" + fromParam;
   setTicker(routeKey, (signal) => blocksTick(signal, fromParam));

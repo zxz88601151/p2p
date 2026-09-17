@@ -18,15 +18,30 @@ import (
 	"log"
 	"net/http"
 
+	"p2pchain/internal/control"
 	"p2pchain/internal/explorer"
 )
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:9091", "Explorer HTTP 监听地址（仅本机）")
 	rpc := flag.String("rpc", "http://127.0.0.1:17881", "本机 control 接口地址")
+	// PHASE MINING-LIFECYCLE-1（方案 A 冻结）：mutation 凭据仅由服务端经 0600
+	// 文件持有并注入上游；浏览器零接触。缺省=只读模式（mutation 端点本地
+	// fail-closed 拒绝）；提供了 -token-file 但读取/校验失败 ⇒ 启动失败。
+	tokenFile := flag.String("token-file", "",
+		"mutation Bearer Token 文件（0600；缺省=只读模式，/api/mine/* 一律 503）")
 	flag.Parse()
 
-	handler, err := explorer.NewHandler(*rpc)
+	mutationToken := ""
+	if *tokenFile != "" {
+		tok, err := control.LoadTokenFile(*tokenFile)
+		if err != nil {
+			log.Fatalf("[explorer] mutation token 不可用（fail-closed）: %v", err)
+		}
+		mutationToken = tok
+	}
+
+	handler, err := explorer.NewHandler(*rpc, mutationToken)
 	if err != nil {
 		log.Fatalf("[explorer] 无效的 control 地址 %q: %v", *rpc, err)
 	}
@@ -34,7 +49,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
 
-	log.Printf("[explorer] P2PChain Explorer V1 启动: http://%s  (control=%s)", *listen, *rpc)
+	log.Printf("[explorer] P2PChain Explorer V1 启动: http://%s  (control=%s, mutation=%s)",
+		*listen, *rpc, map[bool]string{true: "enabled(-token-file)", false: "read-only"}[mutationToken != ""])
 	if err := http.ListenAndServe(*listen, mux); err != nil {
 		log.Fatalf("[explorer] 监听失败 %s: %v", *listen, fmt.Sprintf("%v", err))
 	}

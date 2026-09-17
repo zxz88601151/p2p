@@ -22,12 +22,17 @@ type fakeNode struct {
 	blocks    control.BlocksPageResult
 	blockJSON control.BlockJSON
 
+	mineStartResp control.MineStartResponse
+	mineStopResp  control.MineStopResponse
+
 	balanceErr   error
 	sendErr      error
 	blockErr     error
 	mineErr      error
 	blocksErr    error
 	blockJSONErr error
+	mineStartErr error
+	mineStopErr  error
 
 	lastAddress string
 	lastTo      string
@@ -81,6 +86,22 @@ func (f *fakeNode) Mine(count int) (control.MineResponse, error) {
 		r.Mined = count
 	}
 	return r, nil
+}
+
+// StartMining / StopMining（PHASE MINING-LIFECYCLE-1）：测试替身仅协议层——
+// 返回预设响应/错误，供 handler 契约测试（200/409/500 映射）使用。
+func (f *fakeNode) StartMining() (control.MineStartResponse, error) {
+	if f.mineStartErr != nil {
+		return control.MineStartResponse{}, f.mineStartErr
+	}
+	return f.mineStartResp, nil
+}
+
+func (f *fakeNode) StopMining() (control.MineStopResponse, error) {
+	if f.mineStopErr != nil {
+		return control.MineStopResponse{}, f.mineStopErr
+	}
+	return f.mineStopResp, nil
 }
 
 func (f *fakeNode) BlocksPage(from, count int) (control.BlocksPageResult, error) {

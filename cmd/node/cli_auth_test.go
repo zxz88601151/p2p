@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,12 @@ func (cliFakeNode) BlockJSONByHash([32]byte) (control.BlockJSON, error) {
 }
 func (cliFakeNode) Mine(count int) (control.MineResponse, error) {
 	return control.MineResponse{Mined: count, Height: count}, nil
+}
+func (cliFakeNode) StartMining() (control.MineStartResponse, error) {
+	return control.MineStartResponse{Accepted: true, State: "STARTING"}, nil
+}
+func (cliFakeNode) StopMining() (control.MineStopResponse, error) {
+	return control.MineStopResponse{Accepted: true, State: "STOPPED"}, nil
 }
 
 // newAuthedTestServer 起一个要求 token 的 control 服务，返回 rpc 地址（host:port）。
@@ -139,10 +146,13 @@ func TestCLIStopValidTokenFile(t *testing.T) {
 	s := control.NewServer(cliFakeNode{})
 	s.SetAuthToken(testToken)
 	s.SetAuthFailureDelay(0)
-	var stopHit bool
+	// stopHit 由 HTTP handler goroutine 写、由下方轮询 goroutine 与测试主
+	// goroutine 读，必须原子化：普通 bool 在 -race 下是真实数据竞争
+	// （既有缺陷，PHASE MINING-LIFECYCLE-1 全包 race 首次暴露后修复）。
+	var stopHit atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
-		stopHit = true
+		stopHit.Store(true)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"accepted":true,"message":"ok"}`))
 	})
@@ -161,7 +171,7 @@ func TestCLIStopValidTokenFile(t *testing.T) {
 	// 从而快速返回成功，无需等待 15s 超时。
 	go func() {
 		for i := 0; i < 200; i++ {
-			if stopHit {
+			if stopHit.Load() {
 				srv.Close()
 				return
 			}
@@ -174,7 +184,7 @@ func TestCLIStopValidTokenFile(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("使用有效 token 的 stop 应成功: code=%d out=%q err=%q", code, out.String(), errBuf.String())
 	}
-	if !stopHit {
+	if !stopHit.Load() {
 		t.Fatal("stop 请求未到达服务端（token 未生效？）")
 	}
 }

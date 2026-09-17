@@ -46,7 +46,7 @@ func TestProxyRewritesAPIPrefix(t *testing.T) {
 	ctrl := fakeControl(t, &gotPath, &gotQuery)
 	defer ctrl.Close()
 
-	h, err := NewHandler(ctrl.URL)
+	h, err := NewHandler(ctrl.URL, "")
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestProxyForwardsQueryParams(t *testing.T) {
 	ctrl := fakeControl(t, &gotPath, &gotQuery)
 	defer ctrl.Close()
 
-	h, _ := NewHandler(ctrl.URL)
+	h, _ := NewHandler(ctrl.URL, "")
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -102,7 +102,7 @@ func TestProxyForwardsQueryParams(t *testing.T) {
 
 func TestProxyUpstreamUnavailable502(t *testing.T) {
 	// 不可达端口 → 502（UI 据此显示 Explorer API unavailable）
-	h, _ := NewHandler("http://127.0.0.1:1") // port 1 不可达
+	h, _ := NewHandler("http://127.0.0.1:1", "") // port 1 不可达
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/api/status")
@@ -116,7 +116,7 @@ func TestProxyUpstreamUnavailable502(t *testing.T) {
 }
 
 func TestStaticServesIndexAndSPAFallback(t *testing.T) {
-	h, _ := NewHandler("http://127.0.0.1:1")
+	h, _ := NewHandler("http://127.0.0.1:1", "")
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -198,7 +198,7 @@ func localBodyMarkers(t *testing.T, body string) {
 
 func newTestExplorer(t *testing.T, cu *countingUpstream) *httptest.Server {
 	t.Helper()
-	h, err := NewHandler(cu.srv.URL)
+	h, err := NewHandler(cu.srv.URL, "")
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -446,8 +446,16 @@ func TestForeignOriginHostRefererBehaviour(t *testing.T) {
 	}
 }
 
-// TestEmbeddedUINoMutationSurface：嵌入 UI 不得再引用任何控制端点或 POST。
-func TestEmbeddedUINoMutationSurface(t *testing.T) {
+// TestEmbeddedUIMutationSurfaceFrozen：嵌入 UI 的 mutation 面按 PHASE
+// MINING-LIFECYCLE-1（方案 A 冻结）收紧为最小集。
+//
+// 契约变更披露：本测试前身为 TestEmbeddedUINoMutationSurface（F-1/P1：
+// UI 不得构造任何 mutation 请求）。PHASE MINING-LIFECYCLE-1 设计冻结显式
+// 授权 UI 构造【仅两条】白名单 mutation（POST /api/mine/start|stop），
+// token 由 Explorer 服务端注入——本测试按新冻结边界重编码不变量，
+// 绝非放宽：/send、/stop、/console、按需 /mine、token/凭据字样、
+// localStorage/sessionStorage 仍然一律禁止。
+func TestEmbeddedUIMutationSurfaceFrozen(t *testing.T) {
 	sub, err := fs.Sub(uiFS, "ui")
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
@@ -463,21 +471,41 @@ func TestEmbeddedUINoMutationSurface(t *testing.T) {
 	js := string(appJS)
 	html := string(indexHTML)
 
-	for _, bad := range []string{`method: "POST"`, `"/mine"`, `"/send"`, `"/stop"`, `"/api/console"`} {
-		if strings.Contains(js, bad) {
-			t.Fatalf("app.js 含被禁调用 %q（F-1/P1：UI 不得构造任何 mutation 请求）", bad)
+	// 白名单内：恰好两条 mutation 路径 + 恰一处 POST 构造 + JSON 强制。
+	for _, want := range []string{`"/mine/start"`, `"/mine/stop"`, `method: "POST"`, `"Content-Type": "application/json"`} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("app.js 缺少白名单 mutation 要素 %q（方案 A 冻结）", want)
 		}
 	}
-	if strings.Contains(js, `"POST"`) {
-		t.Fatalf("app.js 仍含 POST 字面量（UI 应只构造 GET）")
+	if n := strings.Count(js, `method: "POST"`); n != 1 {
+		t.Fatalf("app.js 应恰好 1 处 POST 构造（单飞 mineAction），实际 %d", n)
 	}
-	for _, bad := range []string{"Mine 1 Block", "doMine"} {
+
+	// 白名单外：按需 /mine（旧端点）、/send、/api/console、GET-only 的 /mine 直接引用。
+	for _, bad := range []string{`"/mine"`, `"/send"`, `"/api/console"`, `"/api/mine"`, "Mine 1 Block", "doMine"} {
 		if strings.Contains(js, bad) || strings.Contains(html, bad) {
-			t.Fatalf("UI 残留 Mine 控件痕迹 %q（P1：按钮与其调用须一并移除）", bad)
+			t.Fatalf("UI 含被禁调用/控件痕迹 %q（MINING-LIFECYCLE-1 冻结白名单）", bad)
 		}
 	}
-	if !strings.Contains(html, "READ-ONLY") {
-		t.Fatalf("index.html 页脚缺少 READ-ONLY 声明")
+
+	// 凭据红线：浏览器侧不得出现凭据操作模式（Authorization/Bearer 头构造、
+	// 本地凭据存储）。注释中的设计说明字样（如「token 由服务端注入」）
+	// 不属于凭据操作，不在红线内——方案 A：token 仅由 Explorer 服务端注入。
+	for _, bad := range []string{"Authorization", "Bearer", "localStorage", "sessionStorage", "document.cookie"} {
+		if strings.Contains(js, bad) {
+			t.Fatalf("app.js 含凭据红线模式 %q（方案 A：浏览器零凭据）", bad)
+		}
+		if strings.Contains(html, bad) {
+			t.Fatalf("index.html 含凭据红线模式 %q（方案 A：浏览器零凭据）", bad)
+		}
+	}
+	// 无 CORS 放水：不得引入 Access-Control-Allow-Origin。
+	if strings.Contains(js, "Access-Control-Allow-Origin") || strings.Contains(html, "Access-Control-Allow-Origin") {
+		t.Fatal("UI 不得引入 CORS 头（同源边界冻结）")
+	}
+	// 页脚声明：只读浏览 + 最小挖矿控制（POST 白名单）+ 永不代理清单。
+	if !strings.Contains(html, "只读浏览") || !strings.Contains(html, "/api/mine/start") || !strings.Contains(html, "永不代理") {
+		t.Fatalf("index.html 页脚缺少新边界声明: %s", html)
 	}
 }
 
