@@ -193,21 +193,15 @@ function drawOverview(status, page) {
       el("div", { class: "stat-sub", text: "node wallet" }))
   );
 
-  // -- mining panel（Explorer=READ 呈现 + /mine 受控调用）--
-  const mineMsg = el("span", { class: "mine-msg", text: "" });
-  const mineBtn = el("button", {
-    class: "btn", text: "Mine 1 Block（按需出块）",
-    onclick: () => doMine(mineBtn, mineMsg)
-  });
+  // -- mining panel（只读状态呈现；F-1/P1：Explorer 不提供任何挖矿控制）--
   const ms = status.mining_state || "UNKNOWN";
   const reasonLine = status.mining_reason ? " · " + status.mining_reason : "";
   const miningPanel = el("div", { class: "panel" },
-    el("h2", { text: "Mining（CONTROL）" }),
+    el("h2", { text: "Mining（只读状态）" }),
     el("div", { class: "mine-row" },
       el("span", { class: "state-chip " + ms, text: ms }),
-      el("span", { class: "mine-msg", text: "continuous(-mine): " + (status.mining ? "ON" : "OFF") + " · pow_attempts: " + (status.pow_attempts ?? "—") + reasonLine }),
-      mineBtn, mineMsg),
-    el("div", { class: "stat-sub", style: "margin-top:8px", text: "409 = 持续挖矿互斥（按需出块不可用），属明确状态而非错误。" }));
+      el("span", { class: "mine-msg", text: "continuous(-mine): " + (status.mining ? "ON" : "OFF") + " · pow_attempts: " + (status.pow_attempts ?? "—") + reasonLine })),
+    el("div", { class: "stat-sub", style: "margin-top:8px", text: "Explorer 为只读浏览器，不提供按需出块；挖矿操作属于节点控制面（17881），不在本界面。" }));
 
   // -- recent blocks --
   const recent = (!page.blocks || page.blocks.length === 0)
@@ -229,35 +223,9 @@ function drawOverview(status, page) {
   $app.replaceChildren(root);
 }
 
-async function doMine(btn, msg) {
-  btn.disabled = true;
-  msg.className = "mine-msg";
-  msg.textContent = "submitting…";
-  try {
-    const r = await api("/mine", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ count: 1 })
-    });
-    msg.className = "mine-msg ok";
-    msg.textContent = "mined " + (r.mined ?? "?") + " block(s), height " + (r.height ?? "?");
-  } catch (e) {
-    if (e.status === 409) {
-      msg.className = "mine-msg conflict";
-      msg.textContent = "Mining already active — 持续挖矿（-mine）运行中，按需出块互斥不可用。";
-    } else if (e.status === 400) {
-      msg.className = "mine-msg err";
-      msg.textContent = "invalid request: " + (e.body || "count 非法");
-    } else {
-      msg.className = "mine-msg err";
-      msg.textContent = "API failure" + (e.status ? " (HTTP " + e.status + ")" : " / timeout");
-    }
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 /* ---------------- Route: Blocks ---------------- */
+// （F-1/P1：挖矿调用函数与 POST /api/mine 请求已随 Mine 按钮一并移除；
+//   Explorer UI 现在只构造 GET /api/status、/api/blocks、/api/block。）
 function renderBlocks(fromParam) {
   const routeKey = "blocks:" + fromParam;
   setTicker(routeKey, (signal) => blocksTick(signal, fromParam));

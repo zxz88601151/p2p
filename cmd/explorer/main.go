@@ -5,9 +5,11 @@
 //	浏览器 → Explorer(默认 127.0.0.1:9091) → control(默认 http://127.0.0.1:17881) → Node
 //
 // 仅本机监听、无鉴权 —— LAN 暴露/限流/鉴权为 DEFERRED，需独立安全授权。
-// Explorer = READ；/mine 为唯一被允许的受控调用；/send /stop 永不代理 UI 暴露之外
-// 的任何额外路径（代理是通用的 /api/* 透传，UI 前端代码永不构造 /send /stop 请求，
-// 见 ui/app.js 安全注释）。
+// Explorer 暴露【显式只读 API 面】：仅 GET /api/status、/api/blocks、/api/block
+// 三个数据端点被代理；/mine /send /stop /console 与 /balance /utxos /logs 等
+// 一律由 Explorer 本地拒绝，上游零接触（F-1 修复，OPTION A + P1）。
+// Explorer 不包含任何挖矿/转帐/停机控制；Node 控制面本身（127.0.0.1:17881）
+// 仍无鉴权，其加固为独立项 F-2（OPEN），不属于本进程的职责范围。
 package main
 
 import (
