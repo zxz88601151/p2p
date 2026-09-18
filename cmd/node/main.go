@@ -788,13 +788,12 @@ func mineOnce(svc *nodeService, stop <-chan struct{}) mineOutcome {
 		log.Printf("[miner] MINING_TEMPLATE_STALE 高度=%d 原因=链尾在求解期间变化（该区块作废）: %v", height, err)
 		return mineOutcomeStale
 	}
-	svc.pool.RemoveIncluded(candidate, svc.chain.UTXOSnapshot(), height)
-	svc.acceptedBlocks.Add(1)
-	svc.lastAcceptedAt.Store(time.Now().Unix())
+	// PHASE E-IMPLEMENTATION-A（O-02/B-1）：上链后的收尾（交易池同步 / 计数 / 广播 /
+	// 统一解析入口级联）统一由 commitMinedBlock 承担，本地挖矿不再绕过解析契约。
+	svc.commitMinedBlock(candidate, height)
 	svc.setMineState(MiningRunning, "mined")
 	log.Printf("[miner] MINING_BLOCK_ACCEPTED 高度=%d 哈希=%s 交易数=%d",
 		svc.chain.Height(), candidate.Header.HashHex(), len(candidate.Transactions))
-	svc.broadcastBlock(candidate)
 	return mineOutcomeMined
 }
 

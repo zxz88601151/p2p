@@ -60,6 +60,15 @@ const (
 	maxBranchRounds = 8
 	// branchReqTTL 在途请求去重窗口：窗口内同一哈希绝不重复请求（幂等 + 防抖）。
 	branchReqTTL = 30 * time.Second
+
+	// ---- PHASE E-IMPLEMENTATION-A：统一级联的到达面标签（纯观测用）----
+	//
+	// 这些字符串只出现在 obs 事件的 via 字段里，不参与任何业务分支判断。
+	// cascadeViaByHash 的值与修复前逐字相同，以保证 by-hash 路径的观测输出不变。
+	cascadeViaByHash      = "on_block_by_hash_resp_cascade"
+	cascadeViaBroadcast   = "resolve_arrival_on_new_block"
+	cascadeViaBatchSync   = "resolve_arrival_on_blocks_resp"
+	cascadeViaLocalMining = "resolve_arrival_local_mining"
 )
 
 // nodeService 实现 p2p.Handler。
@@ -309,10 +318,13 @@ func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 			b.Header.HashHex(), shortHash(hex.EncodeToString(b.Header.PrevBlockHash[:])))
 		return
 	case applied:
-		// I0/§7：父块经 OnNewBlock 到达 —— 此路径**没有** takeWaiting 级联（B-1 证据点）。
+		// I0/§7：父块经 OnNewBlock 到达。
+		// PHASE E-IMPLEMENTATION-A（B-1）：修复前此路径**没有** takeWaiting 级联，
+		// 现在统一经 resolveKnownBlock 释放等待该父块的孤儿。
 		obs.Emit("WAITING_PARENT_RESCAN_TRIGGER", "parent", hashHex32(b.Header.Hash()),
 			"waiting_children", s.waitingChildren(b.Header.Hash()), "via", "on_new_block")
 		s.relayBlock(b, peerAddr)
+		s.resolveKnownBlock(peerAddr, cascadeViaBroadcast, b)
 	}
 }
 
@@ -413,9 +425,12 @@ func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayloa
 			deferred++
 		case ok:
 			applied++
-			// I0/§7：父块经 OnBlocksResp 到达 —— 此路径**没有** takeWaiting 级联（B-1 证据点）。
+			// I0/§7：父块经 OnBlocksResp 到达。
+			// PHASE E-IMPLEMENTATION-A（B-1）：修复前此路径**没有** takeWaiting 级联，
+			// 现在统一经 resolveKnownBlock 释放等待该父块的孤儿。
 			obs.Emit("WAITING_PARENT_RESCAN_TRIGGER", "parent", hashHex32(b.Header.Hash()),
 				"waiting_children", s.waitingChildren(b.Header.Hash()), "via", "on_blocks_resp")
+			s.resolveKnownBlock(peerAddr, cascadeViaBatchSync, b)
 		}
 	}
 	// I0/§6：批应用汇总（含 cursor_after 与 deferred 计数）。
@@ -711,8 +726,39 @@ func (s *nodeService) OnBlockByHashResp(peerAddr string, payload p2p.BlockByHash
 
 // applyResolved 应用一个「父已就位」的分支区块，并级联处理等待它的孤儿。
 // 级联用显式队列 + 有界展开，不递归（避免深度分支导致栈膨胀）。
+//
+// PHASE E-IMPLEMENTATION-A（O-02/B-1）：本函数现在只是统一级联实现的入口之一；
+// 唯一的级联实现在 cascadeFrom，via 标签与修复前逐字保持相同（行为等价）。
 func (s *nodeService) applyResolved(peerAddr string, b *block.Block) {
-	queue := []*block.Block{b}
+	s.cascadeFrom(peerAddr, cascadeViaByHash, []*block.Block{b})
+}
+
+// resolveKnownBlock 是「一个区块刚刚变为已知（已 apply / 已 canonical）」的统一解析入口。
+//
+// PHASE E-IMPLEMENTATION-A（O-02/B-1）修复要点：
+// 修复前 takeWaiting 只在 by-hash 响应路径（OnBlockByHashResp → applyResolved）被调用，
+// 于是父块经其它合法到达面（网络广播 OnNewBlock / 批量同步 OnBlocksResp / 本地挖矿）
+// 变为已知时，等待它的孤儿永远不会被释放——`waiting` 键恒为「不在 blocktree 中」的父哈希，
+// 因此只有「把新块准入 blocktree 的到达面」才能解析它。
+//
+// 契约（不得违反）：
+//   - 所有此类到达面必须且只能经本函数进入级联；到达点不得各自复制 takeWaiting。
+//   - b 自身由调用方在此之前应用；本函数只处理「以 b 为父的等待孤儿」。
+//   - 不改变任何校验/链选择/reorg 语义：每个被释放的子块仍逐个走 ingestBlock → 完整共识校验。
+//
+// 边界说明：本次不覆盖 reorg 采纳面。等待键恒为「当时不在 blocktree 中」的父哈希，
+// 而 reorg 只能连接「已在 blocktree 中」的区块（ShouldReorg 作用于已入树节点），
+// 故 reorg 采纳面在语义上不可能释放任何 waiting 条目——无需、也不应为其增加钩子。
+func (s *nodeService) resolveKnownBlock(peerAddr, via string, b *block.Block) {
+	s.cascadeFrom(peerAddr, via, s.takeWaiting(b.Header.Hash()))
+}
+
+// cascadeFrom 是全局唯一的 waiting 级联实现（Option A 单一漏斗）。
+//
+// 显式 FIFO 队列 + 有界展开，不递归。队列元素只来自 takeWaiting，
+// 而 takeWaiting 取走即删除该键，因此同一孤儿最多入队一次（I-1/I-2/I-9）。
+func (s *nodeService) cascadeFrom(peerAddr, via string, seeds []*block.Block) {
+	queue := seeds
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
@@ -727,11 +773,11 @@ func (s *nodeService) applyResolved(peerAddr string, b *block.Block) {
 			continue
 		case applied:
 			s.branchApplied.Add(1)
-			// I0/§3+§7：级联路径应用成功 —— 这是唯一会 takeWaiting 重扫的父块来源。
+			// I0/§3+§7：级联路径应用成功。
 			obs.Emit("RECOVERY_APPLIED", "block", cur.Header.HashHex(),
-				"height", s.chain.Height(), "via", "on_block_by_hash_resp_cascade")
+				"height", s.chain.Height(), "via", via)
 			obs.Emit("WAITING_PARENT_APPLY", "parent", hashHex32(cur.Header.Hash()),
-				"via", "on_block_by_hash_resp_cascade")
+				"via", via)
 			s.relayBlock(cur, peerAddr)
 		}
 		kids := s.takeWaiting(cur.Header.Hash())
@@ -767,6 +813,22 @@ func (s *nodeService) clearInflight(hash [32]byte) {
 }
 
 // ---- 内部工具 ----
+
+// commitMinedBlock 是本地挖矿成功上链后的统一收尾（PHASE E-IMPLEMENTATION-A 抽出）。
+//
+// 抽出理由：P4（本地挖矿）是「父块刚变为已知」的到达面之一，必须与其它到达面共用同一
+// 解析契约。把它固定在**一个可被测试直接驱动的生产方法**上，才能对"接线"本身做行为验证
+// ——主流程 mineOnce 的候选块哈希在求解完成前不可预知，测试无法预先构造其子块，
+// 因此无法从黑盒驱动 P4。
+//
+// 语义与抽出前逐条相同：交易池同步 → 计数 → 广播 → 统一解析入口级联。
+func (s *nodeService) commitMinedBlock(b *block.Block, height int) {
+	s.pool.RemoveIncluded(b, s.chain.UTXOSnapshot(), height)
+	s.acceptedBlocks.Add(1)
+	s.lastAcceptedAt.Store(time.Now().Unix())
+	s.broadcastBlock(b)
+	s.resolveKnownBlock("", cascadeViaLocalMining, b)
+}
 
 // addBlockAndUpdatePool 追加区块并同步交易池：移除已上链交易、剔除失效交易。
 // REORG-1F：若触发 reorg，在 canonical TIP 提交后复活断开区块中的交易。
