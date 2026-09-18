@@ -24,6 +24,7 @@ import (
 	"p2pchain/internal/mempool"
 	"p2pchain/internal/obs"
 	"p2pchain/internal/p2p"
+	"p2pchain/internal/pow"
 	"p2pchain/internal/transaction"
 	"p2pchain/internal/wallet"
 )
@@ -52,7 +53,22 @@ const (
 	// 成千上万条请求（请求风暴）。
 	maxInflightBranch = 64
 	// maxWaitingBlocks 等待父块的孤儿区块上限（纯内存）。
+	//
+	// 注意：这是**不同父哈希**的个数上限，不是总孤儿个数上限——见
+	// maxWaitingChildrenPerParent。
 	maxWaitingBlocks = 256
+	// maxWaitingChildrenPerParent 同一个父哈希下最多保留的孤儿个数（Q）。
+	//
+	// R-1（孤儿资源边界修复 / F-1）。性质：
+	//   - 这是 **LOCAL ORPHAN RETENTION POLICY**，不是共识参数、不是区块有效性规则；
+	//     超限只表示「本节点不再保留另一份」，该区块仍然有效，后续可重新传播/重新提交。
+	//   - 它把此前**无界**的「每键子块数」变为有限，配合上面的 256 键上限即得
+	//     total waiting entries <= 256 × 64 = 16,384（C5 实测此前 20/20、200/200 全保留）。
+	//   - 这是**计数**上界，不是字节上界（块大小 352 B…1 MiB，保留对象是 Go 堆对象图）。
+	//   - 取值 64 锚定本仓既有的三个 64（`MaxBranchAncestors`、`maxInflightBranch`、
+	//     p2p.MaxAncestorsPerResp），不引入新的魔数量级；相对测试中最大的合法
+	//     每父子块数（1）有 64× 余量，不影响合法孤儿。
+	maxWaitingChildrenPerParent = 64
 	// maxBranchRounds 同一条孤儿链允许的「继续回溯」轮次上限。
 	//
 	// 为什么必须有限：若对端持续返回一段我们挂不上的链（例如彼此创世不同），
@@ -91,7 +107,11 @@ type nodeService struct {
 	// 崩溃恢复中证明正确性的状态（完整 orphan pool 属 REORG-1G/B5）。
 	inflight map[[32]byte]time.Time      // 已发出、尚未回来的 by-hash 请求
 	waiting  map[[32]byte][]*block.Block // 缺父哈希 → 等待该父块的孤儿区块
-	rounds   map[[32]byte]int            // 按哈希请求 → 已回溯轮次（有界追溯）
+	// parkedHashes 已入队孤儿的哈希索引（R-1 / F-3）：孤儿身份 = Header.Hash()。
+	// 与 waiting 同一把 mu 保护、同为纯内存；用于「同一区块只保留一份」，
+	// 并在 takeWaiting 释放时同步删除，使同一区块之后仍可再次入队。
+	parkedHashes map[[32]byte]struct{}
+	rounds       map[[32]byte]int // 按哈希请求 → 已回溯轮次（有界追溯）
 	// syncResume 记录「批量同步因缺父转入分支拉取」时的对端地址；
 	// 分支补齐后由 resumeSync 恢复下一批 GetBlocks，避免 syncing 永久卡死。
 	syncResume string
@@ -154,14 +174,15 @@ type nodeService struct {
 
 func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *wallet.Wallet) *nodeService {
 	s := &nodeService{
-		chain:      chain,
-		pool:       pool,
-		miner:      miner,
-		tipChanged: make(chan struct{}, 1),
-		inflight:   make(map[[32]byte]time.Time),
-		waiting:    make(map[[32]byte][]*block.Block),
-		rounds:     make(map[[32]byte]int),
-		obsReqIDs:  make(map[[32]byte]uint64),
+		chain:        chain,
+		pool:         pool,
+		miner:        miner,
+		tipChanged:   make(chan struct{}, 1),
+		inflight:     make(map[[32]byte]time.Time),
+		waiting:      make(map[[32]byte][]*block.Block),
+		parkedHashes: make(map[[32]byte]struct{}),
+		rounds:       make(map[[32]byte]int),
+		obsReqIDs:    make(map[[32]byte]uint64),
 	}
 	// atomic.Value 必须先 Store 再 Load，否则 Load 返回 nil 接口导致类型断言 panic。
 	s.mineState.Store(miningState(MiningStopped))
@@ -511,30 +532,108 @@ func (s *nodeService) ingestBlock(peerAddr string, b *block.Block) (applied bool
 	return true, false, nil
 }
 
+// preParkRejectReason 返回孤儿「入队前」校验的失败原因；空串表示通过。
+//
+// R-1（F-4）。只做**不依赖父块**的廉价检查，顺序刻意由最便宜到最贵，避免为超大载荷
+// 付出昂贵的默克尔/PoW 成本：
+//
+//	size → bits 共识域 → 默克尔 → PoW
+//
+// 依赖父块或本链的校验——时间戳 vs tip/MTP、由本链推导的期望 bits、UTXO/交易校验、
+// 以及完整的 validateForkBlock——**绝不**出现在这里，它们仍留在各自既有位置；
+// 本函数的目标只是「客观无效的候选不占用孤儿保留资源」，不是「入队前做全量共识校验」。
+func preParkRejectReason(b *block.Block) string {
+	if b.Size() > blockchain.MaxBlockSize {
+		return "size"
+	}
+	if !pow.IsBitsInConsensusDomain(b.Header.Bits) {
+		return "bits"
+	}
+	if block.ComputeMerkleRoot(b.Transactions) != b.Header.MerkleRoot {
+		return "merkle"
+	}
+	if !pow.Validate(&b.Header) {
+		return "pow"
+	}
+	return ""
+}
+
 // deferOrphan 登记一个缺父的孤儿区块，并向来源对端请求它缺的父块。
 func (s *nodeService) deferOrphan(peerAddr string, b *block.Block) {
 	parent := b.Header.PrevBlockHash
+	hash := b.Header.Hash()
+	hashHex := b.Header.HashHex()
 	// I0/§3：ORPHAN_SEEN —— 孤儿高度在父未知时不可知，记 -1（UNKNOWN，禁止猜测）。
-	obs.Emit("ORPHAN_SEEN", "orphan", b.Header.HashHex(), "parent", hashHex32(parent),
+	obs.Emit("ORPHAN_SEEN", "orphan", hashHex, "parent", hashHex32(parent),
 		"orphan_height", -1, "peer", peerAddr)
 
+	// ---- F-3（快速路径）：同一区块哈希只保留一份。
+	//
+	// 授权设计（§5.1 / 决策审计 1.1r-4）要求 dedup 排在昂贵校验**之前**：
+	// 已入队区块的重复到达不应重复支付默克尔/PoW 成本。这里先做一次无副作用的
+	// 快速查重；真正的权威查重与插入在同一临界区内完成（见下方 F-3 二次复查），
+	// 两个检查点之间没有状态被写入 ⇒ 不存在「查重后、插入前」被并发抢先的双插窗口。
 	s.mu.Lock()
-	existing := len(s.waiting[parent])
-	if existing == 0 && len(s.waiting) >= maxWaitingBlocks {
+	_, dup := s.parkedHashes[hash]
+	s.mu.Unlock()
+	if dup {
+		obs.Emit("ORPHAN_DUPLICATE_IGNORED", "orphan", hashHex, "parent", hashHex32(parent),
+			"peer", peerAddr)
+		s.emitWaitingState("duplicate_ignored")
+		return
+	}
+
+	// ---- F-4：入队前的父无关校验（拒绝客观无效的候选，避免占用保留资源）----
+	if reason := preParkRejectReason(b); reason != "" {
+		obs.Emit("ORPHAN_REJECTED_PREPARK", "orphan", hashHex, "parent", hashHex32(parent),
+			"reason", reason, "peer", peerAddr)
+		log.Printf("[node] 孤儿候选在入队前被拒绝（父无关校验失败: %s）: %s", reason, hashHex)
+		s.emitWaitingState("prepark_reject")
+		return
+	}
+
+	s.mu.Lock()
+	// ---- F-3（权威复查，与插入同临界区）：快速路径与插入之间该哈希可能已被并发入队 ----
+	if _, dup := s.parkedHashes[hash]; dup {
 		s.mu.Unlock()
-		obs.Emit("RECOVERY_DROPPED", "orphan", b.Header.HashHex(), "parent", hashHex32(parent),
-			"reason", "waiting_limit", "waiting_total", len(s.waiting), "peer", peerAddr)
-		log.Printf("[node] 等待父块的孤儿区块已达上限 %d，丢弃 %s", maxWaitingBlocks, b.Header.HashHex())
+		obs.Emit("ORPHAN_DUPLICATE_IGNORED", "orphan", hashHex, "parent", hashHex32(parent),
+			"peer", peerAddr)
+		s.emitWaitingState("duplicate_ignored")
+		return
+	}
+	existing := len(s.waiting[parent])
+	// ---- F-1：每个父哈希的子块配额（LOCAL ORPHAN RETENTION POLICY，Q=64）----
+	if existing >= maxWaitingChildrenPerParent {
+		total := len(s.waiting)
+		s.mu.Unlock()
+		obs.Emit("RECOVERY_DROPPED", "orphan", hashHex, "parent", hashHex32(parent),
+			"reason", "per_parent_quota", "waiting_total", total,
+			"waiting_children", existing, "quota", maxWaitingChildrenPerParent, "peer", peerAddr)
+		log.Printf("[node] 父块 %s 的等待子块已达每键配额 %d，丢弃 %s", hashHex32(parent),
+			maxWaitingChildrenPerParent, hashHex)
+		s.emitWaitingState("per_parent_quota_drop")
+		return
+	}
+	// 既有的**不同父哈希**个数上限（256）——与 F-1 的每键配额相互独立，语义保持不变。
+	if existing == 0 && len(s.waiting) >= maxWaitingBlocks {
+		total := len(s.waiting)
+		s.mu.Unlock()
+		obs.Emit("RECOVERY_DROPPED", "orphan", hashHex, "parent", hashHex32(parent),
+			"reason", "waiting_limit", "waiting_total", total, "peer", peerAddr)
+		log.Printf("[node] 等待父块的孤儿区块已达上限 %d，丢弃 %s", maxWaitingBlocks, hashHex)
+		s.emitWaitingState("waiting_limit_drop")
 		return
 	}
 	s.waiting[parent] = append(s.waiting[parent], b)
+	s.parkedHashes[hash] = struct{}{}
 	s.mu.Unlock()
 
 	// I0/§3+§7：登记成功 → 具备恢复资格；同时记录 waiting-add 观测点。
-	obs.Emit("RECOVERY_ELIGIBLE", "orphan", b.Header.HashHex(), "parent", hashHex32(parent),
+	obs.Emit("RECOVERY_ELIGIBLE", "orphan", hashHex, "parent", hashHex32(parent),
 		"waiting_children", existing+1, "peer", peerAddr)
-	obs.Emit("WAITING_PARENT_ADD", "parent", hashHex32(parent), "orphan", b.Header.HashHex(),
+	obs.Emit("WAITING_PARENT_ADD", "parent", hashHex32(parent), "orphan", hashHex,
 		"waiting_children", existing+1, "via", "defer_orphan")
+	s.emitWaitingState("add")
 	s.requestBranch(peerAddr, parent)
 }
 
@@ -787,12 +886,38 @@ func (s *nodeService) cascadeFrom(peerAddr, via string, seeds []*block.Block) {
 	}
 }
 
+// waitingSnapshotLocked 在持有 s.mu 时统计 waiting 规模（R-1 / F-7，仅用于观测）。
+//
+// 只读计数、不修改任何状态；不引入 goroutine、不落盘、不改 internal/*、不改 RPC schema。
+func (s *nodeService) waitingSnapshotLocked() (keys, blocks, inflight int) {
+	blocks = 0
+	for _, v := range s.waiting {
+		blocks += len(v)
+	}
+	return len(s.waiting), blocks, len(s.inflight)
+}
+
+// emitWaitingState 以既有 obs 事件路径输出 waiting / inflight 状态（R-1 / F-7）。
+//
+// 每一次 waiting 的插入或移除都恰好对应一次状态事件（Invariant H）。调用方**不得**在持有 s.mu 时调用。
+func (s *nodeService) emitWaitingState(event string) {
+	s.mu.Lock()
+	keys, blocks, inflight := s.waitingSnapshotLocked()
+	s.mu.Unlock()
+	obs.Emit("WAITING_STATE", "waiting_keys", keys, "waiting_blocks", blocks, "inflight", inflight, "event", event)
+}
+
 // takeWaiting 取出并清空等待该父哈希的孤儿区块。
 func (s *nodeService) takeWaiting(parentHash [32]byte) []*block.Block {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	out := s.waiting[parentHash]
 	delete(s.waiting, parentHash)
+	// F-3：释放时同步移除哈希索引——既不残留，也允许同一区块之后再次入队（不重复释放、不重复计数）。
+	for _, b := range out {
+		delete(s.parkedHashes, b.Header.Hash())
+	}
+	s.mu.Unlock()
+	s.emitWaitingState("release")
 	return out
 }
 

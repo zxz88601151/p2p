@@ -332,6 +332,13 @@ func TestB1T7DuplicateParentDelivery(t *testing.T) {
 }
 
 // T8 非法子块滞留在合法父块之后：父块到达后子块必须被拒绝，且不得成为 canonical。
+//
+// ── T8 语义更新（R-1 / F-4，经授权的行为变更）────────────────────────────
+// 旧语义：invalid child → 先进入 waiting（父未知时先入队，父到达后再被拒绝）。
+// 新语义：invalid child → **入队前即被拒收**（waiting 计数不变）。
+// 因此旧断言「非法子块仍会先进入等待（父未知）」不再成立，本用例改为验证新语义的
+// 另一半：即便非法子块被直接拒收，父块仍照常上链，且非法子块永不进入 canonical 链。
+// 「合法孤儿仍然入队」由 TestR1F4LegitimateOrphanStillParked 覆盖（不得削弱 F-4 以保留旧 T8）。
 func TestB1T8InvalidWaitingChildNeverCanonical(t *testing.T) {
 	svc := newB1Service(t)
 	g, err := svc.chain.Tip()
@@ -342,14 +349,21 @@ func TestB1T8InvalidWaitingChildNeverCanonical(t *testing.T) {
 	bad := mineOn(t, svc, p, 2)
 	bad.Header.Nonce++ // 破坏 PoW（父引用不变，仍以 p 为父）
 
-	deliverBroadcast(t, svc, bad)
-	assertParked(t, svc, p.Header.Hash(), 1, "非法子块仍会先进入等待（父未知）")
+	// 前置：该候选确实会被父无关校验以 pow 拒绝（保证下面的断言在测 F-4，而不是别的原因）。
+	if got := preParkRejectReason(bad); got != "pow" {
+		t.Fatalf("preParkRejectReason(bad) = %q, want %q", got, "pow")
+	}
 
-	deliverBroadcast(t, svc, p) // 父块到达 → 级联尝试非法子块
+	// F-4：无效候选在进入 waiting 之前被拒收 ⇒ waiting 计数保持为 0。
+	deliverBroadcast(t, svc, bad)
+	assertWaitingCounts(t, svc, 0, 0, "无效候选应在入队前被拒收（waiting 计数不变）")
+
+	// 父块仍照常上链，且非法子块永不成为 canonical。
+	deliverBroadcast(t, svc, p)
 	assertHeight(t, svc, 1, "非法子块不得上链")
 	assertTipIs(t, svc, p, "链尾应为合法父块 P")
 	assertCanonical(t, svc, bad, false, "非法子块不得成为 canonical")
-	assertWaitingEmpty(t, svc, "被拒绝的等待条目仍应被消费")
+	assertWaitingEmpty(t, svc, "被拒收的候选不应留下等待条目")
 }
 
 // T9 重启边界：实现不得假设 waiting 跨重启持久化。
