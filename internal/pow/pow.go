@@ -73,10 +73,40 @@ const (
 	NewBlockVersion uint32 = 2
 )
 
+// targetBitWidth 是难度目标的位宽：target = 2^(targetBitWidth-bits)。
+//
+// 它同时定义了「不触发移位回绕」的 bits 上界：位移量按 uint32 计算，
+// bits > targetBitWidth 时 targetBitWidth-bits 会回绕成 2^32 量级（见 BitsToTarget）。
+const targetBitWidth = 256
+
+// IsBitsInConsensusDomain 报告 bits 是否落在本链共识认可的难度域 [1, 256]。
+//
+// 该域**不是本阶段新引入的协议边界**，而是补齐既有不变量：
+//   - internal/blocktree：`bits == 0 || bits > 256 → ErrInvalidBits`
+//     （注释原文：「防止移位溢出 / 零工作量」）；
+//   - internal/storage：workOfBits 采用同一域判定（ErrInvalidBits）；
+//   - internal/pow：合法区块的 bits 必须等于期望难度（∈ [1, MaxDifficultyBits=32]），
+//     且 32 ≤ 256 ⇒ **一切合法区块都落在本域内**。
+//
+// 用途：作为区块校验中**先于目标构造与 PoW** 的廉价前置闸门，使对端可控的
+// bits 在进入任何大整数构造之前被拒绝（PHASE F-4-CONSENSUS-INPUT-HARDENING-REMEDIATION）。
+func IsBitsInConsensusDomain(bits uint32) bool {
+	return bits >= 1 && bits <= targetBitWidth
+}
+
 // BitsToTarget 将压缩格式的难度（Bits）还原为大整数目标值。
 // 简化实现：这里假设 bits 直接表示目标值前导零的位数（而不是比特币真实的浮点式编码），
 // 便于初期理解和调试；后续可以替换成与比特币兼容的 nBits 编码。
+//
+// F-4 输入加固：位移量由 uint32 算术得出 —— bits > 256 时 `256-bits` 回绕成
+// 2^32 量级，big.Int 会为**单次调用**构造 2^32 bit（512 MiB）的中间值
+// （实测 155–212 ms/次；≤1 MiB 消息即可触发），构成远程内存放大面。
+// 因此在越界时直接返回**零目标**（任何哈希都不满足 ⇒ PoW 恒失败），不构造大整数。
+// 对全部合法 bits（共识域 [1,256]）本函数输出与加固前逐字节一致（§7 保真）。
 func BitsToTarget(bits uint32) *big.Int {
+	if bits > targetBitWidth {
+		return new(big.Int)
+	}
 	target := big.NewInt(1)
 	target.Lsh(target, uint(256-bits))
 	return target

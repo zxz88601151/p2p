@@ -329,9 +329,18 @@ func (bc *Blockchain) currentBitsLocked() uint32 {
 // validateBlock 对区块执行全序共识校验；全部通过时返回应用后的新 UTXO 集合。
 // 调用方必须已持有锁（AddBlock 写锁 / ValidateBlock 读锁）。
 // 校验顺序（任何一步失败立即拒绝）：
-//  1. PrevHash        2. PoW           3. Bits == 共识难度
-//  4. 时间戳范围      5. Merkle 重验   6. 体积上限
+//  1. PrevHash        1.5 版本          1.6 难度位共识域（F-4 廉价闸门）
+//  2. PoW             3. Bits == 共识难度
+//  4. 时间戳范围      5. Merkle 重验    6. 体积上限
 //  7. coinbase 位置/数量 + 全部交易的状态迁移（签名/双花/maturity/金额/coinbase 上限）
+//
+// 关于 1.6（PHASE F-4-CONSENSUS-INPUT-HARDENING-REMEDIATION）：
+// bits 完全由对端控制，而目标构造 target=2^(256-bits) 在 bits>256 时按 uint32
+// 回绕，产生 2^32 bit（≈512 MiB）级分配；必须在任何大整数构造之前拒绝。
+// 该闸门只拒绝「任何合法区块都不可能取到」的值（共识域 [1,256]，由
+// pow.IsBitsInConsensusDomain 定义，与 blocktree/storage 既有判定同域），
+// 因此**不改变接受集合**；权威规则仍是第 3 步的等值校验。
+// 它也不改变「PoW 先于等值校验」这一防 DoS 顺序——PoW 仍在第 2 步。
 //
 // skipPoW 仅供本地挖矿模板预校验使用（PHASE MINING-REMEDIATION-1）：
 // 未求解的候选区块必然不满足 PoW，若照常执行第 2 步会恒返回 ErrInvalidPoW，
@@ -355,6 +364,12 @@ func (bc *Blockchain) validateBlock(b *block.Block, skipPoW bool) (*utxo.UTXOSet
 	// 1.5 版本号必须与该高度激活的共识规则一致（硬分叉强制，见 consensus.go）
 	if err := bc.validateVersion(b, height); err != nil {
 		return nil, err
+	}
+	// 1.6 难度位共识域闸门（F-4 输入加固）：拒绝越界 bits，且**不构造任何目标值**。
+	// 合法区块 bits == 期望难度 ∈ [1, MaxDifficultyBits=32] ⊂ [1,256] ⇒ 接受集合不变。
+	if !pow.IsBitsInConsensusDomain(b.Header.Bits) {
+		return nil, fmt.Errorf("%w: 区块难度位 %d 超出共识域（拒绝，未构造目标值；F-4 输入加固）",
+			ErrUnexpectedBits, b.Header.Bits)
 	}
 	// 2. 工作量证明（skipPoW 时跳过 —— 见函数注释的安全边界）
 	if !skipPoW && !pow.Validate(&b.Header) {

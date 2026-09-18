@@ -19,11 +19,14 @@ package p2p
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"p2pchain/internal/obs"
 )
 
 // MessageType 标识网络消息的类型。
@@ -333,7 +336,20 @@ func (n *Node) learnPeer(addr string) {
 func (n *Node) Broadcast(msg Message) { n.BroadcastExcept(msg, "") }
 
 // BroadcastExcept 向除 except 之外的全部对等节点发送消息（避免中继回环）。
+//
+// I0/§5：本函数是观测包装——计时与事件在外层，实现体在 broadcastExcept，
+// 行为逐字节保持不变（OBSERVE ≠ CHANGE）。
 func (n *Node) BroadcastExcept(msg Message, except string) {
+	start := time.Now()
+	obs.Emit("BROADCAST_ENTER", "msg_type", string(msg.Type), "except", except,
+		"peer_count", n.PeerCount(), "height", n.currentHeight())
+	n.broadcastExcept(msg, except)
+	obs.Emit("BROADCAST_EXIT", "msg_type", string(msg.Type), "except", except,
+		"duration_us", time.Since(start).Microseconds())
+}
+
+// broadcastExcept 是 BroadcastExcept 的原始实现体（I0 拆分，仅观测包装变更）。
+func (n *Node) broadcastExcept(msg Message, except string) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		log.Printf("[p2p] 序列化消息失败: %v", err)
@@ -364,6 +380,8 @@ func (n *Node) BroadcastExcept(msg Message, except string) {
 			fails := p.sendFails
 			p.mu.Unlock()
 			log.Printf("[p2p] 向 %s 发送失败(%d/%d): %v", p.Addr, fails, maxSendFailures, werr)
+			// I0/§5：写失败细分——超时（WRITE_TIMEOUT）与其他（SEND_ERROR）。
+			emitWriteFailure(p.Addr, string(msg.Type), werr)
 			if fails >= maxSendFailures {
 				n.dropPeer(p, "连续发送失败")
 			}
@@ -375,8 +393,43 @@ func (n *Node) BroadcastExcept(msg Message, except string) {
 	}
 }
 
+// emitWriteFailure 观测专用：按错误类型区分 WRITE_TIMEOUT 与 SEND_ERROR。
+// 在调用方锁外调用（本函数不获取任何业务锁）。
+func emitWriteFailure(peer, msgType string, err error) {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		obs.Emit("WRITE_TIMEOUT", "peer", peer, "msg_type", msgType, "write_timeout_s", writeTimeout.Seconds())
+		return
+	}
+	obs.Emit("SEND_ERROR", "peer", peer, "msg_type", msgType, "error", err.Error())
+}
+
 // SendTo 向指定远端地址发送消息（用于定向响应，如 GetBlocks → BlocksResp）。
+//
+// I0/§5：观测包装——计时与事件在外层，实现体在 sendTo，行为逐字节保持不变。
 func (n *Node) SendTo(addr string, msg Message) error {
+	start := time.Now()
+	obs.Emit("SEND_ENTER", "peer", addr, "msg_type", string(msg.Type), "height", n.currentHeight())
+	err := n.sendTo(addr, msg)
+	if err != nil {
+		// I0/§5：写失败细分（WRITE_TIMEOUT / SEND_ERROR），错误返回值不变。
+		emitWriteFailure(addr, string(msg.Type), err)
+	}
+	obs.Emit("SEND_EXIT", "peer", addr, "msg_type", string(msg.Type),
+		"duration_us", time.Since(start).Microseconds(), "error", errorString(err))
+	return err
+}
+
+// errorString 观测专用：nil → ""（避免事件里出现 "<nil>" 噪声）。
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// sendTo 是 SendTo 的原始实现体（I0 拆分，仅观测包装变更）。
+func (n *Node) sendTo(addr string, msg Message) error {
 	n.mu.RLock()
 	p, ok := n.peers[addr]
 	n.mu.RUnlock()
@@ -414,6 +467,8 @@ func (n *Node) dropPeer(p *Peer, reason string) {
 	}
 	n.mu.Unlock()
 	_ = p.Conn.Close()
+	// I0/§5：连接拆除事件（D 受害链终点：连续发送失败即此处的 reason）。
+	obs.Emit("DISCONNECT", "peer", p.Addr, "reason", reason)
 	log.Printf("[p2p] 断开对等节点 %s（%s）", p.Addr, reason)
 }
 
@@ -449,7 +504,14 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	// 双方都主动发握手：入站连接也立即回送，简化协议（幂等处理）
 	n.sendHandshake(peer)
 
+	// I0/§5：读循环生命周期 —— ENTER 在循环前，EXIT 由 defer 在连接关闭时补记。
+	obs.Emit("READ_LOOP_ENTER", "peer", remote, "height", n.currentHeight())
+	defer func() {
+		obs.Emit("READ_LOOP_EXIT", "peer", remote, "height", n.currentHeight())
+	}()
+
 	reader := bufio.NewReaderSize(conn, 64*1024)
+	prevCycleEnd := time.Now() // READ_WAIT 语义：上一轮 dispatch 结束（或连接建立）到本轮 read 返回的间隔
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		line, err := reader.ReadBytes('\n')
@@ -460,10 +522,12 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 			log.Printf("[p2p] 来自 %s 的消息超过大小上限，断开", remote)
 			return
 		}
+		readGap := time.Since(prevCycleEnd)
 
 		var msg Message
 		if err := json.Unmarshal(line, &msg); err != nil {
 			log.Printf("[p2p] 解析来自 %s 的消息失败: %v", remote, err)
+			prevCycleEnd = time.Now()
 			continue
 		}
 		peer.mu.Lock()
@@ -477,9 +541,14 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 		// 未握手前只接受握手消息，避免未识别连接直接注入区块/交易
 		if !handshaked && msg.Type != MsgHandshake {
 			log.Printf("[p2p] 来自 %s 的 %s 消息在握手前到达，忽略", remote, msg.Type)
+			prevCycleEnd = time.Now()
 			continue
 		}
+		// I0/§5：READ_WAIT —— 读循环两轮处理之间的间隔（含阻塞读与 dispatch 耗时之外的空窗）。
+		obs.Emit("READ_WAIT", "peer", remote, "read_gap_us", readGap.Microseconds(),
+			"msg_type", string(msg.Type))
 		n.dispatch(remote, msg)
+		prevCycleEnd = time.Now()
 	}
 }
 
@@ -558,7 +627,19 @@ func (n *Node) currentStatus() (work string, tipHash string) {
 }
 
 // dispatch 按消息类型分发到上层 Handler。
+//
+// I0/§5：观测包装——ENTER/EXIT + duration 在外层，原始分发体在 dispatchInner。
+// duration 是证明「reader loop 被 dispatch 阻塞」的直接证据（读循环同步调用本函数）。
 func (n *Node) dispatch(peerAddr string, msg Message) {
+	start := time.Now()
+	obs.Emit("DISPATCH_ENTER", "peer", peerAddr, "msg_type", string(msg.Type), "height", n.currentHeight())
+	n.dispatchInner(peerAddr, msg)
+	obs.Emit("DISPATCH_EXIT", "peer", peerAddr, "msg_type", string(msg.Type),
+		"dispatch_duration_us", time.Since(start).Microseconds())
+}
+
+// dispatchInner 是 dispatch 的原始分发体（I0 拆分，仅观测包装变更）。
+func (n *Node) dispatchInner(peerAddr string, msg Message) {
 	switch msg.Type {
 	case MsgHandshake:
 		var payload HandshakePayload
