@@ -557,21 +557,45 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 
 	if !shouldReorg {
 		// 保存为 detached，但不切换 canonical
+		//
+		// P1（REORG SILENT-STATE-DIVERGENCE REMEDIATION）：保存失败不得再被静默丢弃。
+		// 这里刻意 **不** 改成 return error：`tree.AddBlock` 已在上面成功（块已进入候选
+		// 索引），而「fork choice 拒绝」本身是合法结果、不是错误——把它变成 error 会让
+		// 调用方误判为「块非法/处理失败」。因此如实写进结构化事件，保持控制流不变。
+		detachedSaveErr := ""
 		if persist && bc.store != nil {
 			if v2s, ok := bc.store.(reorgStore); ok {
-				_ = v2s.SaveBlockDetached(b)
+				// 与下方 reorg 路径同判据：以「块是否在存储中就位」为准，
+				// 幂等的「已存在」不算失败，避免把正常情形写成噪声。
+				if err := v2s.SaveBlockDetached(b); err != nil && !v2s.HasBlock(b.Header.Hash()) {
+					detachedSaveErr = err.Error()
+				}
 			}
 		}
 		// I0/§8：fork choice 拒绝 —— 新块未能赢得 canonical 竞争（合法，非缺陷）。
 		obs.Emit("REORG_REJECT", "block", b.Header.HashHex(), "fork_height", height,
-			"canonical_height", len(bc.blocks)-1, "reason", "chainwork_not_won")
+			"canonical_height", len(bc.blocks)-1, "reason", "chainwork_not_won",
+			"detached_save_error", detachedSaveErr)
 		return nil
 	}
 
 	// 触发 reorg 的块必须先持久化，否则 executeReorg 中 blockAtHash 找不到它。
+	//
+	// P1（REORG SILENT-STATE-DIVERGENCE REMEDIATION）：这条持久化是 executeReorg 的
+	// **前置条件**（见上句注释）。失败必须显式返回，绝不能让 executeReorg 在
+	// 「块不在存储里」的前提下继续跑——那正是 silent state divergence 的入口。
+	// 此处任何 canonical 状态（bc.blocks / utxo / hashIndex / canonicalSet / tree tip）
+	// 尚未变更，因此 return error 是干净的 fail-before-commit。
 	if persist && bc.store != nil {
 		if v2s, ok := bc.store.(reorgStore); ok {
-			_ = v2s.SaveBlockDetached(b)
+			// 判据是**后置条件**（该块在存储中就位），不是「调用是否返回 nil」：
+			// SaveBlockDetached 对**已存在**的哈希会返回「区块哈希已存在（重复记录被拒绝）」，
+			// 那是幂等成功的正常情形，绝不能当失败处理（否则会改变既有行为）。
+			// 只有「保存返回错误 **且** 块在存储中确实不存在」才意味着前置条件未满足。
+			if err := v2s.SaveBlockDetached(b); err != nil && !v2s.HasBlock(b.Header.Hash()) {
+				return fmt.Errorf("reorg: 触发 reorg 的区块未能在存储中就位（%s）: %w",
+					b.Header.HashHex(), err)
+			}
 		}
 	}
 	// 执行 reorg
@@ -804,6 +828,10 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 	if oldTip == nil {
 		return errors.New("no active tip")
 	}
+	// P1：与 blocktree.SetTip 的 ErrNilTip 前置条件对齐，消除提交尾部的 nil 解引用面。
+	if newTip == nil {
+		return errors.New("reorg: nil new tip")
+	}
 	obs.Emit("REORG_ATTEMPT", "old_tip", obsHashHex(oldTip.Hash), "old_height", oldTip.Height,
 		"new_tip", obsHashHex(newTip.Hash), "new_height", newTip.Height)
 	defer func() {
@@ -859,6 +887,52 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 		newUndos = append(newUndos, undo)
 	}
 
+	// ── Phase A：提交前完整解析与校验（P1 fail-before-commit）──────────────────
+	//
+	// 在触碰任何 canonical 状态之前，把所有必需的 path 区块与 tree tip 前置条件
+	// 一次性解析并校验。任何一项不满足立即 return error —— 此时
+	// bc.blocks / bc.utxo / bc.hashIndex / bc.canonicalSet / tree tip 全部未被修改。
+	//
+	// 修复前的行为：ancestorPath / disconnectPath 的区块在**状态已提交之后**才取，
+	// 且 `blockAtHash` 的错误被 `_` 丢弃、取不到就静默跳过 ⇒ 装上一条被截断的
+	// canonical 链，而 bc.utxo 仍是完整集合 ⇒ bc.blocks / bc.utxo / tree 三方静默分歧。
+	ancestorPath := ancestor.PathToRoot()
+	for i, j := 0, len(ancestorPath)-1; i < j; i, j = i+1, j-1 {
+		ancestorPath[i], ancestorPath[j] = ancestorPath[j], ancestorPath[i]
+	}
+	ancestorBlocks := make([]*block.Block, 0, len(ancestorPath))
+	for _, n := range ancestorPath {
+		b, err := bc.blockAtHash(n.Hash)
+		if err != nil {
+			return fmt.Errorf("reorg: get ancestor block %x: %w", n.Hash[:4], err)
+		}
+		if b == nil {
+			return fmt.Errorf("reorg: ancestor block %x missing (nil without error)", n.Hash[:4])
+		}
+		ancestorBlocks = append(ancestorBlocks, b)
+	}
+
+	// disconnect 分支区块（供 ReorgResult 使用）：与上面同理，提前到提交前解析，
+	// 避免在状态已提交之后失败时静默产出残缺的 ReorgResult。
+	disconnectBlocks := make([]*block.Block, 0, len(disconnectPath))
+	for _, n := range disconnectPath {
+		b, err := bc.blockAtHash(n.Hash)
+		if err != nil {
+			return fmt.Errorf("reorg: get disconnect block %x: %w", n.Hash[:4], err)
+		}
+		if b == nil {
+			return fmt.Errorf("reorg: disconnect block %x missing (nil without error)", n.Hash[:4])
+		}
+		disconnectBlocks = append(disconnectBlocks, b)
+	}
+
+	// tree.SetTip 的前置条件（与 blocktree.SetTip 内部校验逐条一致），同样提前。
+	// nil 与「不在树中」是 SetTip 仅有的两种失败原因；两者在此已排除 ⇒ Phase B
+	// 中的 SetTip 不会失败，故不存在「tip 未推进但状态已提交」的窗口。
+	if bc.tree.LookupNode(newTip.Hash) != newTip {
+		return fmt.Errorf("reorg: new tip %x… is not in the block tree", newTip.Hash[:4])
+	}
+
 	// Persist
 	if persist && bc.store != nil {
 		if v2s, ok := bc.store.(reorgStore); ok {
@@ -885,23 +959,12 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 	}
 
 	// Update memory canonical state
-	newChain := make([]*block.Block, 0, ancestor.Height+1+len(connectPath))
-	ancestorPath := ancestor.PathToRoot()
-	for i, j := 0, len(ancestorPath)-1; i < j; i, j = i+1, j-1 {
-		ancestorPath[i], ancestorPath[j] = ancestorPath[j], ancestorPath[i]
-	}
-	for _, n := range ancestorPath {
-		b, _ := bc.blockAtHash(n.Hash)
-		if b != nil {
-			newChain = append(newChain, b)
-		}
-	}
-	for _, n := range connectPath {
-		b, _ := bc.blockAtHash(n.Hash)
-		if b != nil {
-			newChain = append(newChain, b)
-		}
-	}
+	//
+	// Phase B：全部输入已在 Phase A 解析并校验完成，这里只做不可失败的赋值，
+	// 不再二次查找、不再存在「取不到就跳过」的静默路径。
+	newChain := make([]*block.Block, 0, len(ancestorBlocks)+len(newBlocks))
+	newChain = append(newChain, ancestorBlocks...)
+	newChain = append(newChain, newBlocks...)
 
 	bc.blocks = newChain
 	// C-1：整链替换后全量重建 hash index（disconnect 旧链块随之移出投影，
@@ -911,21 +974,17 @@ func (bc *Blockchain) executeReorg(newTip *blocktree.BlockNode, persist bool) er
 	// disconnect 旧链块移出投影、connect 新链块进入投影）。
 	bc.rebuildCanonicalSetLocked()
 	bc.utxo = utxoSet
-	_ = bc.tree.SetTip(newTip)
+	// P1：SetTip 的前置条件已在 Phase A 校验（newTip 非 nil 且确在树中），故此处
+	// 不会失败；但错误依然不允许被丢弃——若该不变量被破坏，必须显式暴露，而不是
+	// 留下「bc.blocks / bc.utxo 已推进而 tree tip 未推进」的分歧。
+	if err := bc.tree.SetTip(newTip); err != nil {
+		return fmt.Errorf("reorg: set tip %x…: %w", newTip.Hash[:4], err)
+	}
 
 	// Build ReorgResult for service-layer mempool resurrection (REORG-1F).
-	var disconnectBlocks []*block.Block
-	for _, node := range disconnectPath {
-		if b, _ := bc.blockAtHash(node.Hash); b != nil {
-			disconnectBlocks = append(disconnectBlocks, b)
-		}
-	}
-	var connectBlocks []*block.Block
-	for _, node := range connectPath {
-		if b, _ := bc.blockAtHash(node.Hash); b != nil {
-			connectBlocks = append(connectBlocks, b)
-		}
-	}
+	// Phase A 已解析并校验 disconnectPath / connectPath 的区块，这里直接使用，
+	// 不再二次查找（此前二次查找失败会被静默丢弃，产出残缺的 ReorgResult）。
+	connectBlocks := newBlocks
 	bc.lastReorgResult = &ReorgResult{
 		OldTip:           oldTip,
 		NewTip:           newTip,
