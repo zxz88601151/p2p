@@ -6,6 +6,7 @@ package main
 //   START：single / duplicate / concurrent ×N / while FAILED
 //   STOP ：single / duplicate / while idle / during active PoW
 //   RACE ：START vs STOP / STOP vs START / repeated sequence / transition integrity
+//   CR-01：START vs beginShutdown 的生命周期发布竞态（确定性交错，见文件末尾）
 //   （browser/HTTP 层面 Case G/I/J/K 由 internal/control 与 internal/explorer
 //     测试及 UI 轮询契约覆盖；本文件验证 runtime 语义。）
 //
@@ -275,6 +276,102 @@ func TestMineLifecycleStartStopRace(t *testing.T) {
 		t.Fatalf("收敛 STOP 失败: %v", err)
 	}
 	waitMineState(t, svc, MiningStopped)
+}
+
+// TestMineLifecycleCR01StartVsShutdownPublicationRace 覆盖 CR-01：
+// START 与 beginShutdown() 在「已越过停机预检、尚未发布生命周期」窗口内的交错。
+//
+// 确定性来源：testStartSeam 把 START 阻塞在该窗口内，测试以 **channel 握手**
+// 保证 beginShutdown() 已完整返回之后才释放 seam —— 无 sleep、无轮询、
+// 无重复碰概率、无 timeout 放宽、不依赖 goroutine 调度顺序。
+//
+// 修复前（判定与发布分离，预检后即放锁）：beginShutdown() 得以在该窗口内整段
+// 完成（其 stop()/wait() 都看到 current == nil，因而无事可做），随后 START 仍
+// CAS 成功并发布一个**无人管辖**的 miner —— 它再也收不到 stop 请求，mining 永久
+// 为 true（Mine() 闸门永久卡死），并持续向随后的 store.Close() 之后写盘失败、
+// 永不退出（goroutine 泄漏）。
+// 修复后（单临界区）：最终判定与发布原子 ⇒ START 被 409 拒绝且零副作用。
+func TestMineLifecycleCR01StartVsShutdownPublicationRace(t *testing.T) {
+	svc := newLifecycleService(t)
+	life := svc.minerLife.Load()
+
+	inWindow := make(chan struct{})
+	release := make(chan struct{})
+	testStartSeam = func() {
+		close(inWindow)
+		<-release
+	}
+	defer func() { testStartSeam = nil }()
+
+	startResult := make(chan error, 1)
+	go func() { _, err := svc.StartMining(); startResult <- err }()
+
+	// T1–T3：START 必须抵达窗口（越过停机预检、停在发布之前）。
+	// 若它提前返回，本身即为失败——分支化处理，不引入 sleep/timeout。
+	select {
+	case <-inWindow:
+	case err := <-startResult:
+		t.Fatalf("CR-01：START 未抵达注入点即返回（err=%v）", err)
+	}
+
+	// T4–T8：节点停机在窗口内整段完成。
+	shutdownDone := make(chan struct{})
+	go func() { life.beginShutdown(); close(shutdownDone) }()
+	<-shutdownDone
+
+	// T9：释放 START。
+	close(release)
+
+	// A. START 不得成功建立新的 mining run ⇒ 必须被拒绝（HTTP 409 语义）。
+	err := <-startResult
+	if err == nil {
+		t.Fatal("CR-01：beginShutdown 已完整返回后，START 仍被受理")
+	}
+	if !isMineConflict(err) {
+		t.Fatalf("CR-01：START 应以 *control.MineConflictError 拒绝，实际 %T: %v", err, err)
+	}
+
+	// B. 生命周期发布点未被写入。
+	life.mu.Lock()
+	cur := life.current
+	life.mu.Unlock()
+	if cur != nil {
+		t.Fatal("CR-01：停机返回后仍发布了 minerRun（m.current != nil）")
+	}
+
+	// C. 单飞标志零副作用（失败路径未占用 CAS）。
+	// 残留 true 会让 Mine() 闸门永久卡死（nodeapi.go:296），且无任何复位路径。
+	if svc.mining.Load() {
+		t.Fatal("CR-01：mining 标志残留 true —— 无对应 run，Mine() 闸门永久卡死")
+	}
+
+	// D/E. 无 worker 泄漏（确定性判据，非调度推断）。
+	// 依据：m.current 的写入与其唯一的 go 语句位于**同一临界区内、且二者之间
+	// 无任何条件或可失败步骤**，故 B 的 cur == nil 已严格蕴含「本轮未 spawn 任何
+	// mining goroutine」（m.current 全仓唯一写入点，且从不被写回 nil）。
+	// ⇒ 不存在对随后的 store.Close() 的并发写盘（§7F store safety 由此蕴含，
+	// 无需 stub/扩张生产架构）。
+	//
+	// 反例提示：不要改用 svc.startHeight 作证 —— runMiner 存的是
+	// chain.Height()，在仅创世链上合法值就是 0，无法区分「未进入」与「已进入」。
+	if st, _ := svc.miningStateSnapshot(); st != MiningStopped {
+		t.Fatalf("CR-01：停机后挖矿语义状态应为 STOPPED，实际 %s（疑似有 runMiner 进入）", st)
+	}
+
+	// 幂等复检：重复 beginShutdown + 后续 STOP 不得改变上述结论。
+	life.beginShutdown()
+	if _, err := svc.StopMining(); err != nil {
+		t.Fatalf("CR-01：收尾 STOP 失败: %v", err)
+	}
+	if svc.mining.Load() {
+		t.Fatal("CR-01：收尾后 mining 标志仍为 true")
+	}
+	life.mu.Lock()
+	cur = life.current
+	life.mu.Unlock()
+	if cur != nil {
+		t.Fatal("CR-01：收尾后 m.current 非 nil")
+	}
 }
 
 // ---- helpers ----

@@ -16,6 +16,12 @@ package main
 //   - STOP 语义：不再开始新的候选区块；在途 PoW 取消、在途 AddBlock 自然
 //     完成（块可能照常上链，设计冻结 §4/§10），blocks.dat 一致性由
 //     STOP-INV-05 既有保证维护。
+//   - 停机原子性（CR-01）：停机门 closing 的**最终判定**与 m.current 的
+//     **发布**必须同处一个 m.mu 临界区，禁止「预检 → 放锁 → 再判定 → 发布」
+//     的两段式；否则 beginShutdown() 可在窗口内整段完成（stop/wait 均看到
+//     current == nil），随后本函数仍被发布一个无人管辖的 miner —— 该 miner
+//     对已关闭的 store 持续写失败且永不退出（mining 永久 true、Mine() 闸门
+//     永久卡死）。
 
 import (
 	"sync"
@@ -50,7 +56,19 @@ func newMinerLifecycle(svc *nodeService) *minerLifecycle {
 	return &minerLifecycle{svc: svc}
 }
 
+// testStartSeam 仅供测试注入（生产恒为 nil，零副作用，非后门功能；
+// 先例：main.go 的 testPanicAtStart）。
+//
+// 调用点位于 start() 已越过停机预检、尚未占用单飞标志与发布生命周期之前，
+// 即 CR-01 的原始窗口。测试借此建立确定性交错（channel 握手），
+// 无需 sleep / 轮询 / 重复碰概率。任何生产路径都不会设置它。
+var testStartSeam func()
+
 // start 启动持续挖矿（单飞）。maxBlocks>0 保留 boot -max-blocks 既有语义。
+//
+// 停机门为两段式：**无锁预检**（尽早拒绝，不构成安全判定）+ **临界区内最终
+// 判定**（安全判定）。最终判定与单飞 CAS、m.current 发布同处一个 m.mu
+// 临界区（CR-01 修复，见文件头「停机原子性」）。
 //
 // 返回 *control.MineConflictError 表示状态冲突（已在跑 / FAILED / STOPPING /
 // 节点停机中），调用方（control handler）映射为 HTTP 409；CAS 失败亦属冲突，
@@ -58,6 +76,7 @@ func newMinerLifecycle(svc *nodeService) *minerLifecycle {
 func (m *minerLifecycle) start(maxBlocks int) error {
 	s := m.svc
 
+	// ---- 预检（无锁快速路径；只为尽早返回，不构成安全边界）----
 	m.mu.Lock()
 	closing := m.closing
 	m.mu.Unlock()
@@ -73,17 +92,37 @@ func (m *minerLifecycle) start(maxBlocks int) error {
 		}
 	}
 
+	// 测试注入点：已越过停机预检、单飞标志尚未占用、生命周期尚未发布。
+	if seam := testStartSeam; seam != nil {
+		seam()
+	}
+
+	// ---- 单临界区：停机门最终判定 + 单飞 CAS + 生命周期发布 ----
+	// 三者必须原子（CR-01）。任何「判定与发布分离」的写法都会重新打开窗口：
+	// 预检之后 beginShutdown() 可以整段跑完（closing=true → stop() 见
+	// current==nil 无事可做 → wait() 立即返回），随后这里若仍发布一个 run，
+	// 该 run 再也不会有任何人调用 stop()（wait() 已返回），mining 永久为 true。
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closing {
+		// 停机在预检之后启动：拒绝。此失败路径**零副作用** —— CAS 尚未执行
+		// （单飞标志未被占用）、current 未发布，因此不存在需要回滚的残留
+		// s.mining == true（不存在「先占用后回滚」的窗口）。
+		return &control.MineConflictError{Message: "节点正在关闭，拒绝启动挖矿", State: string(MiningStopped)}
+	}
+
 	// 单飞：CAS false→true；失败 = 已有 miner 在跑（含 STOPPING 窗口与并发 START）。
 	if !s.mining.CompareAndSwap(false, true) {
 		st, _ := s.miningStateSnapshot()
 		return &control.MineConflictError{Message: "挖矿已在运行", State: string(st)}
 	}
 
-	m.mu.Lock()
 	run := &minerRun{stopCh: make(chan struct{}), done: make(chan struct{})}
 	m.current = run
-	m.mu.Unlock()
 
+	// 发布与启动同临界区、二者之间无可失败步骤 ⇒ m.current != nil 蕴含该 run
+	// 的 goroutine 已启动（不存在「已发布但未启动」或「已启动但未发布」的中间态）。
 	go func() {
 		defer close(run.done)
 		runMiner(s, maxBlocks, run.stopCh)
@@ -118,6 +157,11 @@ func (m *minerLifecycle) stop() {
 // beginShutdown 标记节点停机开始（拒绝后续 START），并停止+等待挖矿 goroutine
 // 完全退出。必须在 rt.Close()（store 关闭）之前调用，保证不与在途 AddBlock
 // 并发（STOP-INV-05）；在途块自然完成（冻结语义 §10）。幂等。
+//
+// 返回时的保证（CR-01）：不再存在由本管理器管辖的 active mining run。
+// closing=true 的临界区写入与 start() 中「最终判定 + 发布」的临界区互斥，
+// 故本函数返回后不可能再出现新的 published run（因而不会有 miner 对随后的
+// rt.Close()/store.Close() 并发写盘）。
 func (m *minerLifecycle) beginShutdown() {
 	m.mu.Lock()
 	m.closing = true
