@@ -2,8 +2,10 @@ package storage_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"p2pchain/internal/storage"
@@ -40,9 +42,13 @@ func TestAcquireDirLockSecondFails(t *testing.T) {
 	}
 }
 
-// TestAcquireDirLockNeverOverwritesExisting 预置已知内容的 lock，第二次获取必须失败，
-// 且原 lock 内容完全不变（绝不覆盖、绝不截断）。
-func TestAcquireDirLockNeverOverwritesExisting(t *testing.T) {
+// TestStaleLockFileIsReclaimed R2 语义迁移（原 TestAcquireDirLockNeverOverwritesExisting）：
+// 预置 stale 残留 lock（无活持有者）——R2 内核生命周期锁下，接管与否由内核锁
+// 判定（锁空闲 = 持有者已死），文件存在性不再是拒绝依据：必须成功接管，
+// 并以 Truncate+覆写复写 stale 内容为本进程 pid（Release 的归属校验依赖它）。
+// 「绝不覆盖」约束相应迁移为：活持有者在位时（内核锁被持有）绝不触碰文件
+// （见 TestKernelLockMutualExclusionWhileHolderAlive）。
+func TestStaleLockFileIsReclaimed(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "node.lock")
 	known := []byte("pid=9999\nstarted_at=2000-01-01T00:00:00Z\n")
@@ -50,19 +56,18 @@ func TestAcquireDirLockNeverOverwritesExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := storage.AcquireDirLock(dir)
-	if err == nil {
-		t.Fatal("预置 lock 时应拒绝启动")
+	lock, err := storage.AcquireDirLock(dir)
+	if err != nil {
+		t.Fatalf("stale 残留（无活持有者）应被接管，实际被拒: %v", err)
 	}
-	if !errors.Is(err, storage.ErrDatadirLocked) {
-		t.Fatalf("应识别为 ErrDatadirLocked，实际: %v", err)
-	}
+	defer lock.Release()
 	got, err := os.ReadFile(lockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != string(known) {
-		t.Fatalf("已有 lock 内容被覆盖/截断:\n 原=%q\n 现=%q", known, got)
+	want := fmt.Sprintf("pid=%d\n", os.Getpid())
+	if !strings.HasPrefix(string(got), want) {
+		t.Fatalf("接管后内容应被复写为本进程 pid（前缀 %q），实际: %q", want, got)
 	}
 }
 

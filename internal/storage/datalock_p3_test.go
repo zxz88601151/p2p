@@ -75,10 +75,12 @@ func TestReleaseDeletesOwnLockByPID(t *testing.T) {
 	}
 }
 
-// TestEmptyCorruptedLockContentTolerated （PHASE P3.1 §6 Test 5）
-// 预置 node.lock 内容为空 / 仅 pid 字段 / 乱码三种情况：启动必须稳定返回
-// ErrDatadirLocked，不得 panic，不得误报为回放/其他错误类型。
-func TestEmptyCorruptedLockContentTolerated(t *testing.T) {
+// TestEmptyCorruptedStaleContentReclaimed （R2 语义迁移，原 TestEmptyCorruptedLockContentTolerated）
+// 预置 node.lock 内容为空 / 仅 pid 字段 / 乱码三种情况——R2 下锁仲裁由内核锁承担，
+// 无活持有者时这些 stale 内容必须被稳定接管：不 panic、复写为本进程 pid 的合法
+// 诊断信息（原「拒绝启动」断言随「文件存在性锁 → 内核生命周期锁」迁移；活持有
+// 在位时的拒绝由内核锁测试覆盖）。
+func TestEmptyCorruptedStaleContentReclaimed(t *testing.T) {
 	cases := []struct {
 		name    string
 		content string
@@ -94,12 +96,18 @@ func TestEmptyCorruptedLockContentTolerated(t *testing.T) {
 			if err := os.WriteFile(p, []byte(c.content), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			_, err := AcquireDirLock(dir)
-			if err == nil {
-				t.Fatal("空/损坏 lock 内容时应拒绝启动")
+			lock, err := AcquireDirLock(dir)
+			if err != nil {
+				t.Fatalf("stale 内容（无活持有者）应被接管，实际: %v", err)
 			}
-			if !errors.Is(err, ErrDatadirLocked) {
-				t.Fatalf("应统一识别为 ErrDatadirLocked，实际: %v", err)
+			defer lock.Release()
+			data, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := parseLockPID(data)
+			if err != nil || pid != os.Getpid() {
+				t.Fatalf("接管后应复写为本进程 pid（%d），实际: %q（err=%v）", os.Getpid(), data, err)
 			}
 		})
 	}
