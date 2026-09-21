@@ -19,6 +19,19 @@ import (
 	"p2pchain/internal/pow"
 )
 
+// maxActivationTimestampSlack 是 R3（SEC-CLOSE MUST FIX 4）激活后区块时间戳
+// 相对父块 MTP 的最大允许超前量（2 小时，与激活前 maxFutureTimestampDrift 的
+// 量纲一致）。
+//
+// 共识语义（post-activation 完整规则，纯链内、无墙钟）：
+//
+//	MTP(parent) < ts <= MTP(parent) + 7200
+//
+// 下界（> MTP）防 timewarp；上界（≤ MTP+slack）封顶时间戳膨胀：
+// 没有上界时，掌握出块权的攻击者可把候选块时间戳设到任意远未来，人为拉长
+// 难度窗口的时间跨度、压低 retarget 后的难度，从而以低成本持续出块。
+const maxActivationTimestampSlack int64 = 7200
+
 // unsafeView 在调用方已持锁时提供无锁的 pow.ChainView 实现。
 // 它直接读取 bc.blocks 切片，绝不自行加锁。
 type unsafeView struct{ bc *Blockchain }
@@ -88,9 +101,11 @@ func (bc *Blockchain) validateBits(b *block.Block, height int) error {
 // validateTimestamp 按激活状态分叉时间戳规则：
 //   - 激活前（旧规则，共识 + 中继策略）：不得早于父块（保证难度跨度单调），
 //     且不得大幅超前本地时钟（maxFutureTimestampDrift，墙钟仅作中继拒收，非共识分叉源）。
-//   - 激活后（新规则）：必须严格大于父块 MTP（窗口 [max(0,parentH-10), parentH]），
-//     彻底剥离墙钟依赖——timewarp 攻击因「不得 ≤ MTP」被天然防御，且墙钟偏差/恶意时钟
-//     都不会造成永久共识分叉。
+//   - 激活后（新规则，R3 后的完整规则）：MTP(parent) < ts <= MTP(parent)+7200。
+//     下界必须严格大于父块 MTP（窗口 [max(0,parentH-10), parentH]），彻底剥离
+//     墙钟依赖——timewarp 攻击因「不得 ≤ MTP」被天然防御，且墙钟偏差/恶意时钟
+//     都不会造成永久共识分叉；上界封顶时间戳膨胀，防持有出块权者以远未来时间戳
+//     拉长难度时间跨度、压低 retarget 难度（见 maxActivationTimestampSlack）。
 func (bc *Blockchain) validateTimestamp(b *block.Block, tip *block.Block, height int) error {
 	if !pow.IsActivationActive(height, bc.activationHeight) {
 		if b.Header.Timestamp < tip.Header.Timestamp {
@@ -105,6 +120,10 @@ func (bc *Blockchain) validateTimestamp(b *block.Block, tip *block.Block, height
 	if b.Header.Timestamp <= mtp {
 		return fmt.Errorf("%w: 时间戳 %d 未严格大于父块 MTP %d（post-activation 规则）", ErrTimestampOutOfRange, b.Header.Timestamp, mtp)
 	}
+	if b.Header.Timestamp > mtp+maxActivationTimestampSlack {
+		return fmt.Errorf("%w: 时间戳 %d 超过父块 MTP+%d 上界 %d（post-activation 规则）",
+			ErrTimestampOutOfRange, b.Header.Timestamp, maxActivationTimestampSlack, mtp+maxActivationTimestampSlack)
+	}
 	return nil
 }
 
@@ -113,20 +132,38 @@ func (bc *Blockchain) RequiredVersionFor(height int) uint32 {
 	return pow.VersionForHeight(height, bc.activationHeight)
 }
 
+// clampMiningTimestamp 将候选块时间戳夹到共识合法窗口 [mtp+1, mtp+maxActivationTimestampSlack]
+// 内（采矿策略，非共识）：
+//   - now < mtp+1：链短暂超前（MTP 追上来了）→ 取 mtp+1（下界）；
+//   - mtp+1 <= now <= mtp+slack：取 now（正常路径，贴近真实时间）；
+//   - now > mtp+slack：链停滞超过 2 小时后恢复（MTP 远落后于墙钟）→ 取
+//     mtp+slack（上界）。没有这一夹取，恢复挖矿的模板会因自己的新上界被
+//     validateTimestamp 拒绝——链停滞 >2h 后永远无法再出块（死锁）。
+func clampMiningTimestamp(now, mtp int64) int64 {
+	ts := now
+	if ts < mtp+1 {
+		ts = mtp + 1
+	}
+	if ts > mtp+maxActivationTimestampSlack {
+		ts = mtp + maxActivationTimestampSlack
+	}
+	return ts
+}
+
 // MiningTimestamp 返回给定高度候选块应使用的时间戳（采矿策略）：
 //   - 激活前：本地当前时间（沿用旧行为）；
-//   - 激活后：max(本地当前时间, 父块 MTP + 1)，保证满足 post-activation 的
-//     Timestamp > MTP(parent) 共识要求，同时尽量贴近真实时间。
+//   - 激活后：clamp(本地当前时间, [MTP(parent)+1, MTP(parent)+7200])，
+//     保证模板恒满足 post-activation 共识窗口（> MTP 且 ≤ MTP+7200），
+//     同时尽量贴近真实时间。
 //
-// 注意：这是**采矿策略**而非共识——共识只要求 > MTP(parent)，具体取值由矿工决定。
+// 注意：这是**采矿策略**而非共识——共识窗口由 validateTimestamp 强制，
+// 窗口内的具体取值由矿工决定。
 func (bc *Blockchain) MiningTimestamp(height int) int64 {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 	ts := time.Now().Unix()
 	if pow.IsActivationActive(height, bc.activationHeight) {
-		if mtp := bc.medianTimePast(height - 1); mtp+1 > ts {
-			ts = mtp + 1
-		}
+		ts = clampMiningTimestamp(ts, bc.medianTimePast(height-1))
 	}
 	return ts
 }

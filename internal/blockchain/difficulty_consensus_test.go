@@ -645,6 +645,11 @@ func TestDualNodeConsistencyAcrossActivation(t *testing.T) {
 
 // ---- 测试 23：post-activation 共识忽略墙钟（policy/consensus 分离） ----
 
+// TestPostActivationIgnoresWallClock（R3 语义迁移）：墙钟无关性的忠实验证方式
+// 不再是「任意远未来时间戳被接受」（R3 上界明确封堵时间戳膨胀，见
+// maxActivationTimestampSlack），而是「**MTP 被合法推高到本地墙钟未来之后**，
+// ts=MTP+7200 的块虽远超墙钟上限 now+7200，consensus 仍接受」——
+// 共识判定全程不读本地时钟，上界锚定 MTP（链内量）而非墙钟。
 func TestPostActivationIgnoresWallClock(t *testing.T) {
 	actH := 11
 	miner := newTestWallet(t)
@@ -653,23 +658,49 @@ func TestPostActivationIgnoresWallClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for h := 1; h <= 12; h++ {
+	// 激活前（h=1..10）：手工块把链时间合法推到未来 ~7000s
+	//（pre-activation 墙钟规则允许 ts ∈ [父块ts, now+7200]）。
+	for h := 1; h < actH; h++ {
+		tip, err := bc.Tip()
+		if err != nil {
+			t.Fatalf("读取链尾失败: %v", err)
+		}
+		height := bc.Height() + 1
+		cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(height), height)
+		c := block.NewCandidateBlock(tip.Header.Hash(), bc.CurrentBits(), []*transaction.Transaction{cb})
+		c.Header.Version = bc.RequiredVersionFor(height)
+		c.Header.Timestamp = time.Now().Unix() + 7000
+		if found, _ := pow.Mine(c); !found {
+			t.Fatal("采矿失败")
+		}
+		if err := bc.AddBlock(c); err != nil {
+			t.Fatalf("激活前未来时间戳块应被接受: %v", err)
+		}
+	}
+	// 激活后（h=11..22）：MiningTimestamp 自动 clamp（MTP≈now+7000 → ts=mtp+1，
+	// 链时间保持在墙钟未来），推进过激活边界。
+	for h := actH; h <= actH+11; h++ {
 		mineBlockActivated(t, bc, w)
 	}
+
 	parentH := bc.Height()
 	mtp := pow.MedianTimePastAt(bc, parentH, actH)
 	height := bc.Height() + 1
 	tip, _ := bc.Tip()
 	cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(height), height)
-	// 时间戳远超 now+7200（墙钟上限），但仍 > MTP(parent) → consensus 接受（墙钟不影响共识）。
+	// ts=MTP+7200：落在共识窗口上边界内，但按本地墙钟衡量已远超 now+7200
+	//（自检：mtp>now ⇒ mtp+7200 > now+7200）——墙钟上限若仍在起作用必拒。
 	c := block.NewCandidateBlock(tip.Header.Hash(), bc.CurrentBits(), []*transaction.Transaction{cb})
 	c.Header.Version = pow.NewBlockVersion
-	c.Header.Timestamp = mtp + 1 + (7200 + 86400)
+	c.Header.Timestamp = mtp + 7200
 	if found, _ := pow.Mine(c); !found {
 		t.Fatal("采矿失败")
 	}
+	if !(mtp > time.Now().Unix()) {
+		t.Fatalf("测试前提不成立：MTP(%d) 应已高于本地墙钟 now(%d)", mtp, time.Now().Unix())
+	}
 	if err := bc.AddBlock(c); err != nil {
-		t.Fatalf("post-activation 远超墙钟但>MTP 的块应被 consensus 接受，实际 %v", err)
+		t.Fatalf("post-activation 超墙钟上限但 ≤MTP+7200 的块应被 consensus 接受（墙钟无关），实际 %v", err)
 	}
 }
 
