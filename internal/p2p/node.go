@@ -58,8 +58,14 @@ const (
 	// 64 个祖先足以覆盖「几分钟分区」级别的正常分叉；更深的缺口由请求方
 	// 分多轮补齐（每轮同样有上限与轮次上限）。
 	MaxAncestorsPerResp = 64
-	// handshakeTimeout 建立连接后必须在该时间内收到握手消息。
+	// handshakeTimeout 建立连接后必须在该时间内收到握手消息（R1-B 起真正强制：
+	// 未完成握手前每次读都以该值为 deadline，超时即断开）。
 	handshakeTimeout = 10 * time.Second
+	// R1-B（SEC-CLOSE MUST FIX 2）：连接资源限额，堵住无上限 accept 的资源耗尽面
+	//（连接洪水 / 慢握手槽位占用 / 日食式连接挤占）。测试按生产值直接验证。
+	maxInbound     = 125 // 入站连接上限（含未完成握手者）
+	maxPeers       = 128 // 对端总数上限（入站 + 外拨）
+	handshakeQuota = 32  // 同时处于「已注册未握手」状态的连接配额
 	// readTimeout / writeTimeout 单次读写超时。
 	readTimeout  = 60 * time.Second
 	writeTimeout = 10 * time.Second
@@ -161,9 +167,10 @@ type Peer struct {
 	Conn        net.Conn
 	mu          sync.Mutex
 	sendFails   int
-	handshaked  bool
+	handshaked  atomic.Bool // R1-B：原子化——accept 侧限额统计需无锁读取
 	lastActive  time.Time
 	pendingResp int
+	inbound     bool // R1-B：入站/外拨标记（限额统计用）
 
 	// R1-A 出站队列：广播只入队，由该连接唯一的 writer goroutine 串行写出。
 	outQ       chan outboundMsg
@@ -173,10 +180,11 @@ type Peer struct {
 }
 
 // newPeer 构造 Peer 并初始化出站队列（R1-A）。
-func newPeer(addr string, conn net.Conn) *Peer {
+func newPeer(addr string, conn net.Conn, inbound bool) *Peer {
 	return &Peer{
 		Addr:       addr,
 		Conn:       conn,
+		inbound:    inbound,
 		lastActive: time.Now(),
 		outQ:       make(chan outboundMsg, outboundQueueCap),
 		closed:     make(chan struct{}),
@@ -321,7 +329,11 @@ func (n *Node) ConnectToPeer(addr string) error {
 		n.mu.RUnlock()
 		return nil // 已连接
 	}
+	full := len(n.peers) >= maxPeers // R1-B：外拨预检（handleConn 侧还有第二道闸）
 	n.mu.RUnlock()
+	if full {
+		return fmt.Errorf("对端总数已达上限 %d，拒绝外拨 %s", maxPeers, addr)
+	}
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -544,10 +556,37 @@ func (n *Node) dropPeer(p *Peer, reason string) {
 	log.Printf("[p2p] 断开对等节点 %s（%s）", p.Addr, reason)
 }
 
+// peerLimitRejectionLocked 在持有 n.mu 时判断是否应拒绝该连接，返回拒绝原因
+// （空串 = 放行）。统计口径：maxPeers=全部已注册对端；maxInbound=其中入站者；
+// handshakeQuota=已注册但尚未完成握手者（含入站与外拨）。
+func (n *Node) peerLimitRejectionLocked(peer *Peer) string {
+	total := len(n.peers)
+	inboundN, pending := 0, 0
+	for _, p := range n.peers {
+		if p.inbound {
+			inboundN++
+		}
+		if !p.handshaked.Load() {
+			pending++
+		}
+	}
+	if total >= maxPeers {
+		return fmt.Sprintf("对端总数已达上限 %d", maxPeers)
+	}
+	if peer.inbound && inboundN >= maxInbound {
+		return fmt.Sprintf("入站连接已达上限 %d", maxInbound)
+	}
+	if pending >= handshakeQuota {
+		return fmt.Sprintf("未握手连接已达配额 %d", handshakeQuota)
+	}
+	return ""
+}
+
 // handleConn 处理一条连接的完整生命周期：握手 → 消息循环 → 清理。
 func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	remote := conn.RemoteAddr().String()
-	peer := newPeer(remote, conn)
+	inbound := !outbound
+	peer := newPeer(remote, conn, inbound)
 
 	n.mu.Lock()
 	if n.closing {
@@ -558,6 +597,17 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	if old, dup := n.peers[remote]; dup && old != peer {
 		n.mu.Unlock()
 		_ = conn.Close() // 同一地址已有活跃连接
+		return
+	}
+	// R1-B：连接资源限额（在同一临界区内「统计 + 注册」，避免竞态超额）。
+	// 入站受 maxInbound / handshakeQuota / maxPeers 约束；外拨受 maxPeers 约束
+	//（ConnectToPeer 预检之外的第二道闸，防并发外拨穿透）。
+	if reason := n.peerLimitRejectionLocked(peer); reason != "" {
+		n.mu.Unlock()
+		obs.Emit("CONN_REJECTED", "peer", remote, "reason", reason,
+			"peer_count", len(n.peers))
+		log.Printf("[p2p] 拒绝连接 %s（%s）", remote, reason)
+		_ = conn.Close()
 		return
 	}
 	n.peers[remote] = peer
@@ -592,7 +642,13 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	reader := bufio.NewReaderSize(conn, 64*1024)
 	prevCycleEnd := time.Now() // READ_WAIT 语义：上一轮 dispatch 结束（或连接建立）到本轮 read 返回的间隔
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		// R1-B：握手死线强制——未完成握手前，每次读都以 handshakeTimeout 为 deadline；
+		// 完成握手后恢复常规 readTimeout。（原实现声明 handshakeTimeout 却从未执行。）
+		readDeadline := readTimeout
+		if !peer.handshaked.Load() {
+			readDeadline = handshakeTimeout
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			return
@@ -611,11 +667,11 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 		}
 		peer.mu.Lock()
 		peer.lastActive = time.Now()
-		if msg.Type == MsgHandshake {
-			peer.handshaked = true
-		}
-		handshaked := peer.handshaked
 		peer.mu.Unlock()
+		if msg.Type == MsgHandshake {
+			peer.handshaked.Store(true)
+		}
+		handshaked := peer.handshaked.Load()
 
 		// 未握手前只接受握手消息，避免未识别连接直接注入区块/交易
 		if !handshaked && msg.Type != MsgHandshake {
