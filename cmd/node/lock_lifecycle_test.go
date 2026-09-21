@@ -14,6 +14,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"p2pchain/internal/storage"
 )
@@ -72,7 +74,7 @@ func gracefulShutdownReleasesLock(t *testing.T) {
 // （node.lock 删除）→ 下一次启动可重新获取。禁止只测单一失败点。
 func TestAllInitFailuresReleaseLock(t *testing.T) {
 	cases := []struct {
-		name  string
+		name   string
 		inject func(dir string) // 在 datadir 内构造触发该阶段失败的现场
 	}{
 		{"OpenFileBlockStore失败(blocks.dat为目录)", func(dir string) {
@@ -124,35 +126,87 @@ func TestAllInitFailuresReleaseLock(t *testing.T) {
 	}
 }
 
-// TestCLIHintPresentOnLocked （PHASE P3.1 §6 Test 6）
-// 触发 DATADIR_LOCKED，捕获 stderr：必须包含固定引导文案与实际 datadir 路径；
-// 不得包含「自动」处理的暗示。
+// TestCLIHintPresentOnLocked （PHASE P3.1 §6 Test 6；R2 语义迁移 2026-09-21）
+// R2（内核生命周期锁）后锁权威在内核锁而非文件存在性，原「写入残留 lock 文件
+// → 节点必须拒绝启动」的断言已与规格冲突（见 storage 包 TestStaleLockFileIsReclaimed
+// 的同批迁移），拆为两个场景：
+//
+//	场景 1（残留 lock 文件 → 接管）：node.lock 文件存在但无内核锁（写入者
+//	进程已死）→ 节点必须接管并正常启动（内核锁获取成功 + 诊断信息被覆写），
+//	不得因残留文件拒绝启动；stderr 不得出现「已被另一个节点进程占用」。
+//	场景 2（活锁占用 → CLI 引导）：锁被活进程（本测试进程）持有 → 子进程
+//	必须快速非零退出，stderr 含固定引导文案（「已被另一个节点进程占用」、
+//	「手动删除」、实际 lock 路径），不得暗示自动处理。
 func TestCLIHintPresentOnLocked(t *testing.T) {
 	bin := buildNodeBinary(t)
-	dir := t.TempDir()
-	lockPath := filepath.Join(dir, "node.lock")
-	if err := os.WriteFile(lockPath, []byte("pid=12345\nstarted_at=2000-01-01T00:00:00Z\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	_ = cmd.Run() // 期望非零退出（log.Fatalf → os.Exit(1)）
 
-	out := stderr.String()
-	if !strings.Contains(out, "已被另一个节点进程占用") {
-		t.Fatalf("应含「被另一个节点进程占用」提示，实际:\n%s", out)
-	}
-	// §2.5 固定引导文案 + 实际路径
-	if !strings.Contains(out, "手动删除") {
-		t.Fatalf("应含「手动删除」引导文案，实际:\n%s", out)
-	}
-	if !strings.Contains(out, lockPath) {
-		t.Fatalf("应含实际 node.lock 绝对路径 %s，实际:\n%s", lockPath, out)
-	}
-	if strings.Contains(out, "自动") {
-		t.Fatalf("引导文案不得暗示自动处理残留 lock，实际:\n%s", out)
-	}
+	t.Run("stale_lock_file_is_taken_over", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, "node.lock")
+		if err := os.WriteFile(lockPath, []byte("pid=12345\nstarted_at=2000-01-01T00:00:00Z\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("节点进程启动失败: %v", err)
+		}
+		// 轮询诊断信息被覆写（pid≠12345）= 内核锁接管成功
+		deadline := time.Now().Add(20 * time.Second)
+		takenOver := false
+		for time.Now().Before(deadline) {
+			if b, err := os.ReadFile(lockPath); err == nil && len(b) > 0 && !bytes.Contains(b, []byte("pid=12345")) {
+				takenOver = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		if !takenOver {
+			t.Fatalf("残留 node.lock（写入者已死）应被接管（诊断信息覆写为存活 pid），实际 stderr:\n%s", stderr.String())
+		}
+		if out := stderr.String(); strings.Contains(out, "已被另一个节点进程占用") {
+			t.Fatalf("残留 lock 文件不应触发占用提示（R2 接管语义），实际 stderr:\n%s", out)
+		}
+	})
+
+	t.Run("live_lock_shows_cli_hint", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, "node.lock")
+		l, err := storage.AcquireDirLock(dir)
+		if err != nil {
+			t.Fatalf("测试进程持锁失败: %v", err)
+		}
+		defer func() { _ = l.Release() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if runErr := cmd.Run(); runErr == nil { // 期望快速非零退出（log.Fatalf → os.Exit(1)）
+			t.Fatalf("活锁占用下节点应非零退出")
+		}
+
+		out := stderr.String()
+		if !strings.Contains(out, "已被另一个节点进程占用") {
+			t.Fatalf("应含「被另一个节点进程占用」提示，实际:\n%s", out)
+		}
+		// §2.5 固定引导文案 + 实际路径
+		if !strings.Contains(out, "手动删除") {
+			t.Fatalf("应含「手动删除」引导文案，实际:\n%s", out)
+		}
+		if !strings.Contains(out, lockPath) {
+			t.Fatalf("应含实际 node.lock 绝对路径 %s，实际:\n%s", lockPath, out)
+		}
+		if strings.Contains(out, "自动") {
+			t.Fatalf("引导文案不得暗示自动处理残留 lock，实际:\n%s", out)
+		}
+	})
 }
 
 // TestPanicPathReleasesLock （PHASE P3.1 §6 Test 7）

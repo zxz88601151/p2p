@@ -563,23 +563,60 @@ func TestResetAfterGracefulStopNeedsNoForce(t *testing.T) {
 	}
 }
 
-// TestResetRefusesWhenStopFailed 覆盖 STOP-INV-09 的边界：
-// 若停止确实失败（锁残留），reset 必须拒绝并提示，而不是静默成功。
+// TestResetRefusesWhenStopFailed 覆盖 STOP-INV-09 的边界（R2 语义迁移 2026-09-21）。
+// R2（内核生命周期锁）后锁权威在内核锁而非文件存在性：写入者进程死 → 内核锁随
+// 进程释放，残留 node.lock 文件不再是屏障（与 storage 包 TestStaleLockFileIsReclaimed、
+// lock_lifecycle_test.go TestCLIHintPresentOnLocked 的同批迁移一致），拆为两个场景：
+//
+//	场景 1（硬杀 → 接管成功）：kill 硬杀节点（「停止失败」的最坏外部表现）后
+//	node.lock 文件残留，但内核锁已随进程死亡释放 → cmdReset 必须接管（返回 0）
+//	并完整清理，这正是 R2 的产品收益（崩溃残留不再需要 --force）；随后同目录
+//	应可正常重启。
+//	场景 2（真·停止失败 → 拒绝）：锁仍被活进程（本测试进程）持有 = 节点实际
+//	未停止 → cmdReset 必须非零退出并报告「已被占用」（STOP-INV-09：不得静默
+//	报告成功）。
 func TestResetRefusesWhenStopFailed(t *testing.T) {
-	dir := t.TempDir()
-	n := startRealNode(t, dir)
-	n.kill() // 硬杀：模拟「停止失败」的最坏情况
-	if _, err := os.Stat(filepath.Join(dir, "node.lock")); err != nil {
-		t.Fatalf("硬杀后应残留 node.lock，实际: %v", err)
-	}
-	withStdin(t, "yes\n", true)
-	var out, errBuf bytes.Buffer
-	code := cmdReset([]string{"-datadir", dir}, &out, &errBuf)
-	if code == 0 {
-		t.Fatal("锁残留时 reset 应拒绝并报错，实际返回 0")
-	}
-	body := out.String() + errBuf.String()
-	if !strings.Contains(body, "已被占用") {
-		t.Fatalf("应报告目录被占用，实际: %s", body)
-	}
+	t.Run("hard_kill_then_reset_takes_over", func(t *testing.T) {
+		dir := t.TempDir()
+		n := startRealNode(t, dir)
+		n.kill() // 硬杀：模拟「停止失败」的最坏情况
+		if _, err := os.Stat(filepath.Join(dir, "node.lock")); err != nil {
+			t.Fatalf("硬杀后应残留 node.lock 文件，实际: %v", err)
+		}
+		// cmdReset 接管成功后会走到确认提示，需预置 yes 输入
+		withStdin(t, "yes\n", true)
+		var out, errBuf bytes.Buffer
+		code := cmdReset([]string{"-datadir", dir}, &out, &errBuf)
+		if code != 0 {
+			t.Fatalf("硬杀后内核锁已随进程释放，reset 应接管成功（R2 语义），退出码=%d 输出=%s%s",
+				code, out.String(), errBuf.String())
+		}
+		assertClean(t, dir)
+		// 接管成功后同目录应可正常重启（无残留死锁）
+		n2 := startRealNode(t, dir)
+		if _, err := n2.status(); err != nil {
+			t.Fatalf("reset 后重启失败: %v", err)
+		}
+	})
+
+	t.Run("live_lock_then_reset_refuses", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := storage.AcquireDirLock(dir)
+		if err != nil {
+			t.Fatalf("测试进程持锁失败: %v", err)
+		}
+		defer func() { _ = l.Release() }()
+		// 预置 yes 输入：拒绝发生在占用探测阶段（确认提示之前）；若流程意外
+		// 走到提示并确认成功，code==0 断言会失败并暴露问题，不会误判为通过
+		withStdin(t, "yes\n", true)
+		var out, errBuf bytes.Buffer
+		code := cmdReset([]string{"-datadir", dir}, &out, &errBuf)
+		if code == 0 {
+			t.Fatal("锁被活进程持有时 reset 应拒绝并报错（STOP-INV-09），实际返回 0")
+		}
+		body := out.String() + errBuf.String()
+		if !strings.Contains(body, "已被占用") {
+			t.Fatalf("应报告目录被占用，实际: %s", body)
+		}
+	})
 }
