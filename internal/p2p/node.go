@@ -13,7 +13,10 @@
 //   - 读取超时与写超时，避免死连接长期占用；
 //   - 发送失败达到阈值即断开并清理，避免僵尸连接；
 //   - 消息按类型分发，未知类型忽略并记录；
-//   - 广播支持 except 参数，避免中继回环导致的广播风暴。
+//   - 广播支持 except 参数，避免中继回环导致的广播风暴；
+//   - R1-A：每对端有界出站队列 + 独立 writer goroutine——广播只做非阻塞入队，
+//     慢对端只能拖垮自己的队列（溢出丢帧），绝不阻塞调用方（尤其是挖矿临界区）
+//     与其他健康对端的投递。
 package p2p
 
 import (
@@ -24,6 +27,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"p2pchain/internal/obs"
@@ -61,6 +65,10 @@ const (
 	writeTimeout = 10 * time.Second
 	// maxSendFailures 连续发送失败阈值，达到即断开该连接。
 	maxSendFailures = 3
+	// outboundQueueCap R1-A：每对端出站队列容量（消息条数，有界）。
+	// 写端被慢对端卡住时，队列填满后新广播对该对端直接丢弃（非阻塞语义），
+	// 丢帧的对端靠既有同步/孤儿恢复机制补齐。
+	outboundQueueCap = 256
 )
 
 // Message 传输信封；Payload 按 Type 解析为不同结构。
@@ -140,6 +148,13 @@ type Handler interface {
 	OnBlockByHashResp(peerAddr string, payload BlockByHashRespPayload)
 }
 
+// outboundMsg 出站队列元素：已序列化的完整线上帧（含结尾 '\n'）。
+// 广播路径对同一条消息只做一次 Marshal，随后逐对端入队共享同一底层数组（只读）。
+type outboundMsg struct {
+	data  []byte
+	mtype string // 观测用（WRITE_TIMEOUT / SEND_ERROR / OVERFLOW 事件载荷）
+}
+
 // Peer 一条已建立的连接及其状态。
 type Peer struct {
 	Addr        string
@@ -149,6 +164,28 @@ type Peer struct {
 	handshaked  bool
 	lastActive  time.Time
 	pendingResp int
+
+	// R1-A 出站队列：广播只入队，由该连接唯一的 writer goroutine 串行写出。
+	outQ       chan outboundMsg
+	closed     chan struct{} // 连接终结信号（dropPeer / handleConn 清理时关闭）
+	closeOnce  sync.Once
+	queueDrops atomic.Uint64 // 队列满被丢弃的广播条数（观测用）
+}
+
+// newPeer 构造 Peer 并初始化出站队列（R1-A）。
+func newPeer(addr string, conn net.Conn) *Peer {
+	return &Peer{
+		Addr:       addr,
+		Conn:       conn,
+		lastActive: time.Now(),
+		outQ:       make(chan outboundMsg, outboundQueueCap),
+		closed:     make(chan struct{}),
+	}
+}
+
+// signalClosed 发出连接终结信号（幂等）；出站 writer 收到后退出。
+func (p *Peer) signalClosed() {
+	p.closeOnce.Do(func() { close(p.closed) })
 }
 
 // Node 一个 P2P 节点。
@@ -272,6 +309,7 @@ func (n *Node) Stop() {
 	n.mu.Unlock()
 
 	for _, p := range peers {
+		p.signalClosed() // R1-A：终结各连接的出站 writer
 		_ = p.Conn.Close()
 	}
 }
@@ -337,8 +375,13 @@ func (n *Node) Broadcast(msg Message) { n.BroadcastExcept(msg, "") }
 
 // BroadcastExcept 向除 except 之外的全部对等节点发送消息（避免中继回环）。
 //
-// I0/§5：本函数是观测包装——计时与事件在外层，实现体在 broadcastExcept，
-// 行为逐字节保持不变（OBSERVE ≠ CHANGE）。
+// R1-A 语义变更——**非阻塞入队**：消息经每对端有界出站队列（outboundQueueCap）
+// 由该连接唯一的 writer goroutine 串行写出；队列满即对该对端丢弃本条
+// （OUTQ_OVERFLOW 观测）。调用方（包括挖矿临界区内的 commitMinedBlock → broadcastBlock）
+// 永不被慢对端的 TCP 写阻塞；per-peer FIFO、writeTimeout、连续失败断开语义保持不变。
+// 注意：BROADCAST_EXIT.duration_us 自此只度量「序列化 + 入队」耗时，不再包含网络写出时间。
+//
+// I0/§5：本函数是观测包装——计时与事件在外层，实现体在 broadcastExcept。
 func (n *Node) BroadcastExcept(msg Message, except string) {
 	start := time.Now()
 	obs.Emit("BROADCAST_ENTER", "msg_type", string(msg.Type), "except", except,
@@ -348,7 +391,7 @@ func (n *Node) BroadcastExcept(msg Message, except string) {
 		"duration_us", time.Since(start).Microseconds())
 }
 
-// broadcastExcept 是 BroadcastExcept 的原始实现体（I0 拆分，仅观测包装变更）。
+// broadcastExcept 是 BroadcastExcept 的原始实现体（R1-A：同步逐对端写 → 非阻塞入队）。
 func (n *Node) broadcastExcept(msg Message, except string) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -360,6 +403,7 @@ func (n *Node) broadcastExcept(msg Message, except string) {
 		return
 	}
 	data = append(data, '\n')
+	m := outboundMsg{data: data, mtype: string(msg.Type)}
 
 	n.mu.RLock()
 	targets := make([]*Peer, 0, len(n.peers))
@@ -372,24 +416,51 @@ func (n *Node) broadcastExcept(msg Message, except string) {
 	n.mu.RUnlock()
 
 	for _, p := range targets {
-		p.mu.Lock()
-		_ = p.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		_, werr := p.Conn.Write(data)
-		if werr != nil {
-			p.sendFails++
-			fails := p.sendFails
-			p.mu.Unlock()
-			log.Printf("[p2p] 向 %s 发送失败(%d/%d): %v", p.Addr, fails, maxSendFailures, werr)
-			// I0/§5：写失败细分——超时（WRITE_TIMEOUT）与其他（SEND_ERROR）。
-			emitWriteFailure(p.Addr, string(msg.Type), werr)
-			if fails >= maxSendFailures {
-				n.dropPeer(p, "连续发送失败")
-			}
-			continue
+		// R1-A：非阻塞入队。队列满 = 该对端消费过慢（writer 正被 writeTimeout 卡住），
+		// 丢弃本条，绝不阻塞调用方或拖累其他对端的投递。
+		select {
+		case p.outQ <- m:
+		default:
+			p.queueDrops.Add(1)
+			obs.Emit("OUTQ_OVERFLOW", "peer", p.Addr, "msg_type", m.mtype,
+				"queue_cap", outboundQueueCap)
+			log.Printf("[p2p] %s 出站队列已满，丢弃 %s 消息（累计丢弃 %d）",
+				p.Addr, m.mtype, p.queueDrops.Load())
 		}
-		p.sendFails = 0
-		p.lastActive = time.Now()
-		p.mu.Unlock()
+	}
+}
+
+// peerWriter R1-A：单连接出站写 goroutine（每连接恰一个，握手写出后启动）。
+//   - FIFO：按入队顺序写出；与 SendTo / sendHandshake 的直接写经 p.mu 互斥，
+//     保证同一连接上的写永不交错；
+//   - writeTimeout 保留：单次写最多阻塞 writeTimeout；
+//   - maxSendFailures 保留：连续写失败达阈值 → dropPeer；
+//   - 终结：p.closed 关闭（连接清理 / dropPeer）即退出。
+func (n *Node) peerWriter(p *Peer) {
+	for {
+		select {
+		case <-p.closed:
+			return
+		case m := <-p.outQ:
+			p.mu.Lock()
+			_ = p.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			_, werr := p.Conn.Write(m.data)
+			if werr != nil {
+				p.sendFails++
+				fails := p.sendFails
+				p.mu.Unlock()
+				log.Printf("[p2p] 向 %s 发送失败(%d/%d): %v", p.Addr, fails, maxSendFailures, werr)
+				emitWriteFailure(p.Addr, m.mtype, werr)
+				if fails >= maxSendFailures {
+					n.dropPeer(p, "连续发送失败")
+					return
+				}
+				continue
+			}
+			p.sendFails = 0
+			p.lastActive = time.Now()
+			p.mu.Unlock()
+		}
 	}
 }
 
@@ -467,6 +538,7 @@ func (n *Node) dropPeer(p *Peer, reason string) {
 	}
 	n.mu.Unlock()
 	_ = p.Conn.Close()
+	p.signalClosed() // R1-A：终结出站 writer
 	// I0/§5：连接拆除事件（D 受害链终点：连续发送失败即此处的 reason）。
 	obs.Emit("DISCONNECT", "peer", p.Addr, "reason", reason)
 	log.Printf("[p2p] 断开对等节点 %s（%s）", p.Addr, reason)
@@ -475,7 +547,7 @@ func (n *Node) dropPeer(p *Peer, reason string) {
 // handleConn 处理一条连接的完整生命周期：握手 → 消息循环 → 清理。
 func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	remote := conn.RemoteAddr().String()
-	peer := &Peer{Addr: remote, Conn: conn, lastActive: time.Now()}
+	peer := newPeer(remote, conn)
 
 	n.mu.Lock()
 	if n.closing {
@@ -498,11 +570,18 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 		}
 		n.mu.Unlock()
 		_ = conn.Close()
+		peer.signalClosed() // R1-A：终结出站 writer
 		log.Printf("[p2p] 与 %s 的连接已关闭", remote)
 	}()
 
-	// 双方都主动发握手：入站连接也立即回送，简化协议（幂等处理）
+	// 双方都主动发握手：入站连接也立即回送，简化协议（幂等处理）。
+	// 握手必须同步先写：出站 writer 尚未启动，保证「握手先于任何广播」的线上顺序
+	//（修复旧实现中广播与握手竞争 p.mu 时广播可能先于握手上线、被对端当未握手消息丢弃的隐患）。
 	n.sendHandshake(peer)
+
+	// R1-A：此后本连接的全部出站写都由独立 writer 串行完成——
+	// 广播调用方（含挖矿临界区）只做入队，永不被本连接的慢写阻塞。
+	go n.peerWriter(peer)
 
 	// I0/§5：读循环生命周期 —— ENTER 在循环前，EXIT 由 defer 在连接关闭时补记。
 	obs.Emit("READ_LOOP_ENTER", "peer", remote, "height", n.currentHeight())
