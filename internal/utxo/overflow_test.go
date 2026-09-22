@@ -169,8 +169,10 @@ func TestCoinbaseNormalBoundaries(t *testing.T) {
 	t.Run("legal multi-output coinbase passes", func(t *testing.T) {
 		base := NewUTXOSet()
 		w2 := newTestWallet(t)
-		// 30(矿工) + 20(w2) = 50 = Subsidy(1)：合法多输出 coinbase，
+		// 3(矿工) + 2(w2) = 5 = Subsidy(1)：合法多输出 coinbase，
 		// 证明修复 overflow ≠ 禁止 multi-output。
+		// （C1/A-2.3-G2：Subsidy(1) 由 50 变为 5，本用例的总额随之重新取满，
+		//   以继续落在「恰好等于上限」这一被断言的分支上。）
 		cb := &transaction.Transaction{
 			Inputs: []transaction.TxInput{{
 				PrevTxHash: [32]byte{},
@@ -178,8 +180,8 @@ func TestCoinbaseNormalBoundaries(t *testing.T) {
 				Signature:  transaction.EncodeCoinbaseHeight(1),
 			}},
 			Outputs: []transaction.TxOutput{
-				{Value: 30, PubKeyHash: w.PubKeyHash()},
-				{Value: 20, PubKeyHash: w2.PubKeyHash()},
+				{Value: 3, PubKeyHash: w.PubKeyHash()},
+				{Value: 2, PubKeyHash: w2.PubKeyHash()},
 			},
 		}
 		txs := []*transaction.Transaction{cb}
@@ -187,11 +189,11 @@ func TestCoinbaseNormalBoundaries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("合法多输出 coinbase 被拒绝: %v", err)
 		}
-		if got := s1.Balance(w.PubKeyHash(), 1, true); got != 30 {
-			t.Fatalf("矿工余额 = %d, want 30", got)
+		if got := s1.Balance(w.PubKeyHash(), 1, true); got != 3 {
+			t.Fatalf("矿工余额 = %d, want 3", got)
 		}
-		if got := s1.Balance(w2.PubKeyHash(), 1, true); got != 20 {
-			t.Fatalf("第二收款方余额 = %d, want 20", got)
+		if got := s1.Balance(w2.PubKeyHash(), 1, true); got != 2 {
+			t.Fatalf("第二收款方余额 = %d, want 2", got)
 		}
 	})
 }

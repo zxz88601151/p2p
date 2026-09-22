@@ -217,7 +217,9 @@ func TestFullStackTransfer(t *testing.T) {
 	}
 	recipient := recipientWallet.Address()
 
-	const amount, fee = uint64(7), uint64(1)
+	// C1（A-2.3-G2）：首个成熟 coinbase = Subsidy(1) = 5（legacy 为 50）。
+	// amount+fee 必须落在 5 以内且找零 > 0：3+1=4，找零 1。
+	const amount, fee = uint64(3), uint64(1)
 	if beforeSend.Spendable < amount+fee {
 		t.Fatalf("可花费余额 %d 不足以支付 %d + 手续费 %d", beforeSend.Spendable, amount, fee)
 	}

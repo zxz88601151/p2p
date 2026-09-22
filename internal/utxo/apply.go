@@ -16,13 +16,23 @@ const (
 	CoinbaseMaturity = 10
 
 	// subsidyInitial 初始出块奖励（最小单位）。
-	subsidyInitial = 50
+	//
+	// C1 经济政策（A-2.3-G2 实施，项目方已于 A-2.3-F-R4 §5 冻结并授权 Q6）：
+	// 50 → 5。该值属**共识权威**，修改即硬分叉。
+	subsidyInitial = 5
 
 	// subsidyHalvingInterval 奖励减半间隔（块数）。
-	subsidyHalvingInterval = 210
+	//
+	// C1 经济政策（A-2.3-G2 实施）：210 → 5,250,000。该值属**共识权威**。
+	subsidyHalvingInterval = 5_250_000
 )
 
-// Subsidy 返回指定高度区块的出块奖励：初始 50，每 210 块减半，64 次减半后为 0。
+// Subsidy 返回指定高度区块的出块奖励：初始 5，每 5,250,000 块减半。
+//
+// C1 参数（A-2.3-G2）下的权威语义：halvings = height / subsidyHalvingInterval
+// （uint 整除，向下取整）；5 = 0b101 仅 3 位，故第 3 次减半即归零 ——
+// 最后一个非零补贴高度为 15,749,999（补贴 1），归零高度为 15,750,000。
+// halvings >= 64 的守卫保留为**防御性上界**（对 int 高度实际不可达）。
 func Subsidy(height int) uint64 {
 	halvings := uint(height / subsidyHalvingInterval)
 	if halvings >= 64 {

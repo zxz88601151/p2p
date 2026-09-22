@@ -15,7 +15,10 @@ import (
 
 // ---- 测试辅助 ----
 
-const testReward = 50
+// testReward 是测试自带的「本高度补贴值」常量：与创世高度（0）的
+// Subsidy(0) 保持一致，使 mineGenesis 产出的创世 coinbase 恰好落在共识上限上。
+// C1 经济政策（A-2.3-G2）：Subsidy(0) 由 50 变为 5。
+const testReward = 5
 
 func newTestWallet(t *testing.T) *wallet.Wallet {
 	t.Helper()
@@ -107,7 +110,7 @@ func TestAddBlockAcceptsValidChain(t *testing.T) {
 	}
 
 	snap := bc.UTXOSnapshot()
-	// 创世 coinbase(50, 高度 0，已成熟) + 3 个新 coinbase（未成熟不影响 includeImmative 统计）
+	// 创世 coinbase(5, 高度 0，已成熟) + 3 个新 coinbase（未成熟不影响 includeImmative 统计）
 	if got := snap.Balance(miner.PubKeyHash(), bc.Height(), true); got != testReward*4 {
 		t.Fatalf("矿工总余额 = %d, want %d", got, testReward*4)
 	}

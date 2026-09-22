@@ -114,6 +114,8 @@ func (f *reorgMempoolFixture) mineToMaturity() {
 }
 
 // buildSpendTx 构造一笔消费指定 src 给自身的交易。
+// C1（A-2.3-G2）：src 为单个 coinbase 输出，值 = Subsidy(h)（C1 下为 5，
+// legacy 下曾为 50）；amount + change 必须 ≤ 该值（测试取 fee=1）。
 func (f *reorgMempoolFixture) buildSpendTx(src utxo.OutPoint, amount, change uint64) *transaction.Transaction {
 	f.t.Helper()
 	tx := &transaction.Transaction{
@@ -188,7 +190,7 @@ func TestReorgResurrectsDisconnectedTx(t *testing.T) {
 	// h11：coinbase 已成熟，花费 h1 coinbase
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 40, 5) // fee=5
+	tx1 := f.buildSpendTx(src, 4, 0) // fee=1
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
 	// 触发 reorg：从 genesis 分出的更长链（h1'..h12'）
@@ -239,7 +241,7 @@ func TestReorgDoesNotResurrectConfirmedTx(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 40, 5)
+	tx1 := f.buildSpendTx(src, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
 	// 新链也包含 tx1
@@ -283,11 +285,12 @@ func TestReorgRejectsInvalidUnderNewUTXO(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 40, 5)
+	tx1 := f.buildSpendTx(src, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
-	// 新链中某块已花费同一 src
-	txSpendSrc := f.buildSpendTx(src, 30, 15)
+	// 新链中某块已花费同一 src（金额与 tx1 不同 ⇒ 哈希不同，否则会被
+	// ReaddDisconnected 视为「已确认」而跳过，rejected 将为 0）
+	txSpendSrc := f.buildSpendTx(src, 3, 0)
 	// fork 从 genesis 分出 14 块（h1'..h14'），严格长于 canonical（h1..h11）。
 	// txSpendSrc 置于 fork h12'（height=12，h1 coinbase 已度过成熟期 12-1>=10），
 	// 在新链中合法花费 src；reorg 后 canonical 中的 tx1 因双花被拒绝。
@@ -315,7 +318,7 @@ func TestReorgRejectsDoubleSpend(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 40, 5)
+	tx1 := f.buildSpendTx(src, 4, 0)
 
 	// 直接调用：newBase 中 src 已不存在
 	newBase := utxo.NewUTXOSet()
@@ -340,9 +343,9 @@ func TestReorgResurrectsDependentTxs(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 35, 10) // fee=5, out0=35
+	tx1 := f.buildSpendTx(src, 4, 0) // fee=1, out0=4
 	op1 := utxo.OutPoint{Hash: tx1.Hash(), Index: 0}
-	tx2 := f.buildSpendTx(op1, 25, 5) // fee=5
+	tx2 := f.buildSpendTx(op1, 3, 0) // fee=1
 
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1, tx2})
 
@@ -373,11 +376,11 @@ func TestReorgMultiLevelDependency(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 30, 15)
+	tx1 := f.buildSpendTx(src, 4, 0) // fee=1, out0=4
 	op1 := utxo.OutPoint{Hash: tx1.Hash(), Index: 0}
-	tx2 := f.buildSpendTx(op1, 20, 5)
+	tx2 := f.buildSpendTx(op1, 3, 0) // fee=1, out0=3
 	op2 := utxo.OutPoint{Hash: tx2.Hash(), Index: 0}
-	tx3 := f.buildSpendTx(op2, 10, 5)
+	tx3 := f.buildSpendTx(op2, 2, 0) // fee=1
 
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1, tx2, tx3})
 
@@ -402,7 +405,7 @@ func TestReorgRepeatedResurrectionNoDuplicate(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 40, 5)
+	tx1 := f.buildSpendTx(src, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
 	result := f.triggerReorg(f.genesis.Header.Hash(), 1, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
@@ -437,12 +440,12 @@ func TestReorgMempoolCapacityRespected(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src1 := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src1, 40, 5)
+	tx1 := f.buildSpendTx(src1, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
 	b2, _ := f.chain.BlockByHeight(2)
 	src2 := coinbaseOutPoint(b2, 0)
-	tx2 := f.buildSpendTx(src2, 40, 5)
+	tx2 := f.buildSpendTx(src2, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx2})
 
 	result := f.triggerReorg(f.genesis.Header.Hash(), 1, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
@@ -469,7 +472,7 @@ func TestReorgResurrectionFailureDoesNotAffectTIP(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src, 40, 5)
+	tx1 := f.buildSpendTx(src, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
 	result := f.triggerReorg(f.genesis.Header.Hash(), 1, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
@@ -494,7 +497,7 @@ func TestReorgResurrectionFailureDoesNotAffectTIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("block at height 2: %v", err)
 	}
-	txFill := f.buildSpendTx(coinbaseOutPoint(b2, 0), 40, 5)
+	txFill := f.buildSpendTx(coinbaseOutPoint(b2, 0), 4, 0)
 	if err := f.pool.Add(base, txFill, h); err != nil {
 		t.Fatalf("pre-fill pool: %v", err)
 	}
@@ -551,12 +554,12 @@ func TestReorgMultipleDisconnectedBlocks(t *testing.T) {
 
 	b1, _ := f.chain.BlockByHeight(1)
 	src1 := coinbaseOutPoint(b1, 0)
-	tx1 := f.buildSpendTx(src1, 40, 5)
+	tx1 := f.buildSpendTx(src1, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx1})
 
 	b2, _ := f.chain.BlockByHeight(2)
 	src2 := coinbaseOutPoint(b2, 0)
-	tx2 := f.buildSpendTx(src2, 40, 5)
+	tx2 := f.buildSpendTx(src2, 4, 0)
 	f.mineBlockWithTxs([]*transaction.Transaction{tx2})
 
 	// fork 从 h10 分出，3 个 fork 块（h11'..h13'），高度 13 > canonical 12

@@ -175,7 +175,7 @@ func TestValidateTemplateSharesOneRuleSetWithValidateBlock(t *testing.T) {
 					t.Fatal("创世后应存在一个 coinbase 输出")
 				}
 				// 高度 1 上花费高度 0 的 coinbase：maturity(10) 尚未满足
-				spend := spendFrom(t, op, miner, [20]byte{0x22}, 50)
+				spend := spendFrom(t, op, miner, [20]byte{0x22}, testReward)
 				cb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(1), 1)
 				b.Transactions = []*transaction.Transaction{cb, spend}
 				b.Header.MerkleRoot = block.ComputeMerkleRoot(b.Transactions)
@@ -335,7 +335,7 @@ func TestValidateTemplateDoesNotMutateChainState(t *testing.T) {
 //
 // 手法：不构造长链，而是把 `height` 作为参数直接交给 `utxo.ApplyBlock`
 // （它的签名本就接受高度，是实现里唯一的高度来源）。因此本用例调用的是**真实共识代码**，
-// 只是在真实边界高度上调用，从而避开「挖 1260 个区块」的成本，
+// 只是在真实边界高度上调用，从而避开「挖 15,750,000 个区块」的成本，
 // 同时不引入任何测试专用的规则副本。
 //
 // 两条共识规则的合取构成空集：
@@ -345,20 +345,24 @@ func TestValidateTemplateDoesNotMutateChainState(t *testing.T) {
 //
 // α ∧ β 在 Subsidy(height)+fees == 0 时不可满足。
 //
-// 边界对照是**决定性**的：完全相同的 coinbase（总额 1）在高度 1259 被接受、
-// 在高度 1260 被拒绝 —— 唯一的自变量是补贴归零。这排除了「拒绝其实来自别的原因」。
+// 边界对照是**决定性**的：完全相同的 coinbase（总额 1）在高度 15,749,999 被接受、
+// 在高度 15,750,000 被拒绝 —— 唯一的自变量是补贴归零。这排除了「拒绝其实来自别的原因」。
+//
+// C1 经济政策（A-2.3-G2）：归零边界由 1259→1260 移至 15,749,999→15,750,000
+// （subsidyInitial 50→5、subsidyHalvingInterval 210→5,250,000；5 = 0b101 仅 3 位，
+// 故第 3 次减半即为 0）。**决定性手法本身保持不变**，只重参数化。
 func TestZeroSubsidyCoinbaseAdmissibleSetIsEmpty(t *testing.T) {
-	// 前提：补贴恰在 1259→1260 之间归零（50 = 0b110010，仅 6 位，故第 6 次减半即为 0）
-	if got := utxo.Subsidy(1259); got != 1 {
-		t.Fatalf("Subsidy(1259) = %d, want 1（最后一个非零补贴高度）", got)
+	// 前提：补贴恰在 15,749,999→15,750,000 之间归零（5 = 0b101，仅 3 位，故第 3 次减半即为 0）
+	if got := utxo.Subsidy(15_749_999); got != 1 {
+		t.Fatalf("Subsidy(15749999) = %d, want 1（最后一个非零补贴高度）", got)
 	}
-	if got := utxo.Subsidy(1260); got != 0 {
-		t.Fatalf("Subsidy(1260) = %d, want 0（补贴归零边界）", got)
+	if got := utxo.Subsidy(15_750_000); got != 0 {
+		t.Fatalf("Subsidy(15750000) = %d, want 0（补贴归零边界）", got)
 	}
 
 	miner := newTestWallet(t)
 
-	// 基础集合：仅含高度 0 的 coinbase（矿工持有 50），供手续费交易消费
+	// 基础集合：仅含高度 0 的 coinbase（矿工持有 5），供手续费交易消费
 	genesisCb := transaction.NewCoinbaseTx(miner.PubKeyHash(), utxo.Subsidy(0), 0)
 	base, _, err := utxo.ApplyBlock(utxo.NewUTXOSet(), []*transaction.Transaction{genesisCb}, 0)
 	if err != nil {
@@ -379,8 +383,8 @@ func TestZeroSubsidyCoinbaseAdmissibleSetIsEmpty(t *testing.T) {
 
 	t.Run("规则α 总额0被零值输出规则拒绝", func(t *testing.T) {
 		// 总额 0 只有一种实现：一个金额为 0 的输出
-		zero := transaction.NewCoinbaseTx(miner.PubKeyHash(), 0, 1260)
-		_, _, err := utxo.ApplyBlock(base, []*transaction.Transaction{zero}, 1260)
+		zero := transaction.NewCoinbaseTx(miner.PubKeyHash(), 0, 15_750_000)
+		_, _, err := utxo.ApplyBlock(base, []*transaction.Transaction{zero}, 15_750_000)
 		if err == nil {
 			t.Fatal("总额为 0 的 coinbase 被接受（规则α失效）")
 		}
@@ -389,10 +393,10 @@ func TestZeroSubsidyCoinbaseAdmissibleSetIsEmpty(t *testing.T) {
 		}
 	})
 
-	t.Run("规则β 总额1被上限规则拒绝（高度1260）", func(t *testing.T) {
+	t.Run("规则β 总额1被上限规则拒绝（高度15750000）", func(t *testing.T) {
 		// 总额 1 是满足规则α的最小正数
-		one := transaction.NewCoinbaseTx(miner.PubKeyHash(), 1, 1260)
-		_, _, err := utxo.ApplyBlock(base, []*transaction.Transaction{one}, 1260)
+		one := transaction.NewCoinbaseTx(miner.PubKeyHash(), 1, 15_750_000)
+		_, _, err := utxo.ApplyBlock(base, []*transaction.Transaction{one}, 15_750_000)
 		if err == nil {
 			t.Fatal("补贴为 0 且无手续费时，总额 1 的 coinbase 被接受（规则β失效）")
 		}
@@ -404,21 +408,21 @@ func TestZeroSubsidyCoinbaseAdmissibleSetIsEmpty(t *testing.T) {
 		}
 	})
 
-	t.Run("边界对照 同一个coinbase在高度1259被接受", func(t *testing.T) {
-		// 与上一个子用例**完全相同**的 coinbase，只把高度退回 1259（补贴 1）
-		one := transaction.NewCoinbaseTx(miner.PubKeyHash(), 1, 1259)
-		if _, _, err := utxo.ApplyBlock(base, []*transaction.Transaction{one}, 1259); err != nil {
-			t.Fatalf("高度 1259（补贴 1）下总额 1 的 coinbase 应被接受: %v", err)
+	t.Run("边界对照 同一个coinbase在高度15749999被接受", func(t *testing.T) {
+		// 与上一个子用例**完全相同**的 coinbase，只把高度退回 15,749,999（补贴 1）
+		one := transaction.NewCoinbaseTx(miner.PubKeyHash(), 1, 15_749_999)
+		if _, _, err := utxo.ApplyBlock(base, []*transaction.Transaction{one}, 15_749_999); err != nil {
+			t.Fatalf("高度 15749999（补贴 1）下总额 1 的 coinbase 应被接受: %v", err)
 		}
 	})
 
 	t.Run("手续费为正时合法候选重新存在（fee-only 出块）", func(t *testing.T) {
-		// 高度 1260：coinbase 总额 = 补贴 0 + 手续费 1 = 1，恰好落在规则β的边界上
-		one := transaction.NewCoinbaseTx(miner.PubKeyHash(), 1, 1260)
+		// 高度 15,750,000：coinbase 总额 = 补贴 0 + 手续费 1 = 1，恰好落在规则β的边界上
+		one := transaction.NewCoinbaseTx(miner.PubKeyHash(), 1, 15_750_000)
 		// 构造一笔真实手续费交易：消费金额 cbValue，输出 cbValue-1 ⇒ 手续费 1
 		spend := spendFrom(t, cbOp, miner, [20]byte{0x33}, cbValue-1)
 
-		set, fees, err := utxo.ApplyBlock(base, []*transaction.Transaction{one, spend}, 1260)
+		set, fees, err := utxo.ApplyBlock(base, []*transaction.Transaction{one, spend}, 15_750_000)
 		if err != nil {
 			t.Fatalf("补贴为 0 但手续费为 1 时，零补贴区块应合法: %v", err)
 		}

@@ -142,7 +142,7 @@ func TestVerifyValidChainPasses(t *testing.T) {
 	if rep.Blocks != 4 {
 		t.Errorf("Blocks = %d，期望 4（创世 + 3）", rep.Blocks)
 	}
-	if rep.GenesisHash != "0000aca1af720da390380a38dc97d141cfb67afe578a2d31315860a5489db58c" {
+	if rep.GenesisHash != "00003d97723c3cccec83a664f5d22da6f66dfa72c9f28b286c746f4bc4dce4a3" {
 		t.Errorf("创世哈希 = %s，与确定性创世不符", rep.GenesisHash)
 	}
 	if rep.TipHash == "" || rep.FailHeight != -1 || rep.Reason != "" {

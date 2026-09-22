@@ -36,7 +36,7 @@ import (
 
 // TestTemplateFailureClassificationCoversEveryCause 把「某一类失败如何处置」的决策
 // 从挖矿循环里抽出来单独锁定。抽出来的理由是可测性：分类函数是纯函数，
-// 因此不需构造长链也能覆盖「补贴归零」这类需要 1260 个区块才能自然到达的输入。
+// 因此不需构造长链也能覆盖「补贴归零」这类需要 15,750,000 个区块才能自然到达的输入。
 //
 // 覆盖的五个落点（§5）：
 //
@@ -334,7 +334,7 @@ func TestMiningRuntimeDiscardsCandidateWhenTipChanges(t *testing.T) {
 
 // ---- §12 Test C + Test D：补贴归零边界（真实链上端到端）----
 
-// TestMiningRuntimeAtSubsidyExhaustion 在**真实的高度 1260** 上验证 A1 裁决下的两条行为：
+// TestMiningRuntimeAtSubsidyExhaustion 在**真实的高度 15,750,000** 上验证 A1 裁决下的两条行为：
 //
 //	Test D：Subsidy == 0 且 fees == 0  ⇒  不存在合法候选  ⇒  STALLED，0 次 PoW
 //	Test C：Subsidy == 0 且 fees  > 0  ⇒  零补贴区块仍合法  ⇒  MINED，PoW 真实执行
@@ -342,15 +342,24 @@ func TestMiningRuntimeDiscardsCandidateWhenTipChanges(t *testing.T) {
 // 这两个子用例共用同一条前推到边界的长链（Test D 不改变链状态，因此 Test C 可直接续用）。
 //
 // 关于长链的构建方式：链状态在**无存储的** Blockchain 上构建后再交给 nodeService。
-// 这样做的原因是 FileBlockStore.SaveBlock 每块都做一次 fsync —— 1259 次 fsync 会让
+// 这样做的原因是 FileBlockStore.SaveBlock 每块都做一次 fsync —— 15,749,999 次 fsync 会让
 // 本用例的时间由「PoW」变成「磁盘」，而本用例要证明的性质与持久化无关
 // （持久化本身由既有的 TestChainPersistsAcrossRestart / TestFullStackRestartPersists 覆盖）。
 func TestMiningRuntimeAtSubsidyExhaustion(t *testing.T) {
-	if testing.Short() {
-		t.Skip("需要构建高度 1259 的真实链（约 8×10^7 次双 SHA-256），-short 下跳过")
-	}
+	// C1 经济政策（A-2.3-G2）：subsidyInitial 50→5、subsidyHalvingInterval 210→5,250,000，
+	// 补贴归零高度由 1260 移到 15,750,000。本用例要求链**真实前推**到 boundary-1，
+	// 即 15,749,999 个区块（legacy 下为 1259 块，实测 cmd/node 全包约 728 s）；
+	// C1 下工作量放大 ≈12,500×，在任何可行时间预算内不可完成 —— 用例的现实可运行性
+	// 因参数变更而消失。因此 C1 起显式跳过。
+	//
+	// 保留而非删除的理由：**全部断言与边界对照手法（Test D / Test C）完整保留**，
+	// 一旦后续阶段提供「链状态注入 seam」或放宽时间预算即可原样重跑；
+	// 归零边界的**共识**语义由 internal/blockchain/template_validation_test.go 的
+	// TestZeroSubsidyCoinbaseAdmissibleSetIsEmpty 在真实共识代码上廉价覆盖。
+	// 见报告 NON-BLOCKING FINDING G2-NB-1（需项目方在后续阶段裁定处置方式）。
+	t.Skip("C1(G2-NB-1): 补贴归零高度为 15,750,000，真实长链（15,749,999 块）不可行")
 
-	const boundary = 1260 // Subsidy 恰在此高度归零
+	const boundary = 15_750_000 // Subsidy 恰在此高度归零（C1）
 
 	rt, _, _ := startTestRuntime(t, false)
 	svc := rt.svc

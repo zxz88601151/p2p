@@ -207,8 +207,10 @@ func TestRemoveIncludedClearsAndPrunesStale(t *testing.T) {
 	}
 
 	// 区块打包 txA 与 coinbase，并推进链状态
+	// C1（A-2.3-G2）：coinbase 受 Subsidy(height)+fees 上限约束，取 Subsidy(1)=5
+	// （txA 手续费 10，上限 15 ≥ 5；legacy 下曾直接写 50）。
 	newBase := base.Clone()
-	cb := transaction.NewCoinbaseTx(w.PubKeyHash(), 50, 1)
+	cb := transaction.NewCoinbaseTx(w.PubKeyHash(), utxo.Subsidy(1), 1)
 	blk := block.NewCandidateBlock([32]byte{}, 20, []*transaction.Transaction{cb, txA})
 	if _, _, err := utxo.ApplyBlock(newBase, blk.Transactions, 1); err != nil {
 		t.Fatalf("区块状态迁移失败: %v", err)
