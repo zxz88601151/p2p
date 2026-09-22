@@ -44,6 +44,10 @@ var (
 	ErrBadSignature      = errors.New("输入签名验证失败")
 	ErrBadCoinbase       = errors.New("coinbase 交易非法")
 	ErrExcessiveCoinbase = errors.New("coinbase 输出超过区块奖励加手续费上限")
+	// ErrFeeOverflow 块内手续费累计发生 uint64 回绕（A-2.3-G 算术安全防护）。
+	// 手续费是既有 UTXO 的价值转移，理论上不可能达到 2^64 量级；
+	// 一旦回绕意味着记账已不可信，按共识拒绝（fail-closed）。
+	ErrFeeOverflow = errors.New("块内手续费累计 uint64 回绕")
 )
 
 // sighash 返回签名消息哈希。
@@ -247,18 +251,38 @@ func ApplyBlock(base *UTXOSet, txs []*transaction.Transaction, height int) (newS
 		if err != nil {
 			return nil, 0, fmt.Errorf("高度 %d 交易校验失败: %w", height, err)
 		}
+		// A-2.3-G：手续费累计 uint64 回绕防护（与普通交易 inTotal 累加的
+		// `if x+v < x` 先例同型）。回绕会使上限比较失效，必须拒绝。
+		if fees+fee < fees {
+			return nil, 0, fmt.Errorf("%w: 高度 %d 手续费累计回绕", ErrFeeOverflow, height)
+		}
 		fees += fee
 	}
 
-	// coinbase 金额上限：奖励 + 手续费
+	// coinbase 金额上限：奖励 + 手续费。
+	// A-2.3-G 算术加固：
+	//   1) coinbaseOut 累加带回绕防护——2^63 + 2^63 ≡ 0 (mod 2^64) 曾可绕过
+	//      上限检查（BLK-A23F-1）；真实合计一旦 ≥ 2^64 必然超过任何可达上限，
+	//      按超额拒绝；
+	//   2) 上限比较改写为减法形式（coinbaseOut - Subsidy > fees），
+	//      从构造上消除 Subsidy(height)+fees 的加法回绕可能性（fail-safe
+	//      方向虽不变严，但显式消除回绕路径，且与 fees/coinbaseOut 防护对称）。
 	var coinbaseOut uint64
 	for _, out := range txs[0].Outputs {
-		coinbaseOut += out.Value
+		sum := coinbaseOut + out.Value
+		if sum < coinbaseOut {
+			return nil, 0, fmt.Errorf(
+				"%w: coinbase 输出真实合计 ≥ 2^64（uint64 回绕被拒）",
+				ErrExcessiveCoinbase)
+		}
+		coinbaseOut = sum
 	}
-	if coinbaseOut > Subsidy(height)+fees {
-		return nil, 0, fmt.Errorf(
-			"%w: coinbase 输出 %d > 奖励 %d + 手续费 %d",
-			ErrExcessiveCoinbase, coinbaseOut, Subsidy(height), fees)
+	if sub := Subsidy(height); coinbaseOut >= sub {
+		if coinbaseOut-sub > fees {
+			return nil, 0, fmt.Errorf(
+				"%w: coinbase 输出 %d > 奖励 %d + 手续费 %d",
+				ErrExcessiveCoinbase, coinbaseOut, sub, fees)
+		}
 	}
 
 	return working, fees, nil

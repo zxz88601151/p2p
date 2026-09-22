@@ -242,18 +242,32 @@ func ApplyBlockWithUndo(base *UTXOSet, txs []*transaction.Transaction, height in
 		if err != nil {
 			return nil, BlockUndo{}, 0, fmt.Errorf("高度 %d 交易校验失败: %w", height, err)
 		}
+		// A-2.3-G：手续费累计 uint64 回绕防护——与 ApplyBlock 逐字节同规则
+		//（forward / undo 对称，见 undo.go 文件头不变式 5）。
+		if fees+fee < fees {
+			return nil, BlockUndo{}, 0, fmt.Errorf("%w: 高度 %d 手续费累计回绕", ErrFeeOverflow, height)
+		}
 		fees += fee
 	}
 
 	// ---- coinbase 金额上限 ----
+	// A-2.3-G 算术加固：与 ApplyBlock 完全同型（回绕防护 + 减法形式上限比较）。
 	var coinbaseOut uint64
 	for _, out := range cb.Outputs {
-		coinbaseOut += out.Value
+		sum := coinbaseOut + out.Value
+		if sum < coinbaseOut {
+			return nil, BlockUndo{}, 0, fmt.Errorf(
+				"%w: coinbase 输出真实合计 ≥ 2^64（uint64 回绕被拒）",
+				ErrExcessiveCoinbase)
+		}
+		coinbaseOut = sum
 	}
-	if coinbaseOut > Subsidy(height)+fees {
-		return nil, BlockUndo{}, 0, fmt.Errorf(
-			"%w: coinbase 输出 %d > 奖励 %d + 手续费 %d",
-			ErrExcessiveCoinbase, coinbaseOut, Subsidy(height), fees)
+	if sub := Subsidy(height); coinbaseOut >= sub {
+		if coinbaseOut-sub > fees {
+			return nil, BlockUndo{}, 0, fmt.Errorf(
+				"%w: coinbase 输出 %d > 奖励 %d + 手续费 %d",
+				ErrExcessiveCoinbase, coinbaseOut, sub, fees)
+		}
 	}
 
 	// ---- Phase 2：derive undo ----
