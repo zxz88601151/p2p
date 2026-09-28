@@ -35,7 +35,7 @@ func buildChainForVerify(t *testing.T, dir string, n int) {
 	if err != nil {
 		t.Fatalf("打开存储失败: %v", err)
 	}
-	chain, err := blockchain.NewBlockchainFromStore(store)
+	chain, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("初始化链失败: %v", err)
 	}

@@ -269,8 +269,8 @@ func r4bRunCase(t *testing.T, L int) {
 	t.Helper()
 
 	// ── 阶段 0：构造共同前缀与竞争分支（全部由真实二进制产出）─────────────
-	histA := mineChainOffline(t, L-1)          // 高度 0..L-1 ⇒ L 条 legacy 记录
-	prefixB := truncateLegacy(t, histA, L-2)   // 高度 0..L-2 ⇒ L-1 条（共同前缀）
+	histA := mineChainOffline(t, L-1)                 // 高度 0..L-1 ⇒ L 条 legacy 记录
+	prefixB := truncateLegacy(t, histA, L-2)          // 高度 0..L-2 ⇒ L-1 条（共同前缀）
 	histB := extendChainOffline(t, prefixB, r4bExtra) // 高度 0..L
 
 	if got := r4bLegacyCount(histA); got != L {

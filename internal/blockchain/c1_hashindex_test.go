@@ -154,7 +154,7 @@ func TestC1_RecoveryIndex(t *testing.T) {
 		t.Fatalf("重开存储失败: %v", err)
 	}
 	t.Cleanup(func() { _ = store2.Close() })
-	bc2, err := NewBlockchainFromStore(store2)
+	bc2, err := NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatalf("recovery 加载失败: %v", err)
 	}

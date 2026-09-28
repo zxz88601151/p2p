@@ -486,7 +486,7 @@ func TestRestartRecomputesConsensusState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bc, err := blockchain.NewBlockchainFromStore(store)
+	bc, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +506,7 @@ func TestRestartRecomputesConsensusState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
-	bc2, err := blockchain.NewBlockchainFromStore(store2)
+	bc2, err := blockchain.NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatal(err)
 	}

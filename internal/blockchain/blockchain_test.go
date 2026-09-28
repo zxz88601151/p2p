@@ -287,7 +287,7 @@ func TestChainPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("打开存储失败: %v", err)
 	}
 
-	bc, err := blockchain.NewBlockchainFromStore(store)
+	bc, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("从存储加载链失败: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestChainPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("重开存储失败: %v", err)
 	}
 	defer store2.Close()
-	bc2, err := blockchain.NewBlockchainFromStore(store2)
+	bc2, err := blockchain.NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatalf("重启加载链失败: %v", err)
 	}

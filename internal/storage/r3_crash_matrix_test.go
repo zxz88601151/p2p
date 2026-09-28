@@ -41,9 +41,9 @@ import (
 // ── 场景规模常量 ────────────────────────────────────────────────────────────
 
 const (
-	r3LegacyLen = 3 // legacy 前缀高度 0..2（由 legacy SaveBlock 写出）
-	r3OldTop    = 5 // 旧 canonical 链尾高度
-	r3ForkTop   = 6 // 新分支链尾高度（比旧链多一枚 ⇒ 工作量更大 ⇒ reorg 合法）
+	r3LegacyLen = 3               // legacy 前缀高度 0..2（由 legacy SaveBlock 写出）
+	r3OldTop    = 5               // 旧 canonical 链尾高度
+	r3ForkTop   = 6               // 新分支链尾高度（比旧链多一枚 ⇒ 工作量更大 ⇒ reorg 合法）
 	r3ForkAt    = r3LegacyLen - 1 // 分叉点 = legacy 高度 2
 )
 
@@ -68,8 +68,8 @@ type r3Image struct {
 	fork     []*block.Block // 高度 3..6
 	forkUndo []utxo.BlockUndo
 
-	oldTip, newTip     [32]byte
-	oldHeight, newHt   int
+	oldTip, newTip   [32]byte
+	oldHeight, newHt int
 
 	newTipIsNew   bool // true：新链尾由 CommitReorg 首次写入
 	storedInBase  int  // base 中已 detached 落盘的分叉块数
@@ -80,17 +80,17 @@ type r3Image struct {
 
 // r3Probe 一次「崩溃后重启」的可观测状态快照。
 type r3Probe struct {
-	height   int
-	tip      [32]byte
-	hasTip   bool
+	height    int
+	tip       [32]byte
+	hasTip    bool
 	legacyLen int
-	records  int
-	detached int
-	dangling int
-	recovery string
-	logSize  int64
-	logBytes []byte
-	canonN   int // records 中 canonical=true 的数量（内部视图）
+	records   int
+	detached  int
+	dangling  int
+	recovery  string
+	logSize   int64
+	logBytes  []byte
+	canonN    int // records 中 canonical=true 的数量（内部视图）
 }
 
 func (p *r3Probe) sig() string {
@@ -783,7 +783,7 @@ func TestR3_I10_KeyCrashPointsRepeatFiveTimes(t *testing.T) {
 			want [32]byte
 			h    int
 		}{
-			{"C1-分支已抵达未切换", -1, img.oldTip, r3OldTop},                 // k=-1 → 用 base
+			{"C1-分支已抵达未切换", -1, img.oldTip, r3OldTop}, // k=-1 → 用 base
 			{"C4-3-TIP之前", tipStart, img.oldTip, r3OldTop},
 			{"C4-7-完整提交", L, img.newTip, r3ForkTop},
 			{"C5-已切换未关闭", L, img.newTip, r3ForkTop},

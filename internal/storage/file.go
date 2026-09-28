@@ -31,12 +31,13 @@ var ErrReadOnlyStore = errors.New("存储以只读方式打开，不允许写入
 //
 // 并发：所有公开方法受互斥保护。写入为追加语义，天然满足「只增不改」的链特性。
 type FileBlockStore struct {
-	mu       sync.RWMutex
-	dir      string
-	path     string
-	file     *os.File // 可写句柄（只读打开时为 nil）
-	rfile    *os.File // 只读句柄（可写打开时为 nil；供按偏移读取 UNDO 帧）
-	readOnly bool
+	mu           sync.RWMutex
+	dir          string
+	path         string
+	file         *os.File // 可写句柄（只读打开时为 nil）
+	rfile        *os.File // 只读句柄（可写打开时为 nil；供按偏移读取 UNDO 帧）
+	readOnly     bool
+	repairOnOpen bool
 
 	// legacy / canonical 视图（与 REORG-1E 前的语义逐字节保持一致）
 	byHeight []*block.Block   // 高度 → 区块（canonical 链）
@@ -47,15 +48,28 @@ type FileBlockStore struct {
 }
 
 // OpenFileBlockStore 打开（或创建）目录下的区块存储，并重建索引（可写）。
+// 历史调用方保留 EOF 截断尾部的存储层修复语义；节点启动使用
+// OpenFileBlockStoreStrict，以确保 F-3B 身份检查前不发生自动修复。
 func OpenFileBlockStore(dir string) (*FileBlockStore, error) {
+	return openFileBlockStore(dir, true)
+}
+
+// OpenFileBlockStoreStrict 打开可写存储，但遇到任何截断/损坏都 fail closed，
+// 不会在打开阶段自动修改 blocks.dat。它供节点启动与显式 init 使用。
+func OpenFileBlockStoreStrict(dir string) (*FileBlockStore, error) {
+	return openFileBlockStore(dir, false)
+}
+
+func openFileBlockStore(dir string, repairOnOpen bool) (*FileBlockStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 	path := filepath.Join(dir, "blocks.dat")
 	s := &FileBlockStore{
-		dir:    dir,
-		path:   path,
-		byHash: make(map[[32]byte]int),
+		dir:          dir,
+		path:         path,
+		repairOnOpen: repairOnOpen,
+		byHash:       make(map[[32]byte]int),
 	}
 	s.initV2()
 

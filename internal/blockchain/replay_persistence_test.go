@@ -57,7 +57,7 @@ func openChain(t *testing.T, dir string) (*blockchain.Blockchain, *storage.FileB
 	if err != nil {
 		t.Fatalf("打开存储失败: %v", err)
 	}
-	bc, err := blockchain.NewBlockchainFromStore(store)
+	bc, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		store.Close()
 		t.Fatalf("从存储加载链失败: %v", err)
@@ -257,7 +257,7 @@ func TestDuplicatePersistedRecordIsRejected(t *testing.T) {
 		t.Fatalf("打开存储失败: %v", err)
 	}
 	defer s.Close()
-	if _, err := blockchain.NewBlockchainFromStore(s); err == nil {
+	if _, err := blockchain.NewBlockchainFromStoreForTest(s); err == nil {
 		t.Fatal("含重复记录的存储被静默接受：损坏数据不得被转换成有效链")
 	} else {
 		t.Logf("已按预期拒绝加载重复记录: %v", err)

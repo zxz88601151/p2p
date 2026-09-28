@@ -15,10 +15,10 @@ import (
 
 // reorgTestFixture 提供 reorg 测试的通用基础设施。
 type reorgTestFixture struct {
-	t      *testing.T
-	dir    string
-	store  *storage.FileBlockStore
-	chain  *Blockchain
+	t       *testing.T
+	dir     string
+	store   *storage.FileBlockStore
+	chain   *Blockchain
 	genesis *block.Block
 }
 
@@ -151,7 +151,7 @@ func TestReorg_CrashBeforeTip(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer store2.Close()
-	chain2, err := NewBlockchainFromStore(store2)
+	chain2, err := NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestReorg_NewTipFullyPersisted(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer store2.Close()
-	chain2, err := NewBlockchainFromStore(store2)
+	chain2, err := NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestReorg_ReorgFollowedByRestart(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer store2.Close()
-	chain2, err := NewBlockchainFromStore(store2)
+	chain2, err := NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
@@ -372,36 +372,36 @@ func TestReorg_RepeatedEvaluationAfterRollback(t *testing.T) {
 
 // ── TEST: FindCommonAncestor ────────────────────────────────────────────────
 func TestFindCommonAncestor(t *testing.T) {
-	 tree := blocktree.NewBlockTree()
-	 genesisHash := [32]byte{0x01}
-	 aHash := [32]byte{0x02}
-	 bHash := [32]byte{0x03}
-	 cHash := [32]byte{0x04}
-	 xHash := [32]byte{0x10}
-	 yHash := [32]byte{0x11}
+	tree := blocktree.NewBlockTree()
+	genesisHash := [32]byte{0x01}
+	aHash := [32]byte{0x02}
+	bHash := [32]byte{0x03}
+	cHash := [32]byte{0x04}
+	xHash := [32]byte{0x10}
+	yHash := [32]byte{0x11}
 
-	 _, _ = tree.AddBlock(genesisHash, [32]byte{}, 0, 16, 1000)
-	 _, _ = tree.AddBlock(aHash, genesisHash, 1, 16, 1001)
-	 _, _ = tree.AddBlock(bHash, aHash, 2, 16, 1002)
-	 _, _ = tree.AddBlock(cHash, bHash, 3, 16, 1003)
-	 _, _ = tree.AddBlock(xHash, aHash, 2, 16, 1002)
-	 _, _ = tree.AddBlock(yHash, xHash, 3, 16, 1003)
+	_, _ = tree.AddBlock(genesisHash, [32]byte{}, 0, 16, 1000)
+	_, _ = tree.AddBlock(aHash, genesisHash, 1, 16, 1001)
+	_, _ = tree.AddBlock(bHash, aHash, 2, 16, 1002)
+	_, _ = tree.AddBlock(cHash, bHash, 3, 16, 1003)
+	_, _ = tree.AddBlock(xHash, aHash, 2, 16, 1002)
+	_, _ = tree.AddBlock(yHash, xHash, 3, 16, 1003)
 
-	 nodeC := tree.LookupNode(cHash)
-	 nodeY := tree.LookupNode(yHash)
-	 lca := tree.FindCommonAncestor(nodeC, nodeY)
-	 if lca == nil {
-		 t.Fatal("LCA is nil")
-	 }
-	 if lca.Hash != aHash {
-		 t.Fatalf("LCA = %x, want aHash %x", lca.Hash[:4], aHash[:4])
-	 }
+	nodeC := tree.LookupNode(cHash)
+	nodeY := tree.LookupNode(yHash)
+	lca := tree.FindCommonAncestor(nodeC, nodeY)
+	if lca == nil {
+		t.Fatal("LCA is nil")
+	}
+	if lca.Hash != aHash {
+		t.Fatalf("LCA = %x, want aHash %x", lca.Hash[:4], aHash[:4])
+	}
 
-	 // 同一节点
-	 lca2 := tree.FindCommonAncestor(nodeC, nodeC)
-	 if lca2 == nil || lca2.Hash != cHash {
-		 t.Fatal("LCA of same node should be itself")
-	 }
+	// 同一节点
+	lca2 := tree.FindCommonAncestor(nodeC, nodeC)
+	if lca2 == nil || lca2.Hash != cHash {
+		t.Fatal("LCA of same node should be itself")
+	}
 }
 
 // ── TEST: Fork detection via AddBlock ───────────────────────────────────────
@@ -433,27 +433,27 @@ func TestForkDetection(t *testing.T) {
 
 // ── TEST: ShouldReorg deterministic tie-break ───────────────────────────────
 func TestShouldReorg_TieBreak(t *testing.T) {
-	 tree := blocktree.NewBlockTree()
-	 g := [32]byte{0x01}
-	 a := [32]byte{0x02}
-	 b := [32]byte{0x03}
+	tree := blocktree.NewBlockTree()
+	g := [32]byte{0x01}
+	a := [32]byte{0x02}
+	b := [32]byte{0x03}
 
-	 _, _ = tree.AddBlock(g, [32]byte{}, 0, 16, 1000)
-	 _, _ = tree.AddBlock(a, g, 1, 16, 1001)
-	 _, _ = tree.AddBlock(b, g, 1, 16, 1001)
+	_, _ = tree.AddBlock(g, [32]byte{}, 0, 16, 1000)
+	_, _ = tree.AddBlock(a, g, 1, 16, 1001)
+	_, _ = tree.AddBlock(b, g, 1, 16, 1001)
 
-	 _ = tree.SetTip(tree.LookupNode(a))
+	_ = tree.SetTip(tree.LookupNode(a))
 
-	 nodeB := tree.LookupNode(b)
-	 should, reason, err := tree.ShouldReorg(nodeB)
-	 if err != nil {
-		 t.Fatalf("ShouldReorg: %v", err)
-	 }
-	 _ = reason
-	 // work 相同，tie-break：hash 大者胜
-	 if should && bytesCompare(b, a) <= 0 {
-		 t.Fatalf("tie-break wrong: b=%x a=%x", b[:4], a[:4])
-	 }
+	nodeB := tree.LookupNode(b)
+	should, reason, err := tree.ShouldReorg(nodeB)
+	if err != nil {
+		t.Fatalf("ShouldReorg: %v", err)
+	}
+	_ = reason
+	// work 相同，tie-break：hash 大者胜
+	if should && bytesCompare(b, a) <= 0 {
+		t.Fatalf("tie-break wrong: b=%x a=%x", b[:4], a[:4])
+	}
 }
 
 // bytesCompare 用于测试中的字典序比较（[32]byte 无内建比较）。

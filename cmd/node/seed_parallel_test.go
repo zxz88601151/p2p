@@ -18,7 +18,7 @@ func startRuntimeAt(t *testing.T, addr string, seeds []string, dir string) *node
 	t.Helper()
 	var lastErr error
 	for attempt := 0; attempt < 20; attempt++ {
-		rt, err := newNodeRuntime(nodeConfig{
+		rt, err := newNodeRuntimeForTest(nodeConfig{
 			ListenAddr: addr,
 			RPCAddr:    "127.0.0.1:0",
 			Seeds:      seeds,
@@ -71,7 +71,7 @@ func TestSeedReconnectAfterRestart(t *testing.T) {
 func TestParallelMiningProducesValidBlock(t *testing.T) {
 	const miners = 4
 	dir := t.TempDir()
-	rt, err := newNodeRuntime(nodeConfig{
+	rt, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr:    "127.0.0.1:0",
 		RPCAddr:       "127.0.0.1:0",
 		DataDir:       dir,

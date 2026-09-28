@@ -54,19 +54,17 @@ func VerifyStoredChain(store storage.BlockStore) (*ChainVerifyReport, error) {
 	}
 
 	rep := &ChainVerifyReport{Height: h, FailHeight: -1}
-	if h < 0 {
-		rep.Reason = "本地链为空（数据目录中没有区块可校验）"
-		return rep, nil
-	}
-
-	first, err := store.GetBlockByHeight(0)
+	first, err := VerifyGenesisIdentity(store)
 	if err != nil {
 		rep.FailHeight = 0
-		rep.Reason = fmt.Sprintf("读取创世区块失败: %v", err)
+		if first != nil {
+			rep.FailHash = first.Header.HashHex()
+		}
+		rep.Reason = err.Error()
 		return rep, nil
 	}
-	// 注：创世区块按既有设计视为可信输入（见 NewBlockchainWithGenesis 注释），
-	// 本函数不新增创世侧校验规则 —— 这里只用它建立初始 UTXO 状态。
+	// The canonical identity gate is shared with node startup. Only after it
+	// succeeds does verify construct the in-memory chain and replay blocks.
 	bc, err := NewBlockchainWithGenesis(first)
 	if err != nil {
 		rep.FailHeight = 0

@@ -140,7 +140,7 @@ func TestResetAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重启打开存储失败: %v", err)
 	}
-	if _, err := blockchain.NewBlockchainFromStore(store); err != nil {
+	if _, err := blockchain.NewBlockchainFromStoreForTest(store); err != nil {
 		t.Fatalf("重启回放失败: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -258,7 +258,7 @@ func TestResetThenStartRebuildsGenesis(t *testing.T) {
 		t.Fatalf("重新启动打开存储失败: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	chain, err := blockchain.NewBlockchainFromStore(store)
+	chain, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("重新启动失败: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestResetThenVerifyStartsFromCleanGenesis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("打开存储失败: %v", err)
 	}
-	if _, err := blockchain.NewBlockchainFromStore(store); err != nil {
+	if _, err := blockchain.NewBlockchainFromStoreForTest(store); err != nil {
 		t.Fatalf("重建创世失败: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -335,7 +335,7 @@ func TestResetPreservesDeterministicGenesis(t *testing.T) {
 		if err != nil {
 			t.Fatalf("打开存储失败: %v", err)
 		}
-		chain, err := blockchain.NewBlockchainFromStore(store)
+		chain, err := blockchain.NewBlockchainFromStoreForTest(store)
 		if err != nil {
 			t.Fatalf("加载链失败: %v", err)
 		}
@@ -356,7 +356,7 @@ func TestResetPreservesDeterministicGenesis(t *testing.T) {
 		t.Fatalf("reset 后打开存储失败: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	chain, err := blockchain.NewBlockchainFromStore(store)
+	chain, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("reset 后重建链失败: %v", err)
 	}

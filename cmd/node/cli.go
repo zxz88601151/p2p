@@ -45,6 +45,7 @@ const usageText = `p2pchain 节点与钱包工具
   send          用节点钱包向指定地址转账
   mine          按需立即挖出区块（开发/测试用，对标 bitcoind 的 generatetoaddress）
   stop          请求运行中的节点优雅停止（释放数据目录锁后退出）
+  init          显式初始化新数据目录并创建 canonical Genesis
   wallet        查看或创建本地钱包（离线）
   printchain    打印本地区块链（离线，只读）
   verify        只读校验本地区块链（离线，绝不修改任何数据）
@@ -111,6 +112,7 @@ var cliCommands = map[string]cmdFunc{
 	"send":       cmdSend,
 	"mine":       cmdMine,
 	"stop":       cmdStop,
+	"init":       cmdInit,
 	"wallet":     cmdWallet,
 	"printchain": cmdPrintChain,
 	"verify":     cmdVerify,
@@ -153,6 +155,81 @@ func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 func fail(stderr io.Writer, format string, a ...any) int {
 	fmt.Fprintf(stderr, "错误: "+format+"\n", a...)
 	return 1
+}
+
+// cmdInit 显式初始化一个全新的数据目录。
+//
+// 该命令只创建 canonical Genesis，不加载钱包、不启动网络、不挖矿。
+// 普通 node 启动路径不会调用它，也不会在空库上隐式初始化。
+func cmdInit(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("init", stderr)
+	dataDir := fs.String("datadir", defaultDataDir(), "数据目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	blocksPath := filepath.Join(*dataDir, "blocks.dat")
+	dirInfo, dirErr := os.Stat(*dataDir)
+	freshDir := false
+	if dirErr != nil {
+		if !errors.Is(dirErr, os.ErrNotExist) {
+			return fail(stderr, "检查数据目录失败: %v", dirErr)
+		}
+		freshDir = true
+	} else if !dirInfo.IsDir() {
+		return fail(stderr, "数据路径不是目录: %s", *dataDir)
+	} else {
+		entries, err := os.ReadDir(*dataDir)
+		if err != nil {
+			return fail(stderr, "读取数据目录失败: %v", err)
+		}
+		if len(entries) == 0 {
+			freshDir = true
+		}
+	}
+
+	if !freshDir {
+		info, err := os.Stat(blocksPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fail(stderr, "数据目录非空但缺少 blocks.dat；拒绝将其当作空库初始化")
+			}
+			return fail(stderr, "检查 blocks.dat 失败: %v", err)
+		}
+		if info.Size() == 0 {
+			return fail(stderr, "%v: %s", blockchain.ErrCorruptGenesisIdentity, blocksPath)
+		}
+	}
+
+	lock, err := storage.AcquireDirLock(*dataDir)
+	if err != nil {
+		return fail(stderr, "锁定数据目录失败: %v", err)
+	}
+	defer func() { _ = lock.Release() }()
+
+	store, err := storage.OpenFileBlockStoreStrict(*dataDir)
+	if err != nil {
+		return fail(stderr, "打开区块存储失败: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if freshDir {
+		if _, err := blockchain.InitializeBlockchainStore(store); err != nil {
+			return fail(stderr, "初始化 canonical Genesis 失败: %v", err)
+		}
+		fmt.Fprintf(stdout, "已初始化 canonical Genesis: %s\n", blockchain.CanonicalGenesisHashHex())
+		return 0
+	}
+
+	genesis, err := blockchain.VerifyGenesisIdentity(store)
+	if err != nil {
+		if genesis != nil {
+			return fail(stderr, "%v；拒绝覆盖现有数据集", err)
+		}
+		return fail(stderr, "%v；拒绝覆盖现有数据集", err)
+	}
+	_ = genesis
+	return fail(stderr, "%v；拒绝覆盖现有数据集", blockchain.ErrAlreadyInitialized)
 }
 
 // ---- 在线命令 ----

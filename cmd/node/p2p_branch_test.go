@@ -38,7 +38,7 @@ import (
 // newBranchRuntime 在给定目录启动一个真实节点（随机端口，无种子）。
 func newBranchRuntime(t *testing.T, dir string) *nodeRuntime {
 	t.Helper()
-	rt, err := newNodeRuntime(nodeConfig{
+	rt, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,

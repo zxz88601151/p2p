@@ -44,7 +44,7 @@ func newReorgMempoolFixture(t *testing.T) *reorgMempoolFixture {
 		t.Fatalf("append genesis v2: %v", err)
 	}
 
-	chain, err := blockchain.NewBlockchainFromStore(store)
+	chain, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("new chain from store: %v", err)
 	}

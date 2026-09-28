@@ -43,7 +43,7 @@ func TestSIGINTReleasesLock(t *testing.T) {
 // rt.Close()（与 SIGINT/SIGTERM 处理器完全相同），断言 node.lock 被删除、同目录可重新获取。
 func gracefulShutdownReleasesLock(t *testing.T) {
 	dir := t.TempDir()
-	rt, err := newNodeRuntime(nodeConfig{
+	rt, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,
@@ -58,7 +58,7 @@ func gracefulShutdownReleasesLock(t *testing.T) {
 		t.Fatal("graceful shutdown 后应已释放 node.lock")
 	}
 	// 同 datadir 可重新启动（无残留死锁）
-	rt2, err := newNodeRuntime(nodeConfig{
+	rt2, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,
@@ -108,7 +108,7 @@ func TestAllInitFailuresReleaseLock(t *testing.T) {
 			if c.name == "ctl.Start失败(非法RPC地址)" {
 				cfg.RPCAddr = "999.999.999.999:70000" // 非法地址 → net.Listen 失败
 			}
-			_, err := newNodeRuntime(cfg)
+			_, err := newNodeRuntimeForTest(cfg)
 			if err == nil {
 				t.Fatalf("[%s] 该阶段应初始化失败，但未失败", c.name)
 			}
@@ -142,6 +142,9 @@ func TestCLIHintPresentOnLocked(t *testing.T) {
 
 	t.Run("stale_lock_file_is_taken_over", func(t *testing.T) {
 		dir := t.TempDir()
+		// F-3B：node 启动不再自动创世，本用例断言的是「正常启动」语义，
+		// 因此必须先显式初始化数据目录，再写入残留 lock 文件。
+		ensureTestDataDir(t, dir)
 		lockPath := filepath.Join(dir, "node.lock")
 		if err := os.WriteFile(lockPath, []byte("pid=12345\nstarted_at=2000-01-01T00:00:00Z\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -239,7 +242,7 @@ func TestPanicPathReleasesLock(t *testing.T) {
 		t.Fatalf("panic 路径应释放 node.lock，实际仍存在: %v", e)
 	}
 	// 断言：释放后同目录可重新启动（验证释放语义正确，无残留死锁）
-	rt, err := newNodeRuntime(nodeConfig{
+	rt, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,

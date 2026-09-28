@@ -312,7 +312,7 @@ func (s *FileBlockStore) loadLog(f *os.File) error {
 		return err
 	}
 	if sc.torn != tornNone {
-		if s.readOnly {
+		if s.readOnly || !s.repairOnOpen {
 			return fmt.Errorf("%w: %v", ErrCorruptStore, sc.tornErr)
 		}
 		repairable := sc.torn == tornTruncated && (sc.sawMagic || sc.hasV2Frame)

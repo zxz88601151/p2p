@@ -210,32 +210,23 @@ func (bc *Blockchain) rebuildTree() error {
 	return nil
 }
 
-// NewBlockchainFromStore 从持久化存储加载链；空库时创建确定性创世并落盘。
+// NewBlockchainFromStore 从已显式初始化的持久化存储加载链。
 //
-// 启动回放策略（证据优先）：逐块按高度重新执行完整共识校验（AddBlock），
-// 任何一块不合法即拒绝启动——避免带着损坏数据继续运行。
+// 空库不会自动生成创世：必须先由显式 init 流程调用
+// InitializeBlockchainStore。启动回放前统一经过 VerifyGenesisIdentity，
+// 任何身份不匹配或未初始化状态都在 consensus replay 前 fail closed。
 func NewBlockchainFromStore(store storage.BlockStore) (*Blockchain, error) {
 	h, err := store.Height()
 	if err != nil {
 		return nil, fmt.Errorf("读取存储高度失败: %w", err)
 	}
-
 	if h < 0 {
-		genesis := NewGenesisBlock()
-		if err := store.SaveBlock(genesis); err != nil {
-			return nil, fmt.Errorf("创世区块落盘失败: %w", err)
-		}
-		bc, err := NewBlockchainWithGenesis(genesis)
-		if err != nil {
-			return nil, err
-		}
-		bc.store = store
-		return bc, nil
+		return nil, ErrUninitializedStore
 	}
 
-	first, err := store.GetBlockByHeight(0)
+	first, err := VerifyGenesisIdentity(store)
 	if err != nil {
-		return nil, fmt.Errorf("读取创世区块失败: %w", err)
+		return nil, err
 	}
 	bc, err := NewBlockchainWithGenesis(first)
 	if err != nil {

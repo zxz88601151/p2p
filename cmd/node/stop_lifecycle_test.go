@@ -70,9 +70,34 @@ type realNode struct {
 	waitErr error
 }
 
+// ensureTestDataDir 显式初始化「尚无 blocks.dat」的数据目录（等价于 `p2pchain init`）。
+//
+// F-3B 之后 node 启动不再自动创建创世：空目录会 fail closed 为
+// ErrUninitializedStore。因此真实子进程用例必须在启动前显式初始化。
+//
+// 已存在 blocks.dat 的目录一律原样保留 —— 其内容（canonical / legacy / 外来创世）
+// 由各用例自行构造，并交给被测的启动期身份闸门判定，本辅助函数不得介入。
+func ensureTestDataDir(t *testing.T, dir string) {
+	t.Helper()
+	blocksPath := filepath.Join(dir, "blocks.dat")
+	if _, err := os.Stat(blocksPath); err == nil {
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("检查 %s 失败: %v", blocksPath, err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("创建数据目录失败: %v", err)
+	}
+	var out, errBuf bytes.Buffer
+	if code := cmdInit([]string{"-datadir", dir}, &out, &errBuf); code != 0 {
+		t.Fatalf("显式初始化数据目录失败: code=%d stdout=%q stderr=%q", code, out.String(), errBuf.String())
+	}
+}
+
 // startRealNode 用真实二进制启动节点，等待控制接口就绪后返回。
 func startRealNode(t *testing.T, dir string, extra ...string) *realNode {
 	t.Helper()
+	ensureTestDataDir(t, dir)
 	bin := buildNodeBinary(t)
 	rpc := freePort(t)
 	listen := freePort(t)

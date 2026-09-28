@@ -40,7 +40,7 @@ import (
 // 刻意覆盖从「尚未连接」到「同步/重组进行中」再到「可能已收敛」的完整区间——
 // B 比 A 长 15 个区块，同步窗口足够宽，前几个时刻必然落在**提交过程之中**。
 var r3CrashTimings = []time.Duration{
-	0,                        // 控制接口就绪即刻杀死：必然落在同步/重组进行中
+	0, // 控制接口就绪即刻杀死：必然落在同步/重组进行中
 	15 * time.Millisecond,
 	40 * time.Millisecond,
 	100 * time.Millisecond,
@@ -68,9 +68,9 @@ func TestR3_RealProcessCrashRestartLegacyPrefix(t *testing.T) {
 	const aHeight = 5
 	const bHeight = 100
 
-	prefix := mineChainOffline(t, prefixHeight)                    // 高度 2
-	histA := extendChainOffline(t, prefix, aHeight-prefixHeight)   // 高度 5
-	histB := extendChainOffline(t, prefix, bHeight-prefixHeight)   // 高度 6
+	prefix := mineChainOffline(t, prefixHeight)                  // 高度 2
+	histA := extendChainOffline(t, prefix, aHeight-prefixHeight) // 高度 5
+	histB := extendChainOffline(t, prefix, bHeight-prefixHeight) // 高度 6
 
 	// ── 前提断言（对数据本身，不与同步赛跑）──
 	if got := initialHeightFromLegacy(t, prefix); got != prefixHeight {

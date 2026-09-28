@@ -30,7 +30,7 @@ func startTestRuntime(t *testing.T, mine bool) (*nodeRuntime, *control.Client, s
 	dir := t.TempDir()
 	// PHASE CONTROL-AUTH-1：mutation 端点需要 token；测试统一走共享测试凭据。
 	tokenFile := writeTestTokenFile(t)
-	rt, err := newNodeRuntime(nodeConfig{
+	rt, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr:    "127.0.0.1:0",
 		RPCAddr:       "127.0.0.1:0",
 		DataDir:       dir,
@@ -362,7 +362,7 @@ func TestFullStackRestartPersists(t *testing.T) {
 	rt.Close() // 关闭节点，释放文件与端口
 
 	// 用同一数据目录重新启动
-	rt2, err := newNodeRuntime(nodeConfig{
+	rt2, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,

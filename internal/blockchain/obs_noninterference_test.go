@@ -136,7 +136,7 @@ func runScenario(t *testing.T, ops []obsOp, obsOn bool) ([]obsStep, string) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	// 空库自动创建确定性创世（固定时间戳），两态的 genesis 逐字节一致。
-	bc, err := blockchain.NewBlockchainFromStore(store)
+	bc, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("从存储加载链失败: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestObsNonInterferenceDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("打开探针存储失败: %v", err)
 	}
-	bc0, err := blockchain.NewBlockchainFromStore(store0)
+	bc0, err := blockchain.NewBlockchainFromStoreForTest(store0)
 	if err != nil {
 		t.Fatalf("探针链加载失败: %v", err)
 	}

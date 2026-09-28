@@ -105,7 +105,7 @@ func TestCd_CanonicalHashSetEquality(t *testing.T) {
 		t.Fatalf("TEST 1: 重开 store 失败: %v", err)
 	}
 	t.Cleanup(func() { _ = store2.Close() })
-	bc2, err := NewBlockchainFromStore(store2)
+	bc2, err := NewBlockchainFromStoreForTest(store2)
 	if err != nil {
 		t.Fatalf("TEST 1: freeze/thaw recovery 失败: %v", err)
 	}

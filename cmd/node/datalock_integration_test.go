@@ -36,7 +36,7 @@ func statBlocksDat(t *testing.T, dir string) blocksDatInfo {
 func TestSameDatadirRejectsSecondNode(t *testing.T) {
 	dir := t.TempDir()
 
-	a, err := newNodeRuntime(nodeConfig{
+	a, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,
@@ -50,7 +50,7 @@ func TestSameDatadirRejectsSecondNode(t *testing.T) {
 	before := statBlocksDat(t, dir)
 
 	// B 用同一 datadir → 必须在 newNodeRuntime 最开头的锁获取阶段就失败
-	b, err := newNodeRuntime(nodeConfig{
+	b, err := newNodeRuntimeForTest(nodeConfig{
 		ListenAddr: "127.0.0.1:0",
 		RPCAddr:    "127.0.0.1:0",
 		DataDir:    dir,

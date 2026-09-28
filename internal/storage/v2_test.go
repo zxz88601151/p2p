@@ -783,7 +783,7 @@ func TestOptionC_ProductionPathRejectsMismatchedParentBeforeStorage(t *testing.T
 		t.Fatalf("打开存储失败: %v", err)
 	}
 	defer store.Close()
-	chain, err := blockchain.NewBlockchainFromStore(store)
+	chain, err := blockchain.NewBlockchainFromStoreForTest(store)
 	if err != nil {
 		t.Fatalf("加载链失败: %v", err)
 	}

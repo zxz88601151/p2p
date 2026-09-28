@@ -87,7 +87,22 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 		}
 	}()
 
-	store, err := storage.OpenFileBlockStore(cfg.DataDir)
+	// F-3B：0 字节的既有 blocks.dat 按损坏身份处理，不能当作空库自动创世。
+	// 不存在 blocks.dat 的目录仍交给统一链加载路径返回未初始化错误；只有显式
+	// `init` 命令才允许在全新目录中创建 canonical Genesis。
+	blocksPath := filepath.Join(cfg.DataDir, "blocks.dat")
+	if info, statErr := os.Stat(blocksPath); statErr == nil && info.Size() == 0 {
+		_ = lock.Release()
+		return nil, fmt.Errorf("加载区块链失败: %w", blockchain.ErrCorruptGenesisIdentity)
+	} else if statErr != nil {
+		_ = lock.Release()
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("加载区块链失败: %w", blockchain.ErrUninitializedStore)
+		}
+		return nil, fmt.Errorf("检查区块数据文件失败: %w", statErr)
+	}
+
+	store, err := storage.OpenFileBlockStoreStrict(cfg.DataDir)
 	if err != nil {
 		_ = lock.Release()
 		return nil, fmt.Errorf("打开区块存储失败: %w", err)

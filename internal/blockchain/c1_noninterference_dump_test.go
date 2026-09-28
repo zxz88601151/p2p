@@ -20,10 +20,10 @@ import (
 	"testing"
 
 	"p2pchain/internal/block"
+	"p2pchain/internal/blockchain"
 	"p2pchain/internal/obs"
 	"p2pchain/internal/pow"
 	"p2pchain/internal/storage"
-	"p2pchain/internal/blockchain"
 )
 
 type frozenOp struct {
@@ -66,7 +66,7 @@ func TestC1DumpEventStream(t *testing.T) {
 		if err != nil {
 			t.Fatalf("打开探针存储失败: %v", err)
 		}
-		bc0, err := blockchain.NewBlockchainFromStore(store0)
+		bc0, err := blockchain.NewBlockchainFromStoreForTest(store0)
 		if err != nil {
 			t.Fatalf("探针链加载失败: %v", err)
 		}

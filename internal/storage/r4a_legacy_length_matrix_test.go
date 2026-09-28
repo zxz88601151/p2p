@@ -76,11 +76,11 @@ type r4aCell struct {
 	pos r4aPosKind
 }
 
-func (c r4aCell) id() string      { return fmt.Sprintf("L%d/%s", c.L, c.pos) }
-func (c r4aCell) oldTop() int     { return c.L + r4aK - 1 }
-func (c r4aCell) newTop() int     { return c.oldTop() + 1 }
-func (c r4aCell) forkPoint() int  { return r4aForkPoint(c) }
-func (c r4aCell) newBlocks() int  { return c.newTop() - c.forkPoint() }
+func (c r4aCell) id() string       { return fmt.Sprintf("L%d/%s", c.L, c.pos) }
+func (c r4aCell) oldTop() int      { return c.L + r4aK - 1 }
+func (c r4aCell) newTop() int      { return c.oldTop() + 1 }
+func (c r4aCell) forkPoint() int   { return r4aForkPoint(c) }
+func (c r4aCell) newBlocks() int   { return c.newTop() - c.forkPoint() }
 func (c r4aCell) legacySlots() int { return c.L }
 
 // r4aForkPoint 返回该格的分叉点高度 f（最后共同祖先）。
@@ -243,10 +243,10 @@ func r4aForkOf(t *testing.T, main []*block.Block, f, n int) ([]*block.Block, []u
 // ── 崩溃镜像 ────────────────────────────────────────────────────────────────
 
 type r4aImg struct {
-	cell  r4aCell
-	f     int
-	n     int
-	tag   string // "A-all-detached" / "B-new-tip-block"
+	cell r4aCell
+	f    int
+	n    int
+	tag  string // "A-all-detached" / "B-new-tip-block"
 
 	legacyBytes []byte
 	pre         []byte
@@ -258,9 +258,9 @@ type r4aImg struct {
 	fork     []*block.Block // f+1..newTop
 	forkUndo []utxo.BlockUndo
 
-	oldTip, newTip   [32]byte
-	oldHeight        int
-	newHeight        int
+	oldTip, newTip [32]byte
+	oldHeight      int
+	newHeight      int
 
 	storedInBase int
 	tipFrameLen  int
@@ -750,16 +750,16 @@ func TestR4A_Matrix_ByteSweep(t *testing.T) {
 						t.Fatalf("%s k=%d：期望旧 canonical (h=%d tip=%x)，实际 (h=%d tip=%x)",
 							c.id(), k, c.oldTop(), img.oldTip, o.p.height, o.p.tip)
 					}
-				if o.p.logSize != int64(len(img.base)+r4aCompleteEnd(img, k)) {
-					t.Fatalf("%s k=%d：撕裂残片未被精确移除 LogSize=%d, want %d（base=%d + 完整帧 %d）",
-						c.id(), k, o.p.logSize, len(img.base)+r4aCompleteEnd(img, k), len(img.base), r4aCompleteEnd(img, k))
-				}
-				// TIP 起始偏移必须是完整帧边界（R3 C4 同源断言）
-				if k == tipStart && o.p.logSize != int64(len(img.r4aCut(k))) {
-					t.Fatalf("%s：TIP 起始偏移 %d 不是完整帧边界（LogSize=%d，镜像=%d）",
-						c.id(), tipStart, o.p.logSize, len(img.r4aCut(k)))
-				}
-			} else {
+					if o.p.logSize != int64(len(img.base)+r4aCompleteEnd(img, k)) {
+						t.Fatalf("%s k=%d：撕裂残片未被精确移除 LogSize=%d, want %d（base=%d + 完整帧 %d）",
+							c.id(), k, o.p.logSize, len(img.base)+r4aCompleteEnd(img, k), len(img.base), r4aCompleteEnd(img, k))
+					}
+					// TIP 起始偏移必须是完整帧边界（R3 C4 同源断言）
+					if k == tipStart && o.p.logSize != int64(len(img.r4aCut(k))) {
+						t.Fatalf("%s：TIP 起始偏移 %d 不是完整帧边界（LogSize=%d，镜像=%d）",
+							c.id(), tipStart, o.p.logSize, len(img.r4aCut(k)))
+					}
+				} else {
 					if o.p.tip != img.newTip || o.p.height != c.newTop() {
 						t.Fatalf("%s k=%d：期望新 canonical (h=%d tip=%x)，实际 (h=%d tip=%x)",
 							c.id(), k, c.newTop(), img.newTip, o.p.height, o.p.tip)
