@@ -82,50 +82,115 @@ func f1n1Canonical(t *testing.T, s *storage.FileBlockStore, hash [32]byte) bool 
 	return can
 }
 
-// f1n1Mine mines one coinbase-only block. pkh is derived from height+tag so that
-// same-parent siblings are distinct (the C5 technique used elsewhere).
-func f1n1Mine(t *testing.T, prev [32]byte, height int, tag byte) *block.Block {
+// f1n1Epoch is the fixed timestamp base for deterministic fixture mining.
+// These fixtures stay far below the activation height, so the post-activation
+// MTP window rule never applies; the pre-activation rule only requires
+// ts >= parent.ts and ts <= now + drift, both of which a pinned past epoch
+// satisfies for a monotonically increasing height.
+const f1n1Epoch int64 = 1_700_000_000
+
+// f1n1MineAt mines one coinbase-only block at (prev,height) with an explicit
+// tag/salt — so same-parent siblings are distinct (the C5 technique used
+// elsewhere) — and a DETERMINISTIC timestamp.
+//
+// The original helpers stamped blocks via block.NewCandidateBlock's
+// time.Now(), which made every candidate hash a function of the wall clock.
+// Pinning the timestamp makes identical inputs yield identical blocks, so the
+// fork-choice outcome of these fixtures is reproducible instead of load- and
+// wall-clock-sensitive.
+func f1n1MineAt(t *testing.T, prev [32]byte, height int, tag, salt byte) *block.Block {
 	t.Helper()
 	var pkh [20]byte
 	pkh[0] = byte(height)
 	pkh[1] = tag
+	pkh[2] = salt
 	cb := transaction.NewCoinbaseTx(pkh, utxo.Subsidy(height), height)
 	b := block.NewCandidateBlock(prev, pow.MaxTargetBits, []*transaction.Transaction{cb})
+	b.Header.Timestamp = f1n1Epoch + int64(height)*1000 + int64(tag)
 	if found, _ := pow.Mine(b); !found {
 		t.Fatalf("F1N1: mine failed height=%d tag=%d", height, tag)
 	}
 	return b
 }
 
-// f1n1MineAbove mines siblings until one beats threshold on the byte-lexicographic
-// (big-endian) comparison used by the deterministic tie-break. Harvesting an
-// explicit ordering is what makes the fork-choice outcome of these tests
-// deterministic rather than probabilistic.
-func f1n1MineAbove(t *testing.T, prev [32]byte, height int, threshold [32]byte) *block.Block {
+// f1n1Mine keeps the historical call shape (pkh derived from height+tag) but now
+// mines deterministically.
+func f1n1Mine(t *testing.T, prev [32]byte, height int, tag byte) *block.Block {
 	t.Helper()
-	for i := 0; i < 256; i++ {
-		b := f1n1Mine(t, prev, height, byte(i))
-		h := b.Header.Hash()
-		if bytes.Compare(h[:], threshold[:]) > 0 {
-			return b
-		}
-	}
-	t.Fatalf("F1N1: no sibling above threshold after 256 attempts (height=%d)", height)
-	return nil
+	return f1n1MineAt(t, prev, height, tag, 0)
 }
 
-// f1n1MineBelow is the mirror of f1n1MineAbove: it guarantees the sibling LOSES
-// the work-tie, so the competing branch can be parked deterministically.
-func f1n1MineBelow(t *testing.T, prev [32]byte, height int, threshold [32]byte) *block.Block {
+// ── deterministic tie-harvest ──────────────────────────────────────────────
+//
+// The work-tie between two same-height branches is resolved by the byte-
+// lexicographic (big-endian) comparison of their tip hashes (settip.go
+// tieBreakWinner). The previous helpers searched for a sibling that happened to
+// land above/below a *random* threshold with a bounded 256-attempt loop.
+// Because the threshold is itself a uniform hash, the probability that all N
+// attempts lose is E[U^N] = 1/(N+1) — i.e. the bound cannot be raised to
+// safety (256 → 1024 only improves 0.39% → 0.098%). Test C performs two such
+// searches, hence the measured ≈0.78%/run.
+//
+// The fix HARVESTS the ordering instead of searching for it: the two blocks
+// whose tie must be decided are both mined here from a deterministic pool and
+// the extreme hash is selected.
+//
+//   * Same parent — loser/winner are ordered BY CONSTRUCTION (the pool minimum
+//     and maximum of one set of siblings), so the tie can never resolve the
+//     wrong way.
+//   * Across parents (a legacy branch vs the canonical branch) — the winner is
+//     taken as a pool MAXIMUM, which makes each loser candidate succeed with
+//     high probability; the loser harvest is bounded only to guarantee
+//     termination, and its failure probability is 1/C(pool+bound, bound).
+
+// f1n1Harvest mines `pool` distinct sibling candidates at (prev,height) and
+// returns them sorted by hash ascending. Because they share a parent, the first
+// and last entries are strictly ordered by construction.
+func f1n1Harvest(t *testing.T, prev [32]byte, height, pool int) []*block.Block {
 	t.Helper()
-	for i := 0; i < 256; i++ {
-		b := f1n1Mine(t, prev, height, byte(0x80+i))
+	out := make([]*block.Block, 0, pool)
+	for i := 0; i < pool; i++ {
+		out = append(out, f1n1MineAt(t, prev, height, byte(0x40+i), byte(i)))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].Header.Hash(), out[j].Header.Hash()
+		return bytes.Compare(a[:], b[:]) < 0
+	})
+	return out
+}
+
+// f1n1HarvestPair returns the lowest- and highest-hash members of a same-parent
+// harvest; hash(lower) < hash(upper) holds BY CONSTRUCTION, so the work-tie
+// between them resolves identically on every run.
+func f1n1HarvestPair(t *testing.T, prev [32]byte, height, pool int) (lower, upper *block.Block) {
+	t.Helper()
+	p := f1n1Harvest(t, prev, height, pool)
+	return p[0], p[len(p)-1]
+}
+
+// f1n1HarvestWinnerAbove returns the highest-hash member of a harvest at
+// (prev,height) — the branch whose tip must WIN the tie.
+func f1n1HarvestWinnerAbove(t *testing.T, prev [32]byte, height, pool int) *block.Block {
+	t.Helper()
+	_, upper := f1n1HarvestPair(t, prev, height, pool)
+	return upper
+}
+
+// f1n1HarvestLoserBelow returns a candidate at (prev,height) whose hash is
+// strictly below winnerHash, so it deterministically LOSES the work-tie to the
+// winner. winnerHash is expected to be a harvest maximum (large), which makes
+// each attempt succeed with high probability; `bound` only guarantees
+// termination.
+func f1n1HarvestLoserBelow(t *testing.T, prev [32]byte, height int, winnerHash [32]byte, bound int) *block.Block {
+	t.Helper()
+	for i := 0; i < bound; i++ {
+		b := f1n1MineAt(t, prev, height, byte(0x80+i), byte(i>>8))
 		h := b.Header.Hash()
-		if bytes.Compare(h[:], threshold[:]) < 0 {
+		if bytes.Compare(h[:], winnerHash[:]) < 0 {
 			return b
 		}
 	}
-	t.Fatalf("F1N1: no sibling below threshold after 256 attempts (height=%d)", height)
+	t.Fatalf("F1N1: no candidate below the harvested winner after %d attempts (height=%d)", bound, height)
 	return nil
 }
 
@@ -176,7 +241,10 @@ func TestF1N1_A_LegacyReorgBaseline(t *testing.T) {
 	}
 
 	// ── A2: legacy canonical extension ──
-	l1 := f1n1Mine(t, genHash, 1, 0xA1)
+	// L1 and the A4 "losing sibling" are harvested together at (genesis,1) so
+	// that hash(loser) < hash(L1) holds BY CONSTRUCTION: the A4 work-tie is then
+	// deterministic instead of a bounded search against L1's random hash.
+	loser, l1 := f1n1HarvestPair(t, genHash, 1, 2)
 	if err := bc.AddBlock(l1); err != nil {
 		t.Fatalf("A2: AddBlock(L1): %v", err)
 	}
@@ -262,7 +330,8 @@ func TestF1N1_A_LegacyReorgBaseline(t *testing.T) {
 	// be evaluated, and parking writes a v2 BLOCK frame. Therefore a "pure
 	// legacy reorg persistence" does not exist as a reachable state: the first
 	// fork observed by a legacy-only node leaves legacy purity behind.
-	loser := f1n1MineBelow(t, genHash, 1, l1.Header.Hash())
+	// `loser` was harvested alongside L1 in A2: hash(loser) < hash(L1) holds by
+	// construction, so it deterministically loses the work-tie and is parked.
 	if err := bc2.AddBlock(loser); err != nil {
 		t.Fatalf("A4: AddBlock(losing sibling): %v", err)
 	}
@@ -468,7 +537,10 @@ func TestF1N1_C_MixedLegacyV2Reorg(t *testing.T) {
 	if err := bc.AddBlock(l1); err != nil {
 		t.Fatalf("C/1: AddBlock(L1): %v", err)
 	}
-	l2 := f1n1Mine(t, l1.Header.Hash(), 2, 0xC2)
+	// L2 and its displacing sibling W2 are harvested together at (L1,2) so that
+	// hash(W2) > hash(L2) holds BY CONSTRUCTION: the Phase 2 tie-break then
+	// deterministically adopts W2 instead of relying on a bounded search.
+	l2, w2 := f1n1HarvestPair(t, l1.Header.Hash(), 2, 2)
 	if err := bc.AddBlock(l2); err != nil {
 		t.Fatalf("C/1: AddBlock(L2): %v", err)
 	}
@@ -483,7 +555,7 @@ func TestF1N1_C_MixedLegacyV2Reorg(t *testing.T) {
 	}
 
 	// ── Phase 2: displace L2 with the same-work sibling W2 (tie-break wins) ──
-	w2 := f1n1MineAbove(t, l1.Header.Hash(), 2, l2.Header.Hash())
+	// W2 was harvested above in Phase 1: hash(W2) > hash(L2) by construction.
 	if err := bc.AddBlock(w2); err != nil {
 		t.Fatalf("C/2: AddBlock(W2): %v", err)
 	}
@@ -507,7 +579,11 @@ func TestF1N1_C_MixedLegacyV2Reorg(t *testing.T) {
 	}
 
 	// ── Phase 3: canonical v2 extension → mixed canonical chain ──
-	v3 := f1n1Mine(t, w2.Header.Hash(), 3, 0xC3)
+	// V3 is the canonical v2 tip. It is harvested as a pool MAXIMUM so that the
+	// Phase 4 loser (C3) — whose tie against V3 is cross-parent and therefore
+	// cannot be ordered exactly by construction — can be produced below it with
+	// failure probability 1/C(72,8) ≈ 8.4e-11 instead of 1/257.
+	v3 := f1n1HarvestWinnerAbove(t, w2.Header.Hash(), 3, 8)
 	if err := bc.AddBlock(v3); err != nil {
 		t.Fatalf("C/3: AddBlock(V3): %v", err)
 	}
@@ -557,7 +633,7 @@ func TestF1N1_C_MixedLegacyV2Reorg(t *testing.T) {
 	// parked; the reorg then triggers deterministically on C4 (strictly heavier).
 	logBefore := s.LogSize()
 
-	c3 := f1n1MineBelow(t, l2.Header.Hash(), 3, v3.Header.Hash())
+	c3 := f1n1HarvestLoserBelow(t, l2.Header.Hash(), 3, v3.Header.Hash(), 64)
 	if err := bc.AddBlock(c3); err != nil {
 		t.Fatalf("C/4: AddBlock(C3): %v", err)
 	}
