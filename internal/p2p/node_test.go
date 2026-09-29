@@ -148,7 +148,14 @@ func TestBroadcastBlockAndRelayExcept(t *testing.T) {
 	if err := n2.ConnectToPeer(addr3); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { return n1.PeerCount() == 1 && n3.PeerCount() == 1 }, 5*time.Second, "拓扑未建立")
+	// LIM-5 修复：readiness barrier 必须同时覆盖「接收侧」(n1/n3) 与「发送侧」(n2)。
+	// 广播扇出取决于发送方 n2 的「已注册对端集合」（node.go broadcastExcept 快照 n2.peers），
+	// 而 PeerCount() 只表示「已注册」；n2 的注册发生在 ConnectToPeer 返回之后的 goroutine 中，
+	// 故仅等 n1/n3 会在 n2 拓扑不完整时过早开始 broadcast（原 LIM-5 根因）。
+	// 注意：不得以增大 timeout / 增加 sleep / retry / 放宽 assertion 规避。
+	waitFor(t, func() bool {
+		return n1.PeerCount() == 1 && n2.PeerCount() == 2 && n3.PeerCount() == 1
+	}, 5*time.Second, "拓扑未建立")
 
 	payload, _ := json.Marshal(p2p.BlockPayload{Encoded: hex.EncodeToString([]byte("fake-block-bytes"))})
 	n2.Broadcast(p2p.Message{Type: p2p.MsgNewBlock, Payload: payload})
