@@ -207,15 +207,29 @@ p2pchain/
 │   ├── utxo/            # UTXO 集合与状态迁移
 │   └── wallet/          # 密钥、地址、签名、持久化
 ├── scripts/
+│   ├── run-tests.sh     # canonical 全量测试入口（显式 -timeout 契约）
 │   └── smoke-e2e.sh     # 双真实进程端到端冒烟测试
 └── docs/                # 设计文档与阶段报告
 ```
 
 ## 测试
 
+**canonical 测试入口**（版本化的 timeout 契约）：
+
 ```bash
-go test ./...        # 单元 + 集成 + 进程内端到端（171 个顶层用例）
-go test -race ./...  # 数据竞态检测（同 171 个用例）
+bash scripts/run-tests.sh   # == go test ./... -count=1 -timeout 25m
+```
+
+> ⚠️ **必须显式 `-timeout`**：`go test` 的**每包默认超时是 10m**，而本仓库 `cmd/node`
+> 全量实测耗时 **583.5s ～ 605.3s**（真实 `go build` 子进程 + 真实 node 子进程 + 真实 RPC 挖矿
+> + 真实 TCP P2P，138 个测试）⇒ 默认值会以 `panic: test timed out after 10m0s` 产生**假失败**
+> （已实测复现，无任何 `--- FAIL:` 断言失败）。详见 `docs/TEST-EXECUTION-CONTRACT.md`。
+
+底层等价命令：
+
+```bash
+go test ./... -count=1 -timeout 25m        # 单元 + 集成 + 进程内端到端（171 个顶层用例）
+go test -race ./... -count=1 -timeout 25m  # 数据竞态检测（需 CGO + gcc；本机无 gcc 时不可用）
 bash scripts/smoke-e2e.sh   # 双真实节点进程：出块→同步→转账→打包→余额→真重启持久化（15 项）
 ```
 
