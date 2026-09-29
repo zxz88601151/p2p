@@ -655,6 +655,40 @@ func (bc *Blockchain) extendChain(b *block.Block, persist bool) error {
 // 由于校验路径全程持有 bc.mu 写锁，差值在同锁串行下是精确的。
 var obsBlockLookups atomic.Uint64
 
+// forkView 是「以某条 fork 分支自身祖先」构造的 pow.ChainView（O-3 修复核心）。
+//
+// 与 unsafeView（读 canonical bc.blocks）相对：forkView 按高度返回 **fork 分支上的
+// 区块**——由 parentNode.PathToRoot() 得到 fork 祖先链，再经 blockAtHash 取块
+// （blockAtHash 同时登记 detached 非 canonical 区块，见其调用方须知）。
+//
+// 为什么必须如此（O-3）：fork 块的 bits 与 MTP 必须基于 **fork 自身历史**计算；
+// 若沿用 canonical 视图，则跨 ruleset 边界（2000 / 3000）且 fork 深度 ≥ 一个难度周期
+// （20 块）时，会把 fork 自身的 AdjustBits/AdjustBitsNearest 结果与 canonical 期望值
+// 错误比较 ⇒ 误拒合法 fork（或误收非法 bits）。这正是 pow.ChainView 抽象与
+// DESIGN-1 §FC-004 的设计意图。
+//
+// 惰性求值：BlockByHeight 经 AncestorAtHeight 定位节点后再取块，只读取实际需要的高度
+// （bits 至多 2 个高度、MTP 至多 11 个），避免一次性扫描整条路径。
+type forkView struct {
+	bc   *Blockchain
+	node *blocktree.BlockNode // fork 分支末端（= 待校验块的父节点）
+}
+
+func (v forkView) BlockByHeight(h int) (*block.Block, error) {
+	if h < 0 || h > v.node.Height {
+		return nil, fmt.Errorf("%w: %d（fork 视图高度 %d）", ErrUnknownHeight, h, v.node.Height)
+	}
+	a := v.node.AncestorAtHeight(h)
+	if a == nil {
+		return nil, fmt.Errorf("%w: %d（fork 视图无该祖先）", ErrUnknownHeight, h)
+	}
+	return v.bc.blockAtHash(a.Hash)
+}
+
+func (v forkView) Height() int {
+	return v.node.Height
+}
+
 // validateForkBlock 对一条 fork branch 上的区块执行共识校验。
 // 需要重建父节点处的 UTXO 状态（replay from genesis）。
 //
@@ -708,12 +742,15 @@ func (bc *Blockchain) validateForkBlockInner(b *block.Block, parentNode *blocktr
 	if !pow.Validate(&b.Header) {
 		return ErrInvalidPoW
 	}
-	// 4. 难度（使用当前链的期望难度作为近似；fork branch 难度差异属已知局限）
-	if err := bc.validateBits(b, height); err != nil {
+	// O-3 修复：fork 块的 bits 与 MTP 必须基于 **fork 自身祖先视图**计算，
+	// 而非 canonical bc.blocks（否则跨 ruleset 边界 2000/3000 的 reorg 会误判）。
+	view := forkView{bc: bc, node: parentNode}
+	// 4. 难度（基于 fork 自身祖先视图；canonical 视图会误拒合法 fork）
+	if err := bc.validateBitsWithView(view, b, height); err != nil {
 		return err
 	}
-	// 5. 时间戳
-	if err := bc.validateTimestamp(b, parentBlock, height); err != nil {
+	// 5. 时间戳（同一 fork 视图提供 MTP；与步 4 同属 O-3 修复范围）
+	if err := bc.validateTimestampWithView(view, b, parentBlock, height); err != nil {
 		return err
 	}
 	// 6. Merkle

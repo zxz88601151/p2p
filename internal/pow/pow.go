@@ -73,6 +73,47 @@ const (
 	NewBlockVersion uint32 = 2
 )
 
+// ---- FROZEN CONSENSUS PARAMETER CONTRACT（MNC 系列，MNC-OD-14 冻结 / MNC-OD-15-D 补全） ----
+//
+// 下列常量是 **第二激活边界（ruleset v3）** 的共识真值。它们是**高度锚定**的：
+// 规则集完全由区块高度唯一确定，绝不依赖 canonical tip（OD-15 §4 硬性约束）。
+//
+// 术语纪律（OD-14/OD-15）：FROZEN = YES / IMPLEMENTED = YES（本阶段落地）/ ACTIVATED = NO。
+// 本阶段只实现代码，**不激活网络**：生产链高度（约 1765）远低于 3000，存量链行为逐字节不变。
+const (
+	// NewRulesetActivationHeight 是第二激活高度（H_nearest），ruleset v3 的**起点高度**。
+	//
+	// 冻结值 = 3000（MNC-OD-15-D 正式冻结）。约束核验（OD-15-D §3.1）：
+	//   - > 2000（严格后于 v2 边界，不复用 ActivationHeight）；
+	//   - > 当前生产链高（1765），留 1235 块余量；
+	//   - 为 DifficultyAdjustmentInterval(20) 的整数倍（3000/20=150），注入后首个周期干净；
+	//   - v2 稳定观察区间 [2000,3000) = 1000 块 = 50 周期。
+	//
+	// 语义：h == 3000 是「新规则起点」而非「旧规则终点」（与 IsActivationActive 的
+	// 「激活块自身用新规则」一致）。注入点高度锚定，跨分支确定，无 fork-choice 歧义。
+	NewRulesetActivationHeight = 3000
+
+	// NewRulesetInitialBits 是 ruleset v3 的**初始难度位**（独立参数，MNC-OD-15 §4 拆分）。
+	//
+	// 冻结值 = 27。它与 MaxTargetBits=16 **不是同一个参数**：
+	//   - MaxTargetBits=16 继续承担 genesis 难度 / v1·v2 AdjustBits 起点 / difficulty floor 三重角色（零改动）；
+	//   - NewRulesetInitialBits=27 只在 h == NewRulesetActivationHeight 处**一次性注入**
+	//     （见 ComputeExpectedBitsAt），用于把 v2（Ceil）漂移造成的 overshoot（~28，OD-08）
+	//     在切换瞬间校正回 Nearest 稳态（OD-10 实证 27 为稳态收敛点）。
+	//
+	// 关键：**绝不允许把 MaxTargetBits 改成 27**，也**绝不允许**让 27 外溢到 genesis
+	// （genesis 恒 16，由 ComputeExpectedBitsAt 的 height==0 分支保证）。
+	NewRulesetInitialBits uint32 = 27
+
+	// NewRulesetBlockVersion 是 ruleset v3 区块**必须**使用的版本号。
+	//
+	// 冻结值 = 3（常量名源自 OD-15 §191）。版本三态：v1(<2000) / v2([2000,3000)) / v3(>=3000)。
+	// 旧节点（v2 二进制）对 v3 区块做**双重拒绝**：
+	//   1. VersionForHeight 返回 2 ≠ 3 → ErrInvalidVersion；
+	//   2. 即使版本校验被绕过，旧节点用 Ceil 算出的 expected bits ≠ 新块 Nearest bits → ErrUnexpectedBits。
+	NewRulesetBlockVersion uint32 = 3
+)
+
 // targetBitWidth 是难度目标的位宽：target = 2^(targetBitWidth-bits)。
 //
 // 它同时定义了「不触发移位回绕」的 bits 上界：位移量按 uint32 计算，
@@ -273,22 +314,16 @@ func isCancelled(cancel <-chan struct{}) bool {
 	}
 }
 
-// AdjustBits 根据最近一个难度调整周期实际耗费的时间，计算下一周期的难度（Bits）。
+// adjustTargetCore 是难度调整的**共享核心**（OD-15-C §6 O-4：shared core + 双入口）。
 //
-// 逻辑与比特币一致：
-//   - 若实际用时比期望用时短（矿工太多/算力太强），提高难度（增大 bits）
-//   - 若实际用时比期望用时长（矿工太少/算力下降），降低难度（减小 bits）
+// 它完成与取整模式无关的三步：
+//  1. 幅度 clamp：actualTimespan 夹到 [expected/4, expected*4]（防难度失控）；
+//  2. newTarget = currentTarget × actualTimespan / expected（方向推导，无分支）；
+//  3. floor clamp：newTarget > MaxTarget() 时报告 floorHit（难度低于下限）。
 //
-// 为避免难度剧烈波动，比特币将单次调整幅度限制在 4 倍以内，这里同样做了限制。
-//
-// 输出随后经过两层**有意的**钳制（见 MaxDifficultyBits 的说明）：
-//   - 难度下限：target 不得超过 T(MaxTargetBits)，即 bits 不得小于 MaxTargetBits；
-//   - 难度上限：bits 不得超过 MaxDifficultyBits（本链 == MaxTargetBits，故难度固定）。
-//
-// 注意：方向推导（newTarget ∝ actualTimespan）在钳制前在数学上是正确且无分支的，
-// 钳制只压缩「链上可达的动态范围」，不改变推导本身。该语义由
-// TestAdjustBitsDirection / TestDifficultyAdjustmentBounds 与本包的链级测试共同锁定。
-func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
+// 取整（Ceil / Nearest）与 ceiling clamp 由两个入口函数分别完成，避免重复 clamp 逻辑。
+// 返回值：floorHit=true 时 newTarget 为 nil（调用方须直接返回 MaxTargetBits）。
+func adjustTargetCore(currentBits uint32, actualTimespanSeconds int64) (newTarget *big.Int, floorHit bool) {
 	expected := int64(TargetBlockTimeSeconds * DifficultyAdjustmentInterval)
 
 	// 限制调整幅度在 [expected/4, expected*4] 之间，防止极端值造成难度失控
@@ -302,20 +337,88 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 	}
 
 	currentTarget := BitsToTarget(currentBits)
-	newTarget := new(big.Int).Mul(currentTarget, big.NewInt(actualTimespanSeconds))
+	newTarget = new(big.Int).Mul(currentTarget, big.NewInt(actualTimespanSeconds))
 	newTarget.Div(newTarget, big.NewInt(expected))
 
-	// 难度下限钳制：难度不能低于初始最低难度（即 target 不能超过 MaxTarget）。
+	// 难度下限钳制（作用于 target，先于任何取整）：难度不能低于初始最低难度。
 	if newTarget.Cmp(MaxTarget()) == 1 {
+		return nil, true
+	}
+	return newTarget, false
+}
+
+// ceilBitsFromTarget 把难度目标 newTarget 换算为 **Ceil** 语义的 bits。
+//
+// 逆变换用 257-BitLen：T(b)=2^(256-b) 的 BitLen 恰为 257-b，
+// 因此 257-BitLen 可让 target→bits→target 在 2 的幂处精确还原（均衡态难度不变）；
+// 对一般 target 则向上（偏难）取整。数学意义 = ceil(256 - log2(newTarget))。
+func ceilBitsFromTarget(newTarget *big.Int) uint32 {
+	return uint32(257 - newTarget.BitLen())
+}
+
+// nearestBitsFromTarget 把难度目标 newTarget 换算为 **Nearest** 语义的 bits
+// （round(256 - log2(newTarget))），全程整数运算、**不含任何浮点**（OD-13 §7F / OD-15 §6.4）。
+//
+// 推导（确定性，可独立复核）：
+//
+//	设 b_cont = 256 - log2(t)，b0 = ceil(b_cont) = 257 - BitLen(t)（= 现行 Ceil 值）。
+//	写 t = m·2^(n-1)，n = BitLen(t)，m ∈ [1,2)，则 b_cont = b0 - log2(m)，log2(m) ∈ [0,1)。
+//	Nearest（round-half-up）判据：log2(m) ≤ 0.5 → b0；log2(m) > 0.5 → b0-1。
+//	log2(m) ≤ 0.5  ⟺  m ≤ √2  ⟺  m² ≤ 2  ⟺  t² ≤ 2^(2n-1) = 2^(513-2·b0)。
+//
+// ⇒ **t² ≤ 2^(513-2·b0) 时取 b0，否则取 b0-1。**
+//
+// 相邻 bits 的几何中点 M = √(T(b0-1)·T(b0)) = 2^(256.5-b0) 是无理数，而 t 恒为精确整数
+// （整数×整数÷整数）⇒ t 永不等 M ⇒ **tie 不可达**；为完备性，等号规范为 round-half-up
+// （t ≤ M → b0）。
+//
+// 无溢出/无下溢：floor clamp 在调用前已执行 ⇒ newTarget ≤ 2^240 ⇒ b0 ≥ 16 ⇒ 指数 513-2·b0 ≥ 481 > 0；
+// 共识域内 newTarget ≥ 2^222（currentBits ≤ 32 且 timespan ≥ expected/4）⇒ b0 ≤ 34，指数恒安全。
+// 故 2^(513-2·b0) 用 big.Int.Lsh 精确构造，t² 亦为精确大整数，比较无浮点误差。
+func nearestBitsFromTarget(newTarget *big.Int) uint32 {
+	if newTarget.Sign() <= 0 {
+		return 0
+	}
+	b0 := 257 - newTarget.BitLen() // = ceil(b_cont) = 现行 Ceil 值
+	exp := 513 - 2*b0
+	if exp <= 0 {
+		// 防御性：正常共识域（floor clamp 之后）不可达。target 极小 ⇒ 直接取 b0。
+		return uint32(b0)
+	}
+	t2 := new(big.Int).Mul(newTarget, newTarget)      // t²
+	mid := new(big.Int).Lsh(big.NewInt(1), uint(exp)) // 2^(513-2·b0)
+	if t2.Cmp(mid) <= 0 {
+		return uint32(b0)
+	}
+	return uint32(b0 - 1)
+}
+
+// AdjustBits 根据最近一个难度调整周期实际耗费的时间，计算下一周期的难度（Bits）。
+//
+// 逻辑与比特币一致：
+//   - 若实际用时比期望用时短（矿工太多/算力太强），提高难度（增大 bits）
+//   - 若实际用时比期望用时长（矿工太少/算力下降），降低难度（减小 bits）
+//
+// 为避免难度剧烈波动，比特币将单次调整幅度限制在 4 倍以内，这里同样做了限制。
+//
+// **本函数是 ruleset v1/v2 的 Ceil 取整入口**（OD-15-C §6 O-4：保留 Ceil 入口向后兼容，
+// 现有 pow_test.go 的 Ceil 断言逐字节不变）。ruleset v3 使用 AdjustBitsNearest。
+//
+// 输出随后经过两层**有意的**钳制（见 MaxDifficultyBits 的说明）：
+//   - 难度下限：target 不得超过 T(MaxTargetBits)，即 bits 不得小于 MaxTargetBits；
+//   - 难度上限：bits 不得超过 MaxDifficultyBits。
+//
+// 执行顺序（冻结，不可换位）：① floor clamp（target）→ ② 取整（bits）→ ③ ceiling clamp（bits）。
+//
+// 注意：方向推导（newTarget ∝ actualTimespan）在钳制前在数学上是正确且无分支的，
+// 钳制只压缩「链上可达的动态范围」，不改变推导本身。该语义由
+// TestAdjustBitsDirection / TestDifficultyAdjustmentBounds 与本包的链级测试共同锁定。
+func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
+	newTarget, floorHit := adjustTargetCore(currentBits, actualTimespanSeconds)
+	if floorHit {
 		return MaxTargetBits
 	}
-
-	// 将 newTarget 换算回近似的 bits：找到使 2^(256-bits) 最接近 newTarget 的 bits。
-	// 逆变换用 257-BitLen：T(b)=2^(256-b) 的 BitLen 恰为 257-b，
-	// 因此 257-BitLen 可让 target→bits→target 在 2 的幂处精确还原（均衡态难度不变）；
-	// 对一般 target 则向下保守取整（T(bits') ≤ newTarget，永不比计算值更易）。
-	// 旧公式 256-BitLen 会在均衡态把 bits 低估 1（如 20→19），造成每周期难度系统性变易。
-	newBits := uint32(257 - newTarget.BitLen())
+	newBits := ceilBitsFromTarget(newTarget)
 	if newBits < 1 {
 		newBits = 1
 	}
@@ -324,7 +427,29 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 		newBits = MaxDifficultyBits
 	}
 	return newBits
+}
 
+// AdjustBitsNearest 是 ruleset v3（FROZEN CONSENSUS，h >= NewRulesetActivationHeight）的
+// **Nearest** 取整入口：与 AdjustBits 共享同一 core（幅度 clamp + newTarget + floor clamp），
+// 仅取整步骤不同（Nearest 作用于 b_cont，见 nearestBitsFromTarget）。
+//
+// 动机（OD-08/OD-10）：Ceil 对小幅扰动系统性 +1（overshoot），Nearest 抑制该偏差。
+// 预期行为差异（非冲突）：newTarget ∈ (2^239.5, 2^240.5) 时 Ceil 给 17、Nearest 给 16。
+//
+// 执行顺序与 AdjustBits 一致（冻结）：① floor clamp → ② Nearest → ③ ceiling clamp。
+func AdjustBitsNearest(currentBits uint32, actualTimespanSeconds int64) uint32 {
+	newTarget, floorHit := adjustTargetCore(currentBits, actualTimespanSeconds)
+	if floorHit {
+		return MaxTargetBits
+	}
+	newBits := nearestBitsFromTarget(newTarget)
+	if newBits < 1 {
+		newBits = 1
+	}
+	if newBits > MaxDifficultyBits {
+		newBits = MaxDifficultyBits
+	}
+	return newBits
 }
 
 // ---- 难度共识：工作量度量、链视图与激活门控（PHASE DIFFICULTY-CONSENSUS-IMPLEMENTATION-1） ----
@@ -362,36 +487,60 @@ func WorkOfBits(bits uint32) *big.Int {
 	return w
 }
 
-// IsActivationActive 判断给定高度是否已处于新共识规则（难度浮动 + MTP 时间戳 + 新版本）。
+// IsActivationActive 判断给定高度是否已处于 v2 共识规则（难度浮动 + MTP 时间戳 + 新版本）。
 //
 // 约定：激活块自身（height == ActivationHeight）即使用新规则——激活高度是「新规则起点」，
 // 而非「旧规则终点」。高度 0（创世）始终视为未激活（创世永远用 MaxTargetBits）。
+//
+// 注意：本函数**只管 v2 边界（ActivationHeight，默认 2000）**，用于版本 v1/v2 分界与
+// MTP 时间戳规则；ruleset v3（Nearest + 注入）的第二边界由 IsNewRulesetActive 单独判定。
 func IsActivationActive(height, activationHeight int) bool {
 	return height >= activationHeight && height > 0
 }
 
-// VersionForHeight 返回给定高度区块**必须**使用的版本号。
+// IsNewRulesetActive 判断给定高度是否已处于 ruleset v3（FROZEN CONSENSUS：Nearest 取整 +
+// 新版本位），边界为固定的 NewRulesetActivationHeight（= 3000）。
 //
-// 硬分叉版本强制：激活前必须用 LegacyBlockVersion（< NewBlockVersion），激活后必须
-// 用 NewBlockVersion（>= 此值）。二者互斥构成结构性分叉（DESIGN-1 已证软分叉不可行）。
+// 高度锚定：完全由 height 决定，与 activationHeight / canonical tip 无关。
+// height 0（创世）恒未激活（genesis 永为 MaxTargetBits=16）。
+func IsNewRulesetActive(height int) bool {
+	return height >= NewRulesetActivationHeight && height > 0
+}
+
+// VersionForHeight 返回给定高度区块**必须**使用的版本号（三态，OD-15 §7 冻结）。
+//
+//	height <  activationHeight              → LegacyBlockVersion    (v1)
+//	activationHeight <= height < 3000       → NewBlockVersion       (v2)
+//	height >= 3000（且已激活）               → NewRulesetBlockVersion (v3)
+//
+// 版本互斥构成结构性硬分叉（DESIGN-1 已证软分叉不可行）：旧节点（v2 二进制）对 v3 区块
+// 返回 2 ≠ 3 → ErrInvalidVersion 确定性拒绝。
 func VersionForHeight(height, activationHeight int) uint32 {
 	if IsActivationActive(height, activationHeight) {
+		if IsNewRulesetActive(height) {
+			return NewRulesetBlockVersion
+		}
 		return NewBlockVersion
 	}
 	return LegacyBlockVersion
 }
 
 // ComputeExpectedBitsAt 按共识规则独立计算「高度 height 的区块应当使用的难度位」，
-// 完全基于 view 提供的候选链自身祖先（绝不依赖外部活动链尾）。
+// 完全基于 view 提供的候选链自身祖先（绝不依赖外部活动链尾 / canonical tip）。
 //
-// 规则（冻结于 DESIGN-1 / GATE-1）：
-//   - height == 0：创世，固定 MaxTargetBits。
-//   - height < ActivationHeight（旧规则）：难度钉死在父块 bits（= MaxTargetBits），
-//     此即旧链「难度不浮动」语义的精确等价（旧链无论是否周期边界，结果恒为 16）。
-//   - height >= ActivationHeight（新规则）：
-//       · 非周期边界（height % DifficultyAdjustmentInterval != 0）：沿用父块 bits；
-//       · 周期边界：以 [height-Interval, height-1] 的实际时间跨度调用 AdjustBits，
-//         结果钳制在 [1, MaxDifficultyBits]（现 32）内浮动。
+// 规则（三态，冻结于 DESIGN-1 / GATE-1 / MNC-OD-14 / MNC-OD-15-D）：
+//   - height == 0：创世，固定 MaxTargetBits(16)。（**genesis 恒 16，注入 27 绝不外溢**）
+//   - 0 < height < ActivationHeight（ruleset v1，LEGACY）：难度钉死在父块 bits
+//     （= MaxTargetBits=16），即旧链「难度不浮动」语义的精确等价。
+//   - ActivationHeight <= height < 3000（ruleset v2，Ceil 浮动）：
+//     非周期边界沿用父块 bits；周期边界 AdjustBits（**Ceil**）钳制在 [16,32]。
+//   - height == 3000（ruleset v3 起点）：**无条件**返回 NewRulesetInitialBits(27)
+//     （一次性注入，先于周期边界判断）——把 v2 的 Ceil overshoot 校正回 Nearest 稳态。
+//   - height > 3000（ruleset v3，Nearest 浮动）：
+//     非周期边界沿用父块 bits；周期边界 AdjustBitsNearest（**Nearest**）钳制在 [16,32]。
+//
+// 高度锚定：ruleset 完全由 height 唯一确定，与 canonical tip 无关 ⇒ 历史块回放 / 跨分支
+// 校验 / 新节点同步逐高度使用正确 ruleset，**无 retroactive reinterpretation**。
 //
 // 返回的错误仅在 view 无法提供所需祖先块时产生（如 height-1 越界），正常路径恒为 nil。
 func ComputeExpectedBitsAt(view ChainView, height, activationHeight int) (uint32, error) {
@@ -402,10 +551,26 @@ func ComputeExpectedBitsAt(view ChainView, height, activationHeight int) (uint32
 	if err != nil {
 		return 0, fmt.Errorf("计算期望难度：读取父块（高度 %d）失败: %w", height-1, err)
 	}
+
+	// ruleset v3（FROZEN CONSENSUS）：Nearest 取整 + 一次性注入。
+	if IsNewRulesetActive(height) {
+		if height == NewRulesetActivationHeight {
+			// 一次性注入（无条件，先于周期边界判断）：高度锚定、跨分支确定。
+			return NewRulesetInitialBits, nil
+		}
+		return retargetAtBoundary(view, parent, height, AdjustBitsNearest)
+	}
+
+	// ruleset v1（钉死 16）/ v2（Ceil 浮动）由 v2 激活边界分叉。
 	if !IsActivationActive(height, activationHeight) {
-		// 旧规则：钉死在父块难度（= MaxTargetBits）。等价于旧 currentBitsLocked 的全部分支。
 		return parent.Header.Bits, nil
 	}
+	return retargetAtBoundary(view, parent, height, AdjustBits)
+}
+
+// retargetAtBoundary 在难度调整周期边界处按给定取整函数重算 bits；非边界沿用父块 bits。
+// 抽出以避免 v2(Ceil)/v3(Nearest) 两条分支重复周期窗口逻辑（单一事实源）。
+func retargetAtBoundary(view ChainView, parent *block.Block, height int, round func(uint32, int64) uint32) (uint32, error) {
 	if height%DifficultyAdjustmentInterval != 0 {
 		return parent.Header.Bits, nil
 	}
@@ -418,7 +583,7 @@ func ComputeExpectedBitsAt(view ChainView, height, activationHeight int) (uint32
 		return 0, fmt.Errorf("计算期望难度：读取周期起点（高度 %d）失败: %w", periodStartHeight, err)
 	}
 	actualTimespan := parent.Header.Timestamp - periodStart.Header.Timestamp
-	return AdjustBits(parent.Header.Bits, actualTimespan), nil
+	return round(parent.Header.Bits, actualTimespan), nil
 }
 
 // MedianTimePastAt 计算高度 h 的「过去中位数时间」（MTP）。

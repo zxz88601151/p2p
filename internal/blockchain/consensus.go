@@ -8,8 +8,10 @@ package blockchain
 // （同一 goroutine 持写锁后再 RLock 会永久阻塞）。
 //
 // 设计要点：所有难度/时间戳/MTP 计算都委托给 pow 包的纯函数（ComputeExpectedBitsAt /
-// MedianTimePastAt），仅通过 ChainView 抽象读取祖先——这样未来 reorg 时可由候选竞争链
-// 提供视图，而无需改动共识计算本身（DESIGN-1 §FC-004 的 fork-choice 安全要求）。
+// MedianTimePastAt），仅通过 ChainView 抽象读取祖先。canonical 路径传 unsafeView{bc}
+// （祖先即 bc.blocks）；**fork 校验路径传 fork 自身祖先视图**（blockchain.go 的
+// forkChainView，由 parentNode.PathToRoot() 构造）——这是 DESIGN-1 §FC-004 的
+// fork-choice 安全要求（O-3 修复：bits 与 timestamp/MTP 两个消费者都必须用 fork 视图）。
 
 import (
 	"fmt"
@@ -62,25 +64,43 @@ func (bc *Blockchain) ActivationHeight() int {
 	return bc.activationHeight
 }
 
-// expectedBitsFor 计算高度 height 区块的期望难度位，基于本链（活动链）视图。
-// 等价于旧 currentBitsLocked，但按激活高度分叉旧/新规则（见 pow.ComputeExpectedBitsAt）。
-func (bc *Blockchain) expectedBitsFor(height int) uint32 {
-	want, err := pow.ComputeExpectedBitsAt(unsafeView{bc}, height, bc.activationHeight)
+// expectedBitsForView 计算高度 height 区块的期望难度位，**基于调用方提供的 ChainView**。
+//
+// 主链（canonical）路径传 unsafeView{bc}；fork 校验路径传 **fork 自身祖先视图**
+// （见 blockchain.go 的 forkChainView）——这正是 pow.ChainView 抽象与 DESIGN-1 §FC-004
+// 「reorg 时由候选竞争链提供视图」的设计意图所在。
+//
+// ruleset 完全由 height 唯一确定（v1/v2/v3，见 pow.ComputeExpectedBitsAt），view 仅提供祖先块。
+func (bc *Blockchain) expectedBitsForView(view pow.ChainView, height int) uint32 {
+	want, err := pow.ComputeExpectedBitsAt(view, height, bc.activationHeight)
 	if err != nil {
-		// 正常主链视图不会失败；防御性返回最保守的 MaxTargetBits。
+		// 正常主链/fork 视图不会失败；防御性返回最保守的 MaxTargetBits。
 		return pow.MaxTargetBits
 	}
 	return want
 }
 
-// medianTimePast 计算高度 parentHeight 的 MTP（过去中位数时间）。
-func (bc *Blockchain) medianTimePast(parentHeight int) int64 {
-	return pow.MedianTimePastAt(unsafeView{bc}, parentHeight, bc.activationHeight)
+// expectedBitsFor 计算高度 height 区块的期望难度位，基于本链（活动链）视图。
+// 等价于旧 currentBitsLocked，但按 ruleset（v1/v2/v3）分叉（见 pow.ComputeExpectedBitsAt）。
+func (bc *Blockchain) expectedBitsFor(height int) uint32 {
+	return bc.expectedBitsForView(unsafeView{bc}, height)
 }
 
-// validateVersion 强制硬分叉版本规则：
-//   - 激活前：区块版本必须为 LegacyBlockVersion（< NewBlockVersion）
-//   - 激活后：区块版本必须为 NewBlockVersion（>= 此值）
+// medianTimePast 计算高度 parentHeight 的 MTP（过去中位数时间），基于本链（活动链）视图。
+func (bc *Blockchain) medianTimePast(parentHeight int) int64 {
+	return bc.medianTimePastView(unsafeView{bc}, parentHeight)
+}
+
+// medianTimePastView 计算高度 parentHeight 的 MTP，**基于调用方提供的 ChainView**
+// （canonical 路径传 unsafeView{bc}，fork 路径传 fork 自身视图）。
+func (bc *Blockchain) medianTimePastView(view pow.ChainView, parentHeight int) int64 {
+	return pow.MedianTimePastAt(view, parentHeight, bc.activationHeight)
+}
+
+// validateVersion 强制硬分叉版本规则（三态，OD-15 §7 冻结）：
+//   - height < activationHeight：LegacyBlockVersion(1)
+//   - activationHeight <= height < 3000：NewBlockVersion(2)
+//   - height >= 3000：NewRulesetBlockVersion(3)
 func (bc *Blockchain) validateVersion(b *block.Block, height int) error {
 	want := pow.VersionForHeight(height, bc.activationHeight)
 	if b.Header.Version != want {
@@ -89,16 +109,29 @@ func (bc *Blockchain) validateVersion(b *block.Block, height int) error {
 	return nil
 }
 
-// validateBits 校验区块难度位等于基于本链计算的期望难度（防止矿工私降/私升难度）。
+// validateBits 校验区块难度位等于基于**本链（活动链）**视图计算的期望难度。
+// canonical 路径专用；fork 校验路径必须用 validateBitsWithView(forkView, …)（O-3）。
 func (bc *Blockchain) validateBits(b *block.Block, height int) error {
-	want := bc.expectedBitsFor(height)
+	return bc.validateBitsWithView(unsafeView{bc}, b, height)
+}
+
+// validateBitsWithView 校验区块难度位等于基于**给定视图**计算的期望难度
+// （防止矿工私降/私升难度）。fork 校验路径传入 fork 自身 ChainView（O-3 修复）。
+func (bc *Blockchain) validateBitsWithView(view pow.ChainView, b *block.Block, height int) error {
+	want := bc.expectedBitsForView(view, height)
 	if b.Header.Bits != want {
 		return fmt.Errorf("%w: 区块 %d，共识期望 %d", ErrUnexpectedBits, b.Header.Bits, want)
 	}
 	return nil
 }
 
-// validateTimestamp 按激活状态分叉时间戳规则：
+// validateTimestamp 按激活状态分叉时间戳规则，基于**本链（活动链）**视图。
+// canonical 路径专用；fork 校验路径必须用 validateTimestampWithView(forkView, …)（O-3）。
+func (bc *Blockchain) validateTimestamp(b *block.Block, tip *block.Block, height int) error {
+	return bc.validateTimestampWithView(unsafeView{bc}, b, tip, height)
+}
+
+// validateTimestampWithView 按激活状态分叉时间戳规则，**MTP 由给定视图提供**：
 //   - 激活前（旧规则，共识 + 中继策略）：不得早于父块（保证难度跨度单调），
 //     且不得大幅超前本地时钟（maxFutureTimestampDrift，墙钟仅作中继拒收，非共识分叉源）。
 //   - 激活后（新规则，R3 后的完整规则）：MTP(parent) < ts <= MTP(parent)+7200。
@@ -106,7 +139,11 @@ func (bc *Blockchain) validateBits(b *block.Block, height int) error {
 //     墙钟依赖——timewarp 攻击因「不得 ≤ MTP」被天然防御，且墙钟偏差/恶意时钟
 //     都不会造成永久共识分叉；上界封顶时间戳膨胀，防持有出块权者以远未来时间戳
 //     拉长难度时间跨度、压低 retarget 难度（见 maxActivationTimestampSlack）。
-func (bc *Blockchain) validateTimestamp(b *block.Block, tip *block.Block, height int) error {
+//
+// view 参数是 O-3 修复的关键：canonical 路径传 unsafeView{bc}（其祖先即 bc.blocks），
+// fork 路径传 **fork 自身祖先视图**——否则 fork 块的 MTP 会用 canonical 链的祖先计算，
+// 与 fork 自身历史不符（跨 ruleset 边界 reorg 时必然误判）。
+func (bc *Blockchain) validateTimestampWithView(view pow.ChainView, b *block.Block, tip *block.Block, height int) error {
 	if !pow.IsActivationActive(height, bc.activationHeight) {
 		if b.Header.Timestamp < tip.Header.Timestamp {
 			return fmt.Errorf("%w: 时间戳 %d 早于父块 %d", ErrTimestampOutOfRange, b.Header.Timestamp, tip.Header.Timestamp)
@@ -116,7 +153,7 @@ func (bc *Blockchain) validateTimestamp(b *block.Block, tip *block.Block, height
 		}
 		return nil
 	}
-	mtp := bc.medianTimePast(height - 1)
+	mtp := bc.medianTimePastView(view, height-1)
 	if b.Header.Timestamp <= mtp {
 		return fmt.Errorf("%w: 时间戳 %d 未严格大于父块 MTP %d（post-activation 规则）", ErrTimestampOutOfRange, b.Header.Timestamp, mtp)
 	}
