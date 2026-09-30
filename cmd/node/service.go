@@ -15,6 +15,7 @@ import (
 	"errors"
 	"log"
 	"math/big"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,68 @@ const (
 	cascadeViaLocalMining = "resolve_arrival_local_mining"
 )
 
+// ---- PHASE P2P-SYNC-LIVENESS-MINIMUM-SAFE-FIX-1：批量同步在途注册表 ----
+//
+// 背景（设计审计 PHASE-P2P-CONNECTION-RECOVERY-DESIGN-AUDIT-1）：
+// 修复前批量同步用一个**全局计数器** `pending` 兼做三件事——去重、在途账期、
+// 进度游标。三者共用一个整数导致：一个坏/僵死的 peer 只要占住这个槽，
+// 其余所有 peer 的同步请求都会被静默抑制，且该槽**既无 TTL 也无断连清理**，
+// 极端情况下永久停留在 1（CASE 7）。
+//
+// 本阶段只做 MINIMUM SAFE FIX，复用既有 by-hash `inflight` 的四个性质
+// （registry / TTL / 并发上限 / 超时重发），不另起一套平行机制：
+//   - registry：按**区间起点高度**建全局登记表（去重仍是全局的，避免请求风暴）；
+//   - per-request state：条目自带归属 peer、尝试次数、截止时间、重试时刻；
+//   - TTL：条目超时即失效，可被重试或被彻底释放；
+//   - bounded retry：最大尝试次数 + 指数退避 + 终态，绝不紧循环；
+//   - peer failover：重试优先改投**另一个**仍连接的 peer；
+//   - disconnect cleanup：对端已不在 PeerAddrs 中的条目立即判定失效；
+//   - global concurrency cap：在途区间数上限。
+//
+// 明确不做（保持 DEFER）：readTimeout / heartbeat / ping-pong / TCP keepalive /
+// 协议消息类型 / 握手能力声明 / NodeID / known_peers / maxInbound /
+// BroadcastExcept / connection layer 重构。
+const (
+	// maxInflightSync 全局在途「区间起点」条目数上限。
+	//
+	// 与 maxInflightBranch=64 不同量级是**故意的**：每个批量条目最多换回
+	// MaxSyncBatch=200 个区块（by-hash 条目只换回 <=65 个），
+	// 因此本上限对应的在途区块上界为 4 × 200 = 800，与分支路径的
+	// 64 × 65 = 4160 同数量级、但更保守。
+	maxInflightSync = 4
+	// syncReqTTL 单次批量同步请求的等待窗口：超时即判定本次尝试失败。
+	//
+	// 取值与 branchReqTTL（30s）同量级，不引入新的时间尺度；
+	// 实测跨主机 200 块批量响应耗时 ~0.2s，30s 有 >100× 余量。
+	defaultSyncReqTTL = 30 * time.Second
+	// maxSyncAttempts 同一个区间起点允许的**总**尝试次数（含首次），
+	// 达到即进入终态并释放条目 —— retry 必须有 terminal state。
+	maxSyncAttempts = 3
+	// defaultSyncRetryBase 退避基数：第 n 次失败后等待 base × 2^(n-1)。
+	// 1st→2s、2nd→4s；第 3 次失败即终态，不再等待。
+	defaultSyncRetryBase = 2 * time.Second
+	// defaultSyncSweepInterval 调度器巡检周期（唯一执行重试发送的 goroutine）。
+	defaultSyncSweepInterval = 2 * time.Second
+)
+
+// syncRequest 一次批量同步请求（区间起点）的完整生命周期状态。
+//
+// 全部字段由 nodeService.mu 保护；纯内存，绝不持久化（与 by-hash inflight 一致）。
+type syncRequest struct {
+	from    int       // 区间起点高度（= 登记表键，全局去重维度）
+	peer    string    // 本次尝试的归属对端
+	attempt int       // 已尝试次数（含当前这次），与 maxSyncAttempts 比较
+	created time.Time // 本次尝试发出的时刻
+	// deadline 本次尝试的失效时刻（created + TTL）。过期即判定本次尝试失败。
+	deadline time.Time
+	// failed 本次尝试已被判定失败（等待调度器按 backoff 重试）。
+	// true 的条目仍占着去重槽 —— 这是「不重复请求同一区间」的保证，
+	// 但它**有寿命**：TTL/退避/终态三者任一到达即被释放。
+	failed bool
+	// nextRetry 允许下一次重试的最早时刻（backoff 闸门，杜绝紧循环）。
+	nextRetry time.Time
+}
+
 // nodeService 实现 p2p.Handler。
 type nodeService struct {
 	chain *blockchain.Blockchain
@@ -95,10 +158,30 @@ type nodeService struct {
 	miner *wallet.Wallet
 
 	mu sync.Mutex
-	// pending 记录尚未收到响应的同步请求数，避免重复发起造成请求风暴。
-	pending int
+	// syncInflight 批量同步在途登记表：键 = 区间起点高度（全局去重维度）。
+	//
+	// 取代了修复前的全局计数器 `pending`：去重语义保留（同一区间绝不并发重复请求），
+	// 但每个条目现在有归属 peer、尝试次数、TTL、退避闸门与终态，
+	// 因此「一个坏 peer 占住唯一全局槽」的 chokepoint 不复存在。
+	syncInflight map[int]*syncRequest
 	// syncing 表示当前正在追赶（本地落后于对端），用于抑制重复触发。
 	syncing bool
+	// syncSchedStarted 调度器 goroutine 是否已启动。
+	//
+	// 未启动时（例如只做单元测试的最小装配）在途条目一旦失败即**立即释放**，
+	// 行为与修复前 `pending=0` 完全一致 —— 保证「不启动调度器 ⇒ 行为不变」。
+	syncSchedStarted bool
+	// syncStopCh / syncStopOnce / syncStartOnce / syncWG：调度器 goroutine 生命周期。
+	// 调度器是**唯一**执行重试发送的地方（见 runSyncSweep）。
+	syncStopCh   chan struct{}
+	syncStopOnce sync.Once
+	syncStartOne sync.Once
+	syncWG       sync.WaitGroup
+	// syncTTL / syncRetryBase / syncSweepInterval：可调时序参数。
+	// 生产一律使用 default* 常量；仅测试可覆盖以压缩时序（不影响任何业务分支）。
+	syncTTL           time.Duration
+	syncRetryBase     time.Duration
+	syncSweepInterval time.Duration
 
 	// ---- REORG-1H：分支拉取运行时状态（全部由 mu 保护，纯内存，绝不持久化）----
 	//
@@ -183,6 +266,12 @@ func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *
 		parkedHashes: make(map[[32]byte]struct{}),
 		rounds:       make(map[[32]byte]int),
 		obsReqIDs:    make(map[[32]byte]uint64),
+		// MSF：批量同步在途登记表与其生命周期。
+		syncInflight:      make(map[int]*syncRequest),
+		syncStopCh:        make(chan struct{}),
+		syncTTL:           defaultSyncReqTTL,
+		syncRetryBase:     defaultSyncRetryBase,
+		syncSweepInterval: defaultSyncSweepInterval,
 	}
 	// atomic.Value 必须先 Store 再 Load，否则 Load 返回 nil 接口导致类型断言 panic。
 	s.mineState.Store(miningState(MiningStopped))
@@ -461,7 +550,7 @@ func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayloa
 		applied, deferred, s.chain.Height(), payload.Done)
 
 	s.mu.Lock()
-	s.pending = 0
+	s.clearSyncInflightLocked()
 	resume := ""
 	switch {
 	case deferred > 0:
@@ -486,7 +575,7 @@ func (s *nodeService) OnBlocksResp(peerAddr string, payload p2p.BlocksRespPayloa
 func (s *nodeService) endSync(resume string) {
 	s.mu.Lock()
 	s.syncing = false
-	s.pending = 0
+	s.clearSyncInflightLocked()
 	s.syncResume = resume
 	s.mu.Unlock()
 }
@@ -497,7 +586,7 @@ func (s *nodeService) resumeSync() {
 	s.mu.Lock()
 	target := s.syncResume
 	s.syncing = false
-	s.pending = 0
+	s.clearSyncInflightLocked()
 	s.syncResume = ""
 	s.mu.Unlock()
 	if target == "" {
@@ -1000,38 +1089,319 @@ func (s *nodeService) resurrectMempool(result *blockchain.ReorgResult, height in
 }
 
 // requestSync 向指定对端请求从 from 高度开始的区块。
+//
+// MSF 状态机：
+//
+//	request → sweep（只判定与释放，绝不发送）
+//	        → 去重 / 并发上限判定
+//	        → 登记条目（归属 peer + 尝试次数 + TTL）
+//	        → 发送一次
+//	        → 响应到达   → clearSyncInflightLocked → 完成
+//	        → TTL 到期 / 对端断开 / 发送失败 → 条目标记 failed
+//	        → 由调度器 goroutine 按 backoff 重试（优先改投其他 peer）
+//	        → 尝试次数耗尽 → 终态释放
+//
+// 关键不变量：**本函数只发送一次，失败后绝不在此处重试。**
+// requestSync 运行在 peer 自己的读循环 goroutine 上，而 SendTo 是同步直写
+// （持有 peer.mu，最长阻塞 writeTimeout=10s）；在此处重试会形成
+// send→fail→retry 紧循环并卡死该 peer 的读循环。重试只由 runSyncSweep 执行。
 func (s *nodeService) requestSync(peerAddr string, from int) {
+	now := time.Now()
+	peers, checkPeers := s.syncPeerSet()
+
 	s.mu.Lock()
-	if s.pending > 0 {
+	s.sweepSyncLocked(now, peers, checkPeers)
+
+	if r, ok := s.syncInflight[from]; ok {
 		s.mu.Unlock()
 		// I0/§6：请求被在途批抑制（抑制也是 SYNC 生命周期的合法状态）。
+		// MSF：事件名与 reason 逐字保持不变（观测兼容），仅补充归属与尝试信息。
 		obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from,
-			"suppressed", true, "reason", "pending_in_flight")
-		return // 已有请求在途，等待响应即可
+			"suppressed", true, "reason", "pending_in_flight",
+			"owner", r.peer, "attempt", r.attempt, "failed", r.failed)
+		return // 同一区间已在途（无论归属哪个 peer）：等响应，或等调度器重投
 	}
-	s.pending++
+	if len(s.syncInflight) >= maxInflightSync {
+		n := len(s.syncInflight)
+		s.mu.Unlock()
+		obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from,
+			"suppressed", true, "reason", "sync_cap",
+			"inflight", n, "max_inflight", maxInflightSync)
+		return
+	}
+	r := &syncRequest{from: from, peer: peerAddr, attempt: 1, created: now}
+	r.deadline = now.Add(s.syncTTL)
+	s.syncInflight[from] = r
 	s.syncing = true
+	n := len(s.syncInflight)
 	s.mu.Unlock()
 
 	// I0/§6：SYNC_REQUEST 真正发出。
 	obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from, "suppressed", false,
 		"batch", MaxSyncBatch)
-	payload, err := json.Marshal(p2p.GetBlocksPayload{FromHeight: from, Count: MaxSyncBatch})
+	obs.Emit("SYNC_REQ_CREATED", "peer", peerAddr, "from_height", from, "attempt", 1,
+		"inflight", n, "max_inflight", maxInflightSync, "ttl_s", s.syncTTL.Seconds())
+	s.sendSyncRequest(r)
+}
+
+// sendSyncRequest 发出一次 GetBlocks，并把结果落到条目状态上。
+// 调用方必须已在本函数之外设置好 r.peer / r.attempt / r.deadline。
+func (s *nodeService) sendSyncRequest(r *syncRequest) {
+	payload, err := json.Marshal(p2p.GetBlocksPayload{FromHeight: r.from, Count: MaxSyncBatch})
 	if err != nil {
 		log.Printf("[node] 构造同步请求失败: %v", err)
+		// 修复前此路径**不复位** pending（潜在泄漏）；现在统一走失败判定。
+		s.markSyncAttemptFailed(r, "marshal_failed")
 		return
 	}
-	if err := s.net.SendTo(peerAddr, p2p.Message{Type: p2p.MsgGetBlocks, Payload: payload}); err != nil {
-		log.Printf("[node] 发送同步请求给 %s 失败: %v", peerAddr, err)
-		obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from,
+	if err := s.net.SendTo(r.peer, p2p.Message{Type: p2p.MsgGetBlocks, Payload: payload}); err != nil {
+		log.Printf("[node] 发送同步请求给 %s 失败: %v", r.peer, err)
+		obs.Emit("SYNC_REQUEST", "peer", r.peer, "from_height", r.from,
 			"suppressed", false, "result", "send_failed")
-		s.mu.Lock()
-		s.pending = 0
-		s.syncing = false
-		s.mu.Unlock()
+		s.markSyncAttemptFailed(r, "send_failed")
 		return
 	}
-	log.Printf("[node] 已向 %s 请求区块，起始高度=%d", peerAddr, from)
+	log.Printf("[node] 已向 %s 请求区块，起始高度=%d", r.peer, r.from)
+	obs.Emit("SYNC_REQ_SENT", "peer", r.peer, "from_height", r.from, "attempt", r.attempt)
+}
+
+// markSyncAttemptFailed 把一次尝试判定为失败，并决定「等待重试」还是「终态释放」。
+//
+// 本函数**从不发送**任何报文 —— 重试发送只由调度器 goroutine 执行，
+// 这是「不在 peer 读循环内重试」的结构性保证。
+func (s *nodeService) markSyncAttemptFailed(r *syncRequest, reason string) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.syncInflight[r.from]
+	if !ok || cur != r {
+		return // 已被响应或已被释放：本次结果作废
+	}
+	s.markSyncFailedLocked(r, reason, now)
+}
+
+// markSyncFailedLocked 在持有 s.mu 时把条目判负：终态释放 或 标记等待重试。
+func (s *nodeService) markSyncFailedLocked(r *syncRequest, reason string, now time.Time) {
+	switch {
+	case !s.syncSchedStarted:
+		// 调度器未启动 ⇒ 行为与修复前 `pending = 0` 完全一致：
+		// 立即释放，把机会交回下一次握手（不引入任何新的重试语义）。
+		delete(s.syncInflight, r.from)
+		s.syncing = len(s.syncInflight) > 0
+		obs.Emit("SYNC_REQ_RELEASED", "peer", r.peer, "from_height", r.from,
+			"reason", reason, "terminal", true, "attempt", r.attempt,
+			"detail", "scheduler_not_started")
+	case r.attempt >= maxSyncAttempts:
+		delete(s.syncInflight, r.from)
+		s.syncing = len(s.syncInflight) > 0
+		obs.Emit("SYNC_REQ_RELEASED", "peer", r.peer, "from_height", r.from,
+			"reason", reason, "terminal", true, "attempt", r.attempt,
+			"detail", "attempts_exhausted")
+		log.Printf("[node] 同步请求（起始高度=%d）已尝试 %d 次仍未成功，本轮放弃",
+			r.from, r.attempt)
+	default:
+		backoff := s.backoffFor(r.attempt)
+		r.failed = true
+		r.nextRetry = now.Add(backoff)
+		obs.Emit("SYNC_REQ_FAILED", "peer", r.peer, "from_height", r.from,
+			"reason", reason, "attempt", r.attempt, "max_attempts", maxSyncAttempts,
+			"retry_in_s", backoff.Seconds())
+	}
+}
+
+// sweepSyncLocked 在持有 s.mu 时扫描在途登记表：
+//   - 已过 TTL，或归属 peer 已不在连接列表中 ⇒ 本次尝试判负；
+//   - 判负后按 markSyncFailedLocked 决定终态释放还是等待重试。
+//
+// 本函数**绝不发送**报文：只做判定与释放，因此可以从 peer 读循环安全调用。
+func (s *nodeService) sweepSyncLocked(now time.Time, peers map[string]bool, checkPeers bool) {
+	for _, r := range s.syncInflight {
+		if r.failed {
+			continue // 已在退避闸门后等待调度器重试
+		}
+		switch {
+		case now.After(r.deadline):
+			s.markSyncFailedLocked(r, "ttl_expired", now)
+		case checkPeers && !peers[r.peer]:
+			s.markSyncFailedLocked(r, "peer_disconnected", now)
+		}
+	}
+}
+
+// clearSyncInflightLocked 释放全部在途条目（批完成 / 异常终止 / 续拉下一批时调用）。
+//
+// 语义与修复前的 `pending = 0` 完全一致：批量同步串行推进，
+// 一批收到（或终止）后此前登记的所有区间都不再需要在途。
+func (s *nodeService) clearSyncInflightLocked() {
+	if len(s.syncInflight) == 0 {
+		return
+	}
+	n := len(s.syncInflight)
+	s.syncInflight = make(map[int]*syncRequest)
+	obs.Emit("SYNC_REQ_CLEARED", "cleared", n)
+}
+
+// runSyncSweep 一次调度巡检：先判定释放，再按 backoff 重试发送。
+// 这是**唯一**执行重试发送的地方，且只运行在调度器 goroutine 上。
+func (s *nodeService) runSyncSweep(now time.Time) {
+	peers, checkPeers := s.syncPeerSet()
+
+	s.mu.Lock()
+	s.sweepSyncLocked(now, peers, checkPeers)
+	retries := make([]*syncRequest, 0, len(s.syncInflight))
+	for _, r := range s.syncInflight {
+		if r.failed && !now.Before(r.nextRetry) {
+			// 先摘牌并续期：避免并发巡检把同一条目重复判负/重复取用。
+			r.failed = false
+			r.created = now
+			r.deadline = now.Add(s.syncTTL)
+			retries = append(retries, r)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, r := range retries {
+		s.retrySync(r, now)
+	}
+}
+
+// retrySync 重新投递一次同步请求：peer failover + 次数递增 + TTL 重置。
+func (s *nodeService) retrySync(r *syncRequest, now time.Time) {
+	peer, ok := s.pickSyncPeer(r.peer)
+	if !ok {
+		// 已无任何可用对端：终态释放（等新 peer 握手时重新登记）。
+		// 不消耗尝试次数 —— 无对端不是对端的错，但也不该让条目无限占位。
+		s.mu.Lock()
+		if cur := s.syncInflight[r.from]; cur == r {
+			delete(s.syncInflight, r.from)
+			s.syncing = len(s.syncInflight) > 0
+		}
+		s.mu.Unlock()
+		obs.Emit("SYNC_REQ_RELEASED", "peer", r.peer, "from_height", r.from,
+			"reason", "no_peer", "terminal", true, "attempt", r.attempt)
+		return
+	}
+	s.mu.Lock()
+	if cur := s.syncInflight[r.from]; cur != r {
+		s.mu.Unlock()
+		return // 期间已被响应或释放
+	}
+	r.peer = peer
+	r.attempt++
+	r.created = now
+	r.deadline = now.Add(s.syncTTL)
+	r.failed = false
+	r.nextRetry = time.Time{}
+	s.mu.Unlock()
+
+	obs.Emit("SYNC_REQ_RETRY", "peer", r.peer, "from_height", r.from, "attempt", r.attempt)
+	log.Printf("[node] 重试同步请求（起始高度=%d）：改投 %s（第 %d/%d 次）",
+		r.from, r.peer, r.attempt, maxSyncAttempts)
+	s.sendSyncRequest(r)
+}
+
+// pickSyncPeer 为重试挑选对端：**优先**与上次不同的 peer（failover），
+// 只有它一个时才退化为复用（仍受 backoff 节流）。
+// 按地址字典序确定，不引入随机性，保证结果可复现。
+func (s *nodeService) pickSyncPeer(exclude string) (string, bool) {
+	if s.net == nil {
+		return "", false
+	}
+	addrs := s.net.PeerAddrs()
+	if len(addrs) == 0 {
+		return "", false
+	}
+	sort.Strings(addrs)
+	for _, a := range addrs {
+		if a != exclude {
+			return a, true
+		}
+	}
+	return addrs[0], true
+}
+
+// syncPeerSet 当前仍连接的对端集合；s.net 未装配时 ok=false（跳过断连判定）。
+//
+// 刻意**在取 s.mu 之前**调用：避免 s.mu → p2p.Node.mu 的锁序嵌套。
+func (s *nodeService) syncPeerSet() (set map[string]bool, ok bool) {
+	if s.net == nil {
+		return nil, false
+	}
+	addrs := s.net.PeerAddrs()
+	out := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		out[a] = true
+	}
+	return out, true
+}
+
+// backoffFor 第 attempt 次失败后的退避时长：base × 2^(attempt-1)。
+func (s *nodeService) backoffFor(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 8 {
+		shift = 8
+	}
+	return s.syncRetryBase << shift
+}
+
+// startSyncScheduler 启动在途同步调度器（幂等；生命周期内只启动一次）。
+//
+// 调度器运行在自己的 goroutine 上，与任何 peer 的读循环解耦，
+// 因此重试不可能退化为 send→fail→retry 紧循环。
+func (s *nodeService) startSyncScheduler() {
+	s.syncStartOne.Do(func() {
+		s.mu.Lock()
+		s.syncSchedStarted = true
+		interval := s.syncSweepInterval
+		s.mu.Unlock()
+		if interval <= 0 {
+			interval = defaultSyncSweepInterval
+		}
+		s.syncWG.Add(1)
+		go s.syncSchedulerLoop(interval)
+	})
+}
+
+// syncSchedulerLoop 调度器主循环：按固定周期巡检，直到 stopSyncScheduler。
+func (s *nodeService) syncSchedulerLoop(interval time.Duration) {
+	defer s.syncWG.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.syncStopCh:
+			return
+		case <-ticker.C:
+			s.runSyncSweep(time.Now())
+		}
+	}
+}
+
+// stopSyncScheduler 停止调度器（幂等）。
+//
+// 只关闭通道、不等待 goroutine 退出：避免在 SendTo 被慢对端卡住时拖长关停路径
+// （goroutine 最多再活一个巡检周期即自行退出）。
+func (s *nodeService) stopSyncScheduler() {
+	s.syncStopOnce.Do(func() {
+		s.mu.Lock()
+		s.syncSchedStarted = false
+		s.mu.Unlock()
+		close(s.syncStopCh)
+	})
+}
+
+// syncInflightSnapshot 测试与诊断用的在途快照（不参与任何业务分支）。
+func (s *nodeService) syncInflightSnapshot() map[int]syncRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int]syncRequest, len(s.syncInflight))
+	for k, r := range s.syncInflight {
+		out[k] = *r
+	}
+	return out
 }
 
 // relayBlock 把区块继续中继给除来源之外的对等节点。

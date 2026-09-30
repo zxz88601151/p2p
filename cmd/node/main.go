@@ -203,6 +203,12 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 		store: store, chain: chain, pool: pool, svc: svc, p2p: p2pNode, ctl: ctl,
 		seeds: cfg.Seeds, stopPeer: make(chan struct{}), lock: lock,
 	}
+	// PHASE P2P-SYNC-LIVENESS-MINIMUM-SAFE-FIX-1：启动批量同步在途调度器。
+	//
+	// 调度器负责「TTL 到期 / 对端断开 / 发送失败」后的**有界重试与 peer failover**，
+	// 它运行在独立 goroutine 上，与任何 peer 的读循环解耦。
+	// 未启动时的行为与修复前完全一致（失败即释放，把机会交回下一次握手）。
+	svc.startSyncScheduler()
 	rt.connectSeeds() // 首次连接
 	rt.watchSeeds()   // 断线后自动重连
 	initDone = true   // 初始化完成：上面的 defer 释放兜底不再触发
@@ -259,6 +265,10 @@ func (rt *nodeRuntime) Close() {
 	rt.closeOnce.Do(func() {
 		if rt.stopPeer != nil {
 			close(rt.stopPeer)
+		}
+		if rt.svc != nil {
+			// 先停同步调度器，再停 P2P：避免关停路径上还在发起新的同步请求。
+			rt.svc.stopSyncScheduler()
 		}
 		if rt.ctl != nil {
 			_ = rt.ctl.Stop()
