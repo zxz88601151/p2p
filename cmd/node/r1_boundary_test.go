@@ -194,10 +194,18 @@ func TestR1F4PreParkRejectionReasons(t *testing.T) {
 	}
 	oversize := mineOn(t, svc, p, 2)
 	oversize.Transactions[0].Outputs = append(oversize.Transactions[0].Outputs, transaction.TxOutput{Value: 1})
+	// 性能约束（R1-F4 修复）：Block.Size() = len(Block.Encode())，而 Encode() 每次都会
+	// 重新分配并序列化**整块**，代价 O(块字节数)。原实现在内层循环里逐次调用 Size()，
+	// 但内层期间 oversize.Transactions[0].Outputs 尚未回写（回写在循环之后），
+	// 因此内层条件恒取同一个陈旧值 ⇒ 内层实际退化为「固定做 appendN 次全块序列化」，
+	// 总代价 O(N²)（1 MiB 块 ≈ 数十 GB 序列化 + GC 抖动），使该用例挂死数分钟，
+	// 并连带拖死整个 `go test ./...`。
+	// 现改为：内层只做追加（摊还 O(1)），每轮外层仅做一次 Size() 检查；
+	// 输出数几何倍增，快速越过阈值，总代价 O(N)。最终块与修复前逐字节一致。
 	for oversize.Size() <= blockchain.MaxBlockSize {
 		outs := oversize.Transactions[0].Outputs
-		appendN := len(outs) // 每轮翻倍，快速越过 1 MiB 阈值
-		for i := 0; i < appendN && oversize.Size() <= blockchain.MaxBlockSize; i++ {
+		// 每轮翻倍，快速越过 1 MiB 阈值（n 在进入内层时一次性求值）。
+		for i, n := 0, len(outs); i < n; i++ {
 			outs = append(outs, transaction.TxOutput{Value: 1})
 		}
 		oversize.Transactions[0].Outputs = outs

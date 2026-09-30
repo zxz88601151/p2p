@@ -349,21 +349,26 @@ func TestPathBoundaryRawTCP(t *testing.T) {
 		spaOK     bool   // 允许 SPA 回落 200
 	}{
 		{"尾斜杠不匹配精确路由", "/api/status/", "404", 0, "", false},
-		{"重复斜杠被清洗", "/api//status", "301", 0, "/api/status", false},
-		{"点段被清洗", "/api/./status", "301", 0, "/api/status", false},
-		{"穿越被清洗出 /api 前缀", "/api/../status", "301", 0, "/status", false},
+		// 实测固化（Go 1.22+）：ServeMux 对「需要路径规范化」的请求使用
+		// StatusTemporaryRedirect = **307**（见 net/http/server.go 中
+		// matchOrRedirect / RedirectHandler(u, StatusTemporaryRedirect)），
+		// 而非旧版 stdlib 的 301。状态码是 stdlib 实现细节；本用例锁定的
+		// 安全不变量是「重定向到清洗后的路径 + 上游 0 次命中」，二者不变。
+		{"重复斜杠被清洗", "/api//status", "307", 0, "/api/status", false},
+		{"点段被清洗", "/api/./status", "307", 0, "/api/status", false},
+		{"穿越被清洗出 /api 前缀", "/api/../status", "307", 0, "/status", false},
 		// 实测固化：path.Clean("/api/../api/status") = "/api/status"（.. 先在段间消解），
-		// ServeMux 301 重定向到清洗后的 /api/status，原始请求本身【不】产生上游命中。
+		// ServeMux 307 重定向到清洗后的 /api/status，原始请求本身【不】产生上游命中。
 		// 若客户端跟随重定向再 GET，则属第二次请求，按白名单正常放行（hits=1）。
-		{"穿越回 /api 先被 301 清洗", "/api/../api/status", "301", 0, "/api/status", false},
+		{"穿越回 /api 先被 307 清洗", "/api/../api/status", "307", 0, "/api/status", false},
 		// 实测固化（比设计假设更严格）：Go 1.22 ServeMux 按编码路径的【段】匹配，
 		// %2f 不折叠为 / ⇒ "/api%2fstatus" 是单一未知段，不命中白名单，
 		// 落入静态 handler → SPA 回落 200 index.html，上游 0 次命中。
 		{"编码分隔符不折叠为段分隔", "/api%2fstatus", "200", 0, "", true},
 		{"大小写敏感", "/api/STATUS", "404", 0, "", false},
-		{"子树根重定向补斜杠", "/api", "301", 0, "/api/", false},
+		{"子树根重定向补斜杠", "/api", "307", 0, "/api/", false},
 		{"非 /api 前缀不误剥", "/apix/status", "200", 0, "", true},
-		{"双前导斜杠被清洗", "//api/status", "301", 0, "/api/status", false},
+		{"双前导斜杠被清洗", "//api/status", "307", 0, "/api/status", false},
 		{"NUL 不构成绕过", "/api/status%00", "404", 0, "", false},
 	}
 	for _, c := range cases {

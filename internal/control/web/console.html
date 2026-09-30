@@ -559,7 +559,7 @@ function renderStatus(st){
     : '<span class="state"><span class="dot"></span>Mining inactive</span>';
   $("hOnDemand").innerHTML = mining
     ? '<span class="state warn"><span class="dot"></span>不可用：持续挖矿期间按需出块被拒绝（409）</span>'
-    : '<span class="state ok"><span class="dot"></span>可用：POST /mine count=1</span>';
+    : '<span class="state ok"><span class="dot"></span>可用：POST /console/mine count=1（同源）</span>';
   unavail($("hHash"),   "全仓无算力统计实现（无 Hashes/sec 采集）");
   unavail($("hDevice"), "无 GPU/设备枚举能力");
   unavail($("hTemp"),   "无温度传感器采集");
@@ -663,7 +663,11 @@ $("mineBtn").addEventListener("click", async function(){
   setText($("mineBtnText"), "出块中…");
   $("mineErr").textContent = "";
   try {
-    var r = await fetch(API + "/mine", {
+    /* PHASE CONSOLE-MINE-AUTH-FIX-1：控制台页面不持有任何凭据（浏览器零凭据红线），
+       而 /mine 受 mutation Bearer Token 保护（恒 401）。故改走控制台专用同源端点
+       /console/mine —— 由服务端按「同源」判定放行（Sec-Fetch-Site / Origin），
+       token 依旧绝不下发到浏览器。注意：仍不得携带读取超时（出块耗时不确定）。 */
+    var r = await fetch(API + "/console/mine", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ count: 1 })

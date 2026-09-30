@@ -24,3 +24,16 @@ coverage.out
 *.dat
 *.lock
 wallet.json
+
+# Bearer tokens (CONTROL-AUTH-1 / GOV-1b)：明文 mutation 凭据，必须永不进入 Git
+control-token
+token
+token.local
+
+# Governance blocked paths (D-WT 裁决 / WORKTREE-COMMIT-BOUNDARY-1)：AI 会话状态、
+# 外部辅助工具、本地运行时数据目录，全部 MUST NOT TRACK，永不进入 Git
+/.workbuddy/
+/gui/
+/audit-run/
+/f5-verify/
+/gui-test/

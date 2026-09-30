@@ -500,8 +500,11 @@ func TestConsoleReadRequestsHaveTimeout(t *testing.T) {
 			t.Fatalf("jget 缺少读取超时防护（接口挂起会让单飞轮询永久停摆）: %q", need)
 		}
 	}
-	if regexp.MustCompile(`fetch\(API \+ "/mine"[\s\S]{0,400}?signal`).MatchString(body) {
-		t.Fatal("/mine 不应携带读取超时信号：出块耗时不确定，短超时会把正常出块误判为失败")
+	// PHASE CONSOLE-MINE-AUTH-FIX-1：控制台出块改走同源端点 /console/mine
+	//（/mine 受 Bearer Token 保护，页面无凭据恒 401）。断言路径随之更新——
+	// 若仍写死 "/mine"，正则会静默失配，令本用例退化为空断言。
+	if regexp.MustCompile(`fetch\(API \+ "/console/mine"[\s\S]{0,600}?signal`).MatchString(body) {
+		t.Fatal("/console/mine 不应携带读取超时信号：出块耗时不确定，短超时会把正常出块误判为失败")
 	}
 }
 

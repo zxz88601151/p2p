@@ -328,6 +328,11 @@ func (s *Server) Handler() http.Handler {
 	// 绝不触碰节点停机路径（/stop 语义保持不变）。
 	mux.HandleFunc("/mine/start", s.requireAuth(s.handleMineStart))
 	mux.HandleFunc("/mine/stop", s.requireAuth(s.handleMineStop))
+	// PHASE CONSOLE-MINE-AUTH-FIX-1：Developer Console 页面专用出块端点。
+	// 控制台页面不持有任何凭据（浏览器零凭据是既有设计红线），因此不能走
+	// requireAuth；改用「同源闸门」恢复其「立即出块」按钮（见 consoleOriginGate）。
+	// 与 /mine 并存：CLI / 第三方脚本继续用 /mine + Bearer Token，语义不变。
+	mux.HandleFunc("/console/mine", s.consoleOriginGate(s.handleMine))
 	mux.HandleFunc("/block", s.handleBlock)
 	mux.HandleFunc("/blocks", s.handleBlocks)
 	mux.HandleFunc("/logs", s.handleLogs)
@@ -709,6 +714,60 @@ func bearerToken(r *http.Request) string {
 		return ""
 	}
 	return h[len(prefix):]
+}
+
+// consoleOriginGate 包装「Developer Console 页面专用」的 mutation 端点。
+//
+// 背景（CONTROL-AUTH-1 回归，PHASE CONSOLE-MINE-AUTH-FIX-1）：
+// 控制台页面于 2026-09-12 冻结时控制接口尚无鉴权，页面直接 POST /mine。
+// 2026-09-17 引入 mutation Bearer Token 后 /mine 被 requireAuth 保护，
+// 而控制台页面**按设计不持有任何凭据**（浏览器零凭据红线），于是「立即出块」
+// 按钮自那时起恒返回 401；页面却仍渲染「可用：POST /mine count=1」，
+// 构成**虚假可用性声明**（实测：无 token POST /mine → 401，带 token → 200）。
+//
+// 本闸门以「同源」判定恢复该按钮，且**不引入任何浏览器可见凭据**
+// （无 token、无 cookie、无 URL 参数、不注入 HTML），因此不触碰
+// CONTROL-AUTH-1 冻结的凭据边界——mutation Bearer Token 依旧绝不出现在浏览器侧。
+//
+// 判定（fail-closed）：
+//   - Sec-Fetch-Site 存在 → 必须等于 "same-origin"（该头由浏览器自动附加，属
+//     forbidden header name，页面 JS 既不能设置也不能删除，无法伪造）；
+//   - Sec-Fetch-Site 缺失 → Origin 必须严格等于 http(s)://<r.Host>（旧浏览器兜底）；
+//   - 两者皆不满足 → 403。
+//
+// 威胁模型：跨站页面（CSRF）与 DNS rebinding 的 Sec-Fetch-Site / Origin 均非本
+// 服务源 ⇒ 被拒；非浏览器本地进程无法伪造 Sec-Fetch-Site，应改用 /mine + Bearer
+// Token（该路径不受本闸门影响）。
+func (s *Server) consoleOriginGate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 方法契约优先：非 POST 交给既有方法守卫，保持 405 + Allow 语义不变。
+		if r.Method != http.MethodPost {
+			next(w, r)
+			return
+		}
+		if !isSameOriginRequest(r) {
+			writeJSON(w, http.StatusForbidden, errorResponse{Error: "forbidden"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// isSameOriginRequest 判定请求是否来自本服务自身的浏览器同源上下文。
+// 无同源证据一律返回 false（fail-closed）。
+func isSameOriginRequest(r *http.Request) bool {
+	// Sec-Fetch-Site 一旦出现即以其为准：浏览器必然填写，且属 forbidden header，
+	// 页面 JS 无法伪造或删除；不允许它在「非 same-origin」时回落到 Origin 分支，
+	// 否则等于给了伪造者可乘之隙。
+	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" {
+		return sfs == "same-origin"
+	}
+	// 兜底：严格比对 Origin（同源 POST 恒带 Origin；缺失即无证据）。
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	return origin == "http://"+r.Host || origin == "https://"+r.Host
 }
 
 // LoadTokenFile 从 path 读取 Bearer Token 并做归一化。
