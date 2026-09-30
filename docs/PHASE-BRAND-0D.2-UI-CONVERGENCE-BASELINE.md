@@ -18,6 +18,57 @@
 
 ---
 
+# §0 — 阶段对齐（2026-09-30 追加）
+
+> **文件性质**：本文件是 **实现前** 的时点审计记录，内容冻结于其产生时刻。后续阶段产生的新事实以本节 **追加** 记录，**不回改原文**——回改会湮灭「当时为何 BLOCKED」的证据价值。
+> 当前阶段权威现态见 `docs/PHASE-BRAND-0D.2-UI-CONVERGENCE-IMPLEMENTATION.md` §13。
+
+## 0.1 已被取代 / 已解除的结论
+
+| 原文位置 | 原文结论 | 2026-09-30 实测现态 | 关系 |
+|---|---|---|---|
+| §1.1 | 路径 `C:\Users\Administrator\Desktop\挖矿\p2pchain`；Go `go1.22.12` | 当前工作副本 = `E:/wakuang/p2pchain`；Go `go1.27.0 windows/amd64` | 环境迁移（非代码结论变化） |
+| §1.2 | HEAD `6c0ced873b11…` | HEAD `154de22b661f98f6f09e96e4b5dcaa2d26f3b683`（71 commits，分支 `main`） | 历史提交点 |
+| §1.4 | **当前 UI 入口点 = NONE** | 已存在两个内嵌 UI 面：Developer Console 与 Explorer V1 | **已被取代**（§0.2） |
+| §1.4 | 控制 API「**零鉴权**」6 个端点 | mutation 端点 Bearer Token 鉴权 + 浏览器侧同源闸门；路由增至 13 条 | **已被取代**（§0.3） |
+| §4 | difficulty/bits「需最小后端补充」 | D-3 已落实：`/status` 返回 `bits`/`difficulty`，新增 `GET /logs` | 已解除 |
+| §8 | `IMPLEMENTATION = BLOCKED`（D-1/D-2/D-3/S-1） | D-1/D-2/D-3 已裁决并落实；**S-1（规格 §25 起截断）仍未补发** | 部分解除 |
+
+## 0.2 现有 UI 面（实测）
+
+| UI 面 | 启动方式 | 载体 | 字节数 | 数据来源 |
+|---|---|---|---|---|
+| **Developer Console** | `node ui -mine -datadir <目录>`（亦可直接访问节点控制接口根路径） | `internal/control/web/console.html`（`go:embed`，路由 `GET /`） | 35,351 B（本阶段记录时为 25,194 B，后续迭代增长） | 同源 `/status` `/logs` `/console/mine` |
+| **Explorer V1** | 独立二进制 `explorer`（`-listen` 默认 `127.0.0.1:9091`，`-rpc` 默认 `http://127.0.0.1:17881`） | `internal/explorer/ui/`（`index.html` 1,045 B + `app.js` 21,784 B + `style.css` 6,734 B，共 29,563 B） | 同上 | 经白名单反向代理上游 control |
+
+两个 UI 面均为 **vanilla HTML/CSS/JS、`go:embed` 内嵌、零第三方依赖、零外部资源**（`https://` / `cdn` / `unpkg` / `jsdelivr` 全仓 grep **0 命中**）——与 §3.1「无前端运行时」的差异在于：前端**资产**已存在，但依旧**没有 Node/Electron/Tauri/WebView 外壳**，D-2 选项 A（零依赖 + 系统浏览器）路线未变。
+
+## 0.3 控制面与鉴权现态（`internal/control/server.go`）
+
+```text
+/status  /balance  /utxos  /block  /blocks  /logs            ← 读端点（无鉴权）
+/send  /mine  /mine/start  /mine/stop  /stop                 ← mutation：requireAuth（Bearer Token）
+/console/mine                                                 ← consoleOriginGate（浏览器同源闸门）
+/                                                             ← Developer Console 页面
+```
+
+- **Bearer Token**：`Authorization: Bearer <token>`，`crypto/subtle.ConstantTimeCompare` 常量时间比较；未配置 token 时 mutation 端点 **fail-closed（一律 401）**；token 只经 `LoadTokenFile` 从文件读取，不经命令行参数/环境变量。
+- **同源闸门** `consoleOriginGate`：`Sec-Fetch-Site` 存在时必须等于 `same-origin`；缺失时 `Origin` 必须严格等于 `http(s)://<Host>`。浏览器零凭据红线保持——§11.5 的「控制台不引入新暴露面」结论依旧成立，但「零鉴权」这一前提已不成立。
+- **Explorer 侧**：只读白名单 `readOnlyRoutes` 3 条（`/api/status` `/api/blocks` `/api/block`），mutation 白名单 `mutationRoutes` 2 条（`/api/mine/start` `/api/mine/stop`）；token 由 `-token-file` 读入并在**服务端**注入 `Authorization`，浏览器零接触；白名单外 `/api/*` 本地 404、**上游零接触**。
+
+## 0.4 仍然有效的判定（不因阶段推进而改变）
+
+1. **无数据源的指标仍只能 `Unavailable`**：Hashrate / Sync% / Inbound-Outbound / Latency / Temperature / Power / Fan / Device / Network 名 / Protocol 版本 —— 页面仍走 `unavail()` 空态渲染（19 处调用点），**未有一处填 0 或占位数字**。§4 的覆盖度判定依旧有效。
+2. **F-1（难度调整实际不生效，`bits` 恒为 16）** 仍未立项处置，属「共识/难度机制」而非显示问题，越界未改。
+3. **规格 §25 起缺失**未补发 ⇒ 验收标准不完整 ⇒ **阶段不宣称 DONE**。
+4. **文档命名错位**（0D / 0D.1 / 0D.2 / 0D.3 文件名与内容错位一格）仍未裁决。
+
+## 0.5 本节的证据边界
+
+本节所有现态值均来自 2026-09-30 对当前工作副本的**实测**（`git ls-files` / `git cat-file -e HEAD:...` / 源码 grep / `go build ./...` exit 0），不引用任何历史报告的转述。原文各节仍按其产生时点生效。
+
+---
+
 # §1 — HARD BASELINE
 
 ## 1.1 环境
@@ -96,11 +147,13 @@ node.exe -listen 127.0.0.1:16690 -rpc 127.0.0.1:16691 -seed 127.0.0.1:6688 -data
 
 > 注意：这是**进程启动脚本**，不是 UI 启动器。
 
-**当前 UI 入口点：**
+**当前 UI 入口点（历史基线值）：**
 
 ```text
 NONE
 ```
+
+> ⚠️ **2026-09-30 注**：该值已被取代——现有 Developer Console（`GET /`，`node ui`）与 Explorer V1（`explorer` 独立进程，默认 `127.0.0.1:9091`）两个内嵌 UI 面，详见 §0.2。
 
 **后端入口点（真实存在，共两套）：**
 
@@ -108,6 +161,8 @@ NONE
    节点选项：`-listen -rpc -seed -datadir -mine -maxblocks -miners`
 2. **HTTP 控制 API**（`internal/control`，JSON over HTTP，默认 `127.0.0.1:6689`，**零鉴权**）：
    `GET /status` · `GET /balance` · `GET /utxos` · `POST /send` · `POST /mine` · `GET /block`
+
+> ⚠️ **2026-09-30 注**：「零鉴权」与「6 个端点」均已被取代——mutation 端点现由 Bearer Token 保护，浏览器侧另有同源闸门，路由增至 13 条，详见 §0.3。
 
 ## 1.5 基线判定
 
@@ -355,6 +410,7 @@ BLOCKED BY:
 ```
 
 **未写任何生产代码，未做任何 Git 操作。**
+> **2026-09-30 阶段对齐**：D-1 / D-2 / D-3 已裁决并落实（见 IMPLEMENTATION 报告）；S-1（规格 §25 起补发）**仍未完成**，故「不宣称 DONE」的结论在现阶段依旧成立。现态清单见本文 **§0**。
 
 ---
 

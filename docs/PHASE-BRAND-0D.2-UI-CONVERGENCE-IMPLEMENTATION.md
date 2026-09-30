@@ -12,6 +12,7 @@
 | 真实 E2E | PASS=28 / FAIL=0（真实进程 · 真实 PoW · 真实日志） |
 | 视觉 QA | 5 个断点 + 离线态 + file:// 回退，无布局破裂 |
 | Git 操作 | 0 次 |
+| 阶段对齐（2026-09-30） | 见 **§13**——本文件为时点实现记录，原文不回改；现态以追加节记录 |
 | 状态 | 实现完成；**§25 起规格缺失，验收标准不完整，故不宣称阶段 DONE** |
 
 ---
@@ -298,3 +299,60 @@ STOP                       = YES
 ```
 
 **下一步待用户裁决**：① 补发规格 §25 起的验收标准；② F-1 难度调整是否单独立项；③ 文档命名错位是否授权修正。
+
+---
+
+# §13 — 阶段对齐（2026-09-30 追加）
+
+> **文件性质**：本文件是 BRAND-0D.2 实现阶段的**时点记录**（含「GIT OPERATIONS = 0」等当时事实）。后续阶段产生的新事实以本节 **追加**，**不回改原文**。
+
+## 13.1 本阶段交付物现态核验（实测）
+
+| 交付物 | 是否在 HEAD `154de22…` 中 | 证据 |
+|---|---|---|
+| `internal/control/console.go` | ✅ | `git cat-file -e HEAD:…` 通过 |
+| `internal/control/web/console.html` | ✅（35,351 B；本阶段记录 25,194 B，后续迭代增长） | 同上 |
+| `internal/control/logs.go` | ✅ | `git ls-files` |
+| `cmd/node/logring.go` / `logring_test.go` | ✅ | `git ls-files` |
+| `cmd/node/openurl.go` | ✅ | `git ls-files` |
+| `cmd/node/cli.go` 的 `ui` 子命令 | ✅ | `cli.go:136` `if cmd == "ui"` |
+
+**构建核验**：`go build ./...` → exit 0（Go `go1.27.0 windows/amd64`，当前工作副本 `E:/wakuang/p2pchain`）。
+
+## 13.2 本阶段之后的界面演进（不属于本阶段产出，但同属「界面说明」范围）
+
+1. **控制面扩容**：路由由本阶段的 8 条增至 **13 条**（新增 `/blocks`、`/mine/start`、`/mine/stop`、`/console/mine`，根路径 `/` 提供 Console 页面）。
+2. **鉴权落地**（PHASE CONTROL-AUTH-1）：mutation 端点改由 `requireAuth` 保护，Bearer Token + `crypto/subtle` 常量时间比较，未配置时 fail-closed。
+3. **控制台出块通道**（PHASE CONSOLE-MINE-AUTH-FIX-1）：新增 `/console/mine`，用 `consoleOriginGate`（`Sec-Fetch-Site` / `Origin` 同源判定）替代凭据——浏览器零凭据红线保持，CLI 侧 `/mine` + Bearer 语义不变。
+4. **第二个 UI 面：Explorer V1**（独立阶段产出）：`internal/explorer/ui/`（29,563 B，`go:embed`）+ `cmd/explorer` 独立二进制，默认 `127.0.0.1:9091` → 上游 control `http://127.0.0.1:17881`；只读白名单 3 条 + mutation 白名单 2 条，token 服务端注入，白名单外 `/api/*` 本地 404、**上游零接触**；零外部资源。
+5. **页面迭代**：`console.html` 由 25,194 B 增至 35,351 B；`unavail()` 空态渲染路径保留（19 处调用点），10 项无源指标仍为 `Unavailable`。
+
+## 13.3 仓库与治理现态（影响「文档如何被保存/传播」）
+
+```text
+HEAD        = 154de22b661f98f6f09e96e4b5dcaa2d26f3b683   （main，71 commits）
+gitea       = ssh://git@192.168.3.123:22/zxzjxx/wakuang.git        ← 154de22…
+.200 镜像    = http://192.168.3.200:3000/zxzjxx/wakungzuixin.git    ← 154de22…（ls-remote 实测）
+origin      = https://github.com/zxz88601151/p2p                    ← 可达但 PUBLIC 且空仓
+```
+
+- **显式路径提交策略（MF-2）**：永久禁用 `git add .` / `-A` / `--all`；由 `scripts/git-guard.sh`（151 行，纯 staged-list 断言）+ `scripts/git-guard-test.sh`（36/36 PASS，纯函数、零 Git 写入）机器强制。
+- **`.gitignore`**（39 行 / 679 B）：已追加治理阻断路径 `/.workbuddy/` `/gui/` `/audit-run/` `/f5-verify/` `/gui-test/` 与凭据文件名（`control-token` / `token` / `token.local`）。
+- 本文件的「GIT OPERATIONS = 0」是**本阶段时点事实**；后续把包括本文件在内的 19 条路径纳入版本库的提交（`154de22…`）由**独立授权阶段**完成，不是本阶段产出。
+
+## 13.4 仍未闭合项（承接 §11 / §12）
+
+| 项 | 状态 | 备注 |
+|---|---|---|
+| 规格 §25 起补发 | **未闭合** | ⇒ `ACCEPTANCE = INCOMPLETE`，阶段**不宣称 DONE** |
+| F-1 难度调整未生效（`bits` 恒 16） | **未闭合** | 需单独立项裁决，属共识域 |
+| 文档命名错位（0D / 0D.1 / 0D.2 / 0D.3） | **未闭合** | 需授权后统一整理 |
+| 控制面 LAN/公网暴露（TLS + 认证） | **未闭合** | 本机回环绑定前提下的独立项 |
+| `internal/blockchain/query.go` stat 异常 | **保持原样，禁止触碰** | `git status` 显示 ` M` 但 `git diff` 为 0 行（`i/lf w/lf` 全等），属 stat 缓存假象；`checkout`/`add` 会“修好”它从而湮灭证据 |
+| `docs/DETERMINISTIC-SERIALIZATION-SPEC.md`（A4） | **BLOCKED，未暂存/未提交** | 待 D-DOC 文档权威裁决后处置 |
+
+## 13.5 阅读指引
+
+- 想看**当时为什么 BLOCKED** → 读 `PHASE-BRAND-0D.2-UI-CONVERGENCE-BASELINE.md` 原文 §1–§8。
+- 想看**本阶段实现了什么** → 读本文件 §1–§12。
+- 想看**当前阶段的实际现态** → 读本文件 §13 与 BASELINE 的 §0。
