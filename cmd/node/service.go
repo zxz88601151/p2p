@@ -1113,12 +1113,16 @@ func (s *nodeService) requestSync(peerAddr string, from int) {
 	s.sweepSyncLocked(now, peers, checkPeers)
 
 	if r, ok := s.syncInflight[from]; ok {
+		// RACE-REMEDIATION：在持有 s.mu 时先把归属/尝试/失败标志拷贝为不可变快照，
+		// 解锁后再用于 obs.Emit —— 解锁后不得再读取该在途记录的任何并发可变字段
+		//（调度器 goroutine 会在锁内并发写 r.peer/r.attempt/r.failed）。
+		owner, attempt, failed := r.peer, r.attempt, r.failed
 		s.mu.Unlock()
 		// I0/§6：请求被在途批抑制（抑制也是 SYNC 生命周期的合法状态）。
 		// MSF：事件名与 reason 逐字保持不变（观测兼容），仅补充归属与尝试信息。
 		obs.Emit("SYNC_REQUEST", "peer", peerAddr, "from_height", from,
 			"suppressed", true, "reason", "pending_in_flight",
-			"owner", r.peer, "attempt", r.attempt, "failed", r.failed)
+			"owner", owner, "attempt", attempt, "failed", failed)
 		return // 同一区间已在途（无论归属哪个 peer）：等响应，或等调度器重投
 	}
 	if len(s.syncInflight) >= maxInflightSync {
