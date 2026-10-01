@@ -6,7 +6,7 @@
 // 线程模型：全链操作受 mu 保护；UTXO 集合自身亦有内部锁，
 // 对外暴露的 UTXOSnapshot() 返回克隆快照，避免调用方直接持有可变状态。
 //
-// 分叉处理（reorg）仍为单链追加实现，设计要点见文末 TODO 注释。
+// 分叉处理（reorg）已实现：基于 internal/blocktree 的区块树与 ShouldReorg（累积工作量比较），由 Blockchain.executeReorg 执行 disconnect→apply→persist 的整链替换（详见 executeReorg / AddBlock）。
 package blockchain
 
 import (
