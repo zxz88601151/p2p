@@ -559,7 +559,7 @@ function renderStatus(st){
     : '<span class="state"><span class="dot"></span>Mining inactive</span>';
   $("hOnDemand").innerHTML = mining
     ? '<span class="state warn"><span class="dot"></span>不可用：持续挖矿期间按需出块被拒绝（409）</span>'
-    : '<span class="state ok"><span class="dot"></span>可用：POST /console/mine count=1（同源）</span>';
+    : '<span class="state warn"><span class="dot"></span>不可用：出块端点受 Bearer Token 保护（控制台页面零凭据）</span>';
   unavail($("hHash"),   "全仓无算力统计实现（无 Hashes/sec 采集）");
   unavail($("hDevice"), "无 GPU/设备枚举能力");
   unavail($("hTemp"),   "无温度传感器采集");
@@ -580,9 +580,12 @@ function renderStatus(st){
   if (mining){
     setText($("mineHint"), "节点以 -mine 持续挖矿；当前无「停止挖矿」接口，需重启节点方可停止。");
   } else {
-    setText($("mineHint"), "按需出块（对标 generatetoaddress），仅影响本机链高。");
+    setText($("mineHint"), "按需出块受 Bearer Token 保护；控制台页面零凭据，出块按钮恒禁用。");
   }
-  $("mineBtn").disabled = mining || busy || !online;
+  // PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1：/console/mine 与 /mine 一致强制
+  // Bearer Token（原可伪造的同源闸门已退役），而本页面按设计零凭据 ⇒ 出块按钮
+  // 恒禁用，杜绝「虚假可用性」声明。
+  $("mineBtn").disabled = true;
 }
 
 /* ---------------- 日志 ---------------- */
@@ -663,10 +666,11 @@ $("mineBtn").addEventListener("click", async function(){
   setText($("mineBtnText"), "出块中…");
   $("mineErr").textContent = "";
   try {
-    /* PHASE CONSOLE-MINE-AUTH-FIX-1：控制台页面不持有任何凭据（浏览器零凭据红线），
-       而 /mine 受 mutation Bearer Token 保护（恒 401）。故改走控制台专用同源端点
-       /console/mine —— 由服务端按「同源」判定放行（Sec-Fetch-Site / Origin），
-       token 依旧绝不下发到浏览器。注意：仍不得携带读取超时（出块耗时不确定）。 */
+    /* PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1：原「同源闸门」经 E6-C-1 审计
+       可被非浏览器客户端伪造绕过、已退役；/console/mine 现与 /mine 一致强制
+       Bearer Token。控制台页面零凭据 ⇒ 本按钮在 renderStatus 中恒禁用（杜绝
+       虚假可用性），此分支仅在带凭据的变体接管时才有意义；token 依旧绝不下发
+       到浏览器。注意：仍不得携带读取超时（出块耗时不确定）。 */
     var r = await fetch(API + "/console/mine", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
