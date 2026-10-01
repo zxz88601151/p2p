@@ -556,6 +556,17 @@ func (n *Node) dropPeer(p *Peer, reason string) {
 	log.Printf("[p2p] 断开对等节点 %s（%s）", p.Addr, reason)
 }
 
+// dropPeerByAddr 按远端地址查找并关闭对应连接（O1 GENESIS IDENTITY GUARD 握手拒绝用）。
+// 未找到（连接已消失）时静默返回；在 dropPeer 之前释放读锁，避免嵌套加锁。
+func (n *Node) dropPeerByAddr(addr, reason string) {
+	n.mu.RLock()
+	p := n.peers[addr]
+	n.mu.RUnlock()
+	if p != nil {
+		n.dropPeer(p, reason)
+	}
+}
+
 // peerLimitRejectionLocked 在持有 n.mu 时判断是否应拒绝该连接，返回拒绝原因
 // （空串 = 放行）。统计口径：maxPeers=全部已注册对端；maxInbound=其中入站者；
 // handshakeQuota=已注册但尚未完成握手者（含入站与外拨）。
@@ -780,6 +791,17 @@ func (n *Node) dispatchInner(peerAddr string, msg Message) {
 		var payload HandshakePayload
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			log.Printf("[p2p] 解析握手失败: %v", err)
+			return
+		}
+		// O1 GENESIS IDENTITY GUARD：创世块一致性校验（握手接受路径）。
+		// 双方都声明 genesis 且不一致 ⇒ 判为异网对端：拒绝握手并关闭连接，
+		// 且**不**记录邻居、**不**进入业务层（跳过 OnHandshake）——因此绝不触发
+		// 同步(get_blocks) / 按哈希分支拉取(get_block_by_hash) / 中继。
+		// 任一方未声明（空）时保持向后兼容（旧节点不填该字段），不据此拒绝。
+		if n.genesisHash != "" && payload.GenesisHash != "" && payload.GenesisHash != n.genesisHash {
+			log.Printf("[p2p] 拒绝握手 %s：创世块不一致（对端=%s 本地=%s）",
+				peerAddr, payload.GenesisHash, n.genesisHash)
+			n.dropPeerByAddr(peerAddr, "创世块不一致")
 			return
 		}
 		// 记录已知节点（节点发现）：既学习对端声明的可达监听地址，也吸收其转告的邻居
