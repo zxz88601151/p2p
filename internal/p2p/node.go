@@ -75,6 +75,11 @@ const (
 	// 写端被慢对端卡住时，队列填满后新广播对该对端直接丢弃（非阻塞语义），
 	// 丢帧的对端靠既有同步/孤儿恢复机制补齐。
 	outboundQueueCap = 256
+	// dispatchQueueCap P0-2：每对端分发队列容量（消息条数，有界）。
+	// 读循环只做帧解析与非阻塞入队，重业务（区块 PoW 校验、磁盘 IO）由该连接
+	// 专属的单个分发 worker 串行消费——慢业务不再卡住读循环，恶意对端也无法
+	// 用消息流水线拖住连接。队列满时丢弃并记数（观测），不阻塞读循环。
+	dispatchQueueCap = 64
 )
 
 // Message 传输信封；Payload 按 Type 解析为不同结构。
@@ -161,6 +166,12 @@ type outboundMsg struct {
 	mtype string // 观测用（WRITE_TIMEOUT / SEND_ERROR / OVERFLOW 事件载荷）
 }
 
+// dispatchJob 分发队列元素：读循环解析出的待业务处理消息。
+type dispatchJob struct {
+	peerAddr string
+	msg      Message
+}
+
 // Peer 一条已建立的连接及其状态。
 type Peer struct {
 	Addr        string
@@ -177,6 +188,10 @@ type Peer struct {
 	closed     chan struct{} // 连接终结信号（dropPeer / handleConn 清理时关闭）
 	closeOnce  sync.Once
 	queueDrops atomic.Uint64 // 队列满被丢弃的广播条数（观测用）
+	// P0-2 分发队列：读循环只做帧解析与非阻塞入队，重业务由该连接唯一的
+	// 分发 worker 串行消费（见 peerDispatchWorker）。
+	dispatchQ     chan dispatchJob
+	dispatchDrops atomic.Uint64 // 分发队列满被丢弃的消息条数（观测用）
 }
 
 // newPeer 构造 Peer 并初始化出站队列（R1-A）。
@@ -187,6 +202,7 @@ func newPeer(addr string, conn net.Conn, inbound bool) *Peer {
 		inbound:    inbound,
 		lastActive: time.Now(),
 		outQ:       make(chan outboundMsg, outboundQueueCap),
+		dispatchQ:  make(chan dispatchJob, dispatchQueueCap),
 		closed:     make(chan struct{}),
 	}
 }
@@ -476,6 +492,26 @@ func (n *Node) peerWriter(p *Peer) {
 	}
 }
 
+// peerDispatchWorker P0-2：单连接分发 worker（每连接恰一个，与 peerWriter 同时启动）。
+//
+// 读循环只做帧解析与非阻塞入队；业务 Handler（含区块 PoW 校验、磁盘 IO、
+// 上层 SendTo）在本 worker 中串行执行——慢业务不再卡住读循环，恶意对端也
+// 无法用消息流水线拖住连接。单 worker + FIFO 队列保证同连接消息处理顺序
+// 与同步分发一致。
+//
+// 终结：p.closed 关闭（连接清理 / dropPeer）即退出；残留未消费消息随连接
+// 丢弃（连接已死，重传由对端同步机制负责）。
+func (n *Node) peerDispatchWorker(p *Peer) {
+	for {
+		select {
+		case <-p.closed:
+			return
+		case job := <-p.dispatchQ:
+			n.dispatch(job.peerAddr, job.msg)
+		}
+	}
+}
+
 // emitWriteFailure 观测专用：按错误类型区分 WRITE_TIMEOUT 与 SEND_ERROR。
 // 在调用方锁外调用（本函数不获取任何业务锁）。
 func emitWriteFailure(peer, msgType string, err error) {
@@ -512,6 +548,14 @@ func errorString(err error) string {
 }
 
 // sendTo 是 SendTo 的原始实现体（I0 拆分，仅观测包装变更）。
+//
+// P0-3 修复：定向发送改走与广播同一套有界出站队列（非阻塞入队），不再持 p.mu
+// 做最长 10s 的同步写——此前 500 区块的 blocks_resp 经 service.go:494 的 SendTo
+// 会把该连接的读循环回包与 writer 串行卡住。
+//
+// 调用方语义变化：返回 nil 仅表示"已入队"（不再表示"对端已收到"）；写失败改由
+// peerWriter 按 maxSendFailures 统一处理（记数 + 阈值断开），与广播路径一致。
+// 上层 4 处 SendTo 调用方均只记日志不依赖同步送达语义（service.go:497/800/847/1268）。
 func (n *Node) sendTo(addr string, msg Message) error {
 	n.mu.RLock()
 	p, ok := n.peers[addr]
@@ -527,19 +571,22 @@ func (n *Node) sendTo(addr string, msg Message) error {
 		return fmt.Errorf("消息过大（%d 字节）", len(data))
 	}
 	data = append(data, '\n')
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_ = p.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if _, err := p.Conn.Write(data); err != nil {
-		p.sendFails++
-		if p.sendFails >= maxSendFailures {
-			go n.dropPeer(p, "连续发送失败")
-		}
-		return err
+	// P0-3：非阻塞入队（与 broadcastExcept 同语义）。队列满 = 对端消费过慢，
+	// 丢弃并返回错误（调用方按既有逻辑记日志，对端靠同步重试补齐），绝不阻塞。
+	// 注意：此处刻意不取 p.mu——peerWriter 在慢写时最长持有该锁 10s（writeTimeout），
+	// 取锁会把"非阻塞"拖回阻塞；lastActive 由 writer 在实际写出时（:489）与读循环
+	// 在收到消息时（:731）维护，语义不变。
+	select {
+	case p.outQ <- outboundMsg{data: data, mtype: string(msg.Type)}:
+		return nil
+	default:
+		p.queueDrops.Add(1)
+		obs.Emit("OUTQ_OVERFLOW", "peer", p.Addr, "msg_type", string(msg.Type),
+			"queue_cap", outboundQueueCap)
+		log.Printf("[p2p] %s 出站队列已满，定向 %s 消息被丢弃（累计丢弃 %d）",
+			p.Addr, msg.Type, p.queueDrops.Load())
+		return fmt.Errorf("对等节点 %s 出站队列已满", addr)
 	}
-	p.sendFails = 0
-	p.lastActive = time.Now()
-	return nil
 }
 
 // dropPeer 移除并关闭一条连接。
@@ -644,6 +691,10 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	// 广播调用方（含挖矿临界区）只做入队，永不被本连接的慢写阻塞。
 	go n.peerWriter(peer)
 
+	// P0-2：与 writer 同时启动分发 worker——读循环只做帧解析与入队，
+	// 业务 Handler 在 worker 中串行执行，不再阻塞读循环。
+	go n.peerDispatchWorker(peer)
+
 	// I0/§5：读循环生命周期 —— ENTER 在循环前，EXIT 由 defer 在连接关闭时补记。
 	obs.Emit("READ_LOOP_ENTER", "peer", remote, "height", n.currentHeight())
 	defer func() {
@@ -693,7 +744,21 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 		// I0/§5：READ_WAIT —— 读循环两轮处理之间的间隔（含阻塞读与 dispatch 耗时之外的空窗）。
 		obs.Emit("READ_WAIT", "peer", remote, "read_gap_us", readGap.Microseconds(),
 			"msg_type", string(msg.Type))
-		n.dispatch(remote, msg)
+		// P0-2：业务分发异步化。握手消息保持同步处理——它便宜（无 PoW/磁盘 IO），
+		// 且后继消息的门控（handshaked 检查）与创世不一致时的立即断开都依赖同步语义；
+		// 其余消息非阻塞入队，由 peerDispatchWorker 串行消费（FIFO，保序）。
+		if msg.Type == MsgHandshake {
+			n.dispatch(remote, msg)
+		} else {
+			select {
+			case peer.dispatchQ <- dispatchJob{peerAddr: remote, msg: msg}:
+			default:
+				peer.dispatchDrops.Add(1)
+				obs.Emit("DISPATCHQ_OVERFLOW", "peer", remote, "msg_type", string(msg.Type))
+				log.Printf("[p2p] %s 分发队列已满，丢弃 %s 消息（累计丢弃 %d）",
+					remote, msg.Type, peer.dispatchDrops.Load())
+			}
+		}
 		prevCycleEnd = time.Now()
 	}
 }
@@ -775,7 +840,8 @@ func (n *Node) currentStatus() (work string, tipHash string) {
 // dispatch 按消息类型分发到上层 Handler。
 //
 // I0/§5：观测包装——ENTER/EXIT + duration 在外层，原始分发体在 dispatchInner。
-// duration 是证明「reader loop 被 dispatch 阻塞」的直接证据（读循环同步调用本函数）。
+// P0-2 后：本函数运行在 peerDispatchWorker（握手消息除外，仍由读循环同步调用），
+// duration 度量的是 worker 上的 Handler 耗时——读循环不再被它阻塞。
 func (n *Node) dispatch(peerAddr string, msg Message) {
 	start := time.Now()
 	obs.Emit("DISPATCH_ENTER", "peer", peerAddr, "msg_type", string(msg.Type), "height", n.currentHeight())
