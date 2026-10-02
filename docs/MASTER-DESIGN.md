@@ -42,7 +42,8 @@
 - Coinbase 结构校验：唯一输入、空签名/空公钥、输出非空且 Value>0。
 
 ### 共识参数（新常量）
-- `Subsidy(height) = 50 >> (height/210)`（每 210 块减半，≥64 次后为 0）。
+- **奖励公式（历史设计稿，已过期）**：早期设计稿曾写 `Subsidy(height) = 50 >> (height/210)`（每 210 块减半，≥64 次后为 0）。该公式**非当前实现**，仅保留作历史参考。
+- **当前实现（权威）**：`Subsidy(height) = 5 >> (height / 5_250_000)`（每 5,250,000 块减半）；halvings ≥ 3 即归零，最后一个非零补贴高度 15,749,999，归零高度 15,750,000（见 `internal/utxo/apply.go` 与 `PROJECT-AI-CONTEXT.md` §7）。任何经济参数以源码与 CANONICAL/CONSOLIDATION 系列文档为准。
 - `CoinbaseMaturity = 10`（测试网取向；比特币为 100，注释说明）。
 - `MaxBlockSize = 1 MiB`（以 block 的 JSON 规范序列化长度计，跨节点一致）。
 
@@ -122,5 +123,5 @@
 - **边界**：未引入任何区块链以外的功能；P3.1（535edb7）已扩展 `internal/storage/datalock.go` 的 PID ownership / Release lifecycle，并新增 `cmd/node/lock_lifecycle_test.go`；`docs/RUN-AUDIT-2026-09-12.md` 亦由 P3.1 更新；`gofmt` 对 `cmd/node/main.go`、`cmd/node/lock_lifecycle_test.go` 报的 2 处差异经核实为纯对齐空白（属并行工作流，不动）。
 
 ## 明确不做（超出学习项目边界）
-- 分叉/reorg 树状链（保留 TODO 与最长链原则说明，当前单链追加）；RIPEMD160/secp256k1（stdlib 限制，注释说明升级路径）；SPV/轻节点；TLS/加密传输；代币经济。
+- 分叉/reorg 树状链：**已于 REORG-1* 阶段实现**（`internal/blocktree` 累积工作量 + `blockchain.executeReorg` 链切换 + 孤儿队列），本设计稿早期将其列入「明确不做」属**历史注记（已过期）**；RIPEMD160/secp256k1（stdlib 限制，注释说明升级路径）；SPV/轻节点；TLS/加密传输；代币经济。
 - 注：设计稿曾列入待办的「多核并行挖矿」「节点发现与断线重连」两项已于 PHASE 7 实现（见上），不在本清单内。

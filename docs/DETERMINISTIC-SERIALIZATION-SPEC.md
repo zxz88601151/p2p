@@ -22,8 +22,6 @@
 
 本文**不**规范（见 §10 已知 GAP）：
 
-- P-256 签名的字节编码与验签流程
-- 地址 Base58Check 的字母表与完整编解码
 - 交易费用策略与选币算法
 
 ---
@@ -137,7 +135,8 @@ len(Inputs) == 1
 - 输入不得重复引用同一 UTXO；`sum(inputs) >= sum(outputs)`，差额为手续费；
 - coinbase 输出需 `height - entry.Height >= 10`（成熟期）才可花费。
 
-奖励：`Subsidy(height) = 50 >> (height / 210)`。
+奖励（历史设计稿，已过期）：早期设计稿曾写 `Subsidy(height) = 50 >> (height / 210)`（每 210 块减半），**非当前实现**，仅保留作历史参考。
+当前实现（权威）：`Subsidy(height) = 5 >> (height / 5_250_000)`（每 5,250,000 块减半；halvings ≥ 3 即归零，最后一个非零补贴高度 15,749,999，归零高度 15,750,000），见 `internal/utxo/apply.go` 与 `PROJECT-AI-CONTEXT.md` §7。
 
 ---
 
@@ -201,8 +200,15 @@ target(bits) = 1 << (256 - bits)
 ```
 
 - `bits` 语义是**前导零位数**（不是比特币的浮点式 nBits 编码）。
-- 本链 `MaxTargetBits = MaxDifficultyBits = 16`，因此**链上可达难度恒为 16**
-  （有意设计：难度调整推导完整，但输出被上下两层钳制，详见 README「难度为何不浮动」）。
+- 难度**已不再是「钉死在 16」**——它按**固定激活高度**分阶段演进（权威定义见 `docs/CANONICAL-CONSENSUS-SPEC.md` §4）：
+  - `MaxTargetBits = 16`（创世难度 / v1·v2 起点 / **难度下限 floor** 三重角色）；
+  - `MaxDifficultyBits = 32`（激活后**难度浮动上限 ceiling**）；
+  - **ruleset v1（h < 2000，LEGACY）**：难度**钉死**父块 bits（= 16）；版本 `1`；
+  - **ruleset v2（2000 ≤ h < 3000）**：周期边界 `AdjustBits`（**Ceil**），钳制 `[16, 32]`；版本 `2`；时间戳启用 MTP；
+  - **ruleset v3（h ≥ 3000）**：周期边界 `AdjustBitsNearest`（**Nearest**），钳制 `[16, 32]`；`h == 3000` **一次性注入 `NewRulesetInitialBits = 27`**；版本 `3`。
+  - **为何现网仍像「难度恒为 16」**：当前生产链高度远低于 2000，仍走 v1 钉死 16 路径——这是**尚未到达激活高度**的预期行为，**不是**「设计上不可浮动」（见 CANONICAL-CONSENSUS-SPEC.md §4.1 裁定）。
+  - v2 / v3 是**结构性硬分叉**：旧节点对 v2/v3 块确定性拒绝；改动难度属真值变更，会让老节点拒绝新区块。
+- 历史注记：本规格早期版本曾写「`MaxTargetBits = MaxDifficultyBits = 16`、难度固定不浮动」，该说法已被 CANONICAL-CONSENSUS-SPEC.md §4 判为**作废**（与当前源码不符）。
 
 难度调整（供完整重放时校验 `Bits` 字段）：
 
@@ -211,9 +217,9 @@ target(bits) = 1 << (256 - bits)
 expected = 60 * 20 = 1200 秒
 actual   = clamp(tip.Timestamp - periodStart.Timestamp, expected/4, expected*4)
 newTarget = currentTarget * actual / expected
-若 newTarget > MaxTarget: return 16
+若 newTarget > MaxTarget: return 16              ; floor clamp ⇒ MaxTargetBits（难度下限）
 newBits = 257 - newTarget.BitLen()      ; 向下保守取整
-newBits = clamp(newBits, 1, 16)
+newBits = clamp(newBits, 1, MaxDifficultyBits)   ; ceiling clamp ⇒ 32（旧版误写为 16）
 ```
 
 ---
@@ -267,12 +273,98 @@ length 字节  block bytes   ; 即 §9.8 的规范编码
 
 ---
 
+## 9.11 P-256 signature encoding
+
+（PHASE V2.0 补录，原 §10 G1。全部来自当前实现事实，非未来格式。）
+
+### 9.11.1 曲线与密钥
+
+| 项 | 值 |
+|---|---|
+| 曲线 | **NIST P-256**（secp256r1 / prime256v1） |
+| 公钥编码 | **非压缩 SEC1**：`0x04 ‖ X(32B) ‖ Y(32B)`，共 **65 字节** |
+| 公钥哈希 | `SHA256(pubkey_bytes)[:20]`（**不是** 比特币的 RIPEMD160(SHA256(...))） |
+
+### 9.11.2 签名编码（规范编码 / 网络传输）
+
+```
+64 字节定长 = r ‖ s
+  r = 32 字节，大端（big-endian），左侧补零至定长
+  s = 32 字节，大端，左侧补零至定长
+```
+
+> ⚠️ **定长是共识的一部分，不是序列化偏好**。r/s 是大整数，若最高位字节为 0，
+> 变长拼接后按「从中间切分」解析会错位，约 1/128 的签名会随机验不过。
+> 因此实现**必须**按 32+32 定长切分，不得按实际字节长度推断。
+
+### 9.11.3 签名消息（sighash）
+
+```
+msgHash = TxID = SHA256(serializeForHash(tx))      ; 单 SHA-256，见 §9.4.2
+```
+
+即：签名的消息哈希**就是该交易的 TxID**。由于 `serializeForHash` 天然排除
+`Signature` 与 `PubKey`，不存在「签名依赖自身哈希」的循环。
+
+`PubKey` 不被 sighash 覆盖，但花费权由「`SHA256(PubKey)[:20] ==` 该 UTXO 锁定的
+`PubKeyHash`」另行绑定——替换公钥必然导致 PubKeyMismatch。
+
+### 9.11.4 验签流程（非 coinbase 交易逐输入执行）
+
+```
+1. 解析公钥：65 字节，首字节必须为 0x04，X/Y 必须在曲线上；否则拒绝
+2. 解析签名：长度必须 == 64；r = int(sig[:32])，s = int(sig[32:])
+3. r == 0 或 s == 0 → 拒绝
+4. ECDSA 验签：curve=P-256，hash=msgHash（TxID），(r, s)
+5. 不通过 → 拒绝该交易
+```
+
+---
+
+## 9.12 Base58Check address
+
+（PHASE V2.0 补录，原 §10 G2。全部来自当前实现事实。）
+
+### 9.12.1 字母表
+
+```
+"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+```
+
+即**比特币标准 Base58 字母表**（去除 `0 O I l`）。索引 0 = `'1'`。
+
+### 9.12.2 编码
+
+```
+payload   = PubKeyHash（20 字节，见 §9.11.1）
+checked   = version(1B) ‖ payload(20B)                  ; version = 0x35
+checksum  = SHA256(SHA256(checked))[:4]                 ; 双 SHA-256 的前 4 字节
+raw       = checked ‖ checksum                          ; 共 25 字节
+address   = Base58Encode(raw)
+```
+
+### 9.12.3 Base58 编解码规则
+
+- 整体按**大整数** base-58 处理（`raw` 以大端解释）；
+- 前导 `0x00` 字节 → 每个对应一个前导字符 `'1'`；
+- 编码结果 = 前导 `'1'`（来自前导零字节）在后、**base-58 数字部分在前**，
+  即实现上先生成数字部分（低位在前），再把前导 `'1'` 追加到末尾，**最后整体反转**；
+- 解码为逆过程：前导 `'1'` 个数 = 前导 `0x00` 个数。
+
+### 9.12.4 地址长度
+
+`0x35` 版本下 25 字节 raw 的 Base58 结果通常为 **34 字符**，例如
+`NfUsAq2HVgpJrHwTtAoJNUHznkvmpxooas`（以 `N` 开头是 `0x35` 版本字节的自然结果，
+**不是**协议要求——不要把它当作校验规则）。
+
+---
+
 ## 10. 已知 GAP（第三方仅凭本文档仍无法确定之处）
 
 | # | GAP | 影响 | 需要的补充 |
 |---|---|---|---|
-| G1 | P-256 签名的 64 字节 `r‖s` 编码与验签流程 | 无法独立验证交易签名 | 需补充签名规范章节（V2 候选） |
-| G2 | Base58 字母表与 Base58Check 完整编解码 | 无法独立生成/校验地址 | 已知：版本字节 `0x35`，校验和 = `SHA256d(version‖payload)` 前 4 字节；字母表需补 |
+| ~~G1~~ | ~~P-256 签名编码与验签流程~~ | — | **已于 PHASE V2.0 补录，见 §9.11** |
+| ~~G2~~ | ~~Base58 字母表与 Base58Check 编解码~~ | — | **已于 PHASE V2.0 补录，见 §9.12** |
 | G3 | UTXO 集合的内存表示与克隆语义 | 无法独立复现状态迁移的**中间**状态 | 只需结果一致，一般不影响验证 |
 | G4 | 选币与费率策略 | 无法独立复现节点构造的交易 | 不影响「给定区块是否合法」的判定 |
 | G5 | 难度调整的浮点/整数边界细节 | 极端参数下可能差 1 bit | 已给出公式；极端值需参照实现 |

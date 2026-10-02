@@ -52,6 +52,11 @@ Verification Runtime · Verifiable Work Runtime · Contribution Network
 - **P2P 网络**：TCP + 换行分隔 JSON；握手（交换高度与已知节点）、区块/交易真实传播与中继、追赶同步（分批拉取）、**种子节点断线自动重连**（防孤岛链）
 - **控制接口**：localhost JSON API（`/status /balance /utxos /send /mine /block`）
 - **CLI 子命令**：`ui / node / status / balance / utxos / send / mine / wallet / printchain / verify / help`
+- **分叉处理与链重组（reorg）**：`internal/blocktree` 累积工作量（`CumulativeWork = Σ 2^bits`）+ fork-choice（工作量大者胜，平局按 tip 哈希确定性 tie-break）；`blockchain.executeReorg` 实现 disconnect→apply→persist 链切换；孤儿队列（父未知时暂存、父到达即入链）
+- **孤儿块持久化与启动恢复**：`<datadir>/orphan_waiting.bin` 检查点（原子写 `temp+fsync+rename` + SHA-256 校验，fail-closed）；启动加载缺失父键集，握手后复用 by-hash 分支拉取（`requestBranch`）重连缺失分支
+- **端到端恢复校验**：`ORPHAN-DURABILITY-E2E-RECOVERY-1` 以真实网络/磁盘/进程边界验证「孤儿产生 → 检查点落盘 → 崩溃重启 → 恢复加载 → 握手消费 → 分支请求 → 父块到达 → 孤儿消解 → 链一致」全链路
+
+> ⚠️ **实现状态同步（CONSOLIDATION-2）**：reorg / 难度浮动（v2@2000、v3@3000）/ 孤儿持久化 / 启动恢复 等功能已在仓库**工作树**中实现，并经单元、集成与端到端测试验证；但截至本文档同步（HEAD = `52fb464`）**尚未提交、未部署、未做生产变更**。以 `internal/blockchain`、`internal/blocktree`、`cmd/node/orphan_checkpoint.go` 与阶段报告为准（详见 `PROJECT-AI-CONTEXT.md` §17）。
 
 ## 快速开始
 
@@ -165,28 +170,38 @@ TCP 长连接，每行一个 JSON 消息。消息类型：
 | 出块奖励 | `5 >> (height/5_250_000)` | 每 5,250,000 块减半 |
 | Coinbase 成熟期 | 10 块 | 比特币为 100，测试网取向 |
 | 区块大小上限 | 1 MiB | 规范二进制序列化长度 |
-| 初始难度 / 难度上限 | `MaxTargetBits = MaxDifficultyBits = 16` | 期望约 2^16 ≈ 6.5 万次哈希/块（CPU 毫秒级出块，测试网调优值） |
+| 初始/下限难度（`MaxTargetBits`） | `16` | 创世与 v1/v2/v3 难度下限（floor）；激活前链上可达难度恒为 16 |
+| 难度上限（`MaxDifficultyBits`） | `32` | 激活后（height ≥ 2000）难度浮动上界 |
+| 难度 v2 激活高度（`ActivationHeight`） | `2000` | 自此启用：难度浮动（Ceil）+ MTP 时间戳 + 区块版本强制 v2 |
+| 规则集 v3 激活高度（`NewRulesetActivationHeight`） | `3000` | 自此改用 Nearest 取整 + 版本强制 v3；`h==3000` 一次性注入 `NewRulesetInitialBits = 27` |
+| 区块版本三态 | `1`(<2000) / `2`([2000,3000)) / `3`(≥3000) | `VersionForHeight`；旧节点对 v2/v3 块确定性拒绝（固定高度硬分叉） |
 | 出块目标间隔 | 60 秒 | 难度调整的期望跨度基准 |
 | 难度调整周期 | 20 块 | 比特币为 2016 |
-| 难度动态范围 | **固定为 16（上限 = 下限）** | 有意设计，见下方「难度为何不浮动」 |
+| 单次难度调整幅度 | **≤ 4 倍**（夹到 [expected/4, expected×4]） | 防止难度失控；`adjustTargetCore` |
+| 难度动态范围 | 激活前固定 16；激活后在 [16, 32] 内按周期浮动 | 见下方「难度规则集与固定激活高度」 |
 | 地址版本字节 | 0x35 | 自定义网络的 Base58Check 前缀 |
 | 签名曲线 | P-256 | 标准库 `crypto/ecdsa`；比特币用 secp256k1 |
 
-### 难度为何不浮动（重要，避免误读为缺陷）
+### 难度规则集：固定激活高度的硬分叉（重要，避免误读为缺陷）
 
-本链的难度调整**推导是完整的**（`pow.AdjustBits`：实际跨度短于期望 → 更难；长于期望 → 更易，
-单次幅度限制在 4 倍内），但输出随后经过两层**有意的**钳制：
+本链的难度**已不再是「钉死在 16」**——它按**固定激活高度**分阶段演进（由 `internal/pow` 的
+`IsActivationActive` / `IsNewRulesetActive` / `VersionForHeight` / `ComputeExpectedBitsAt` 锁定，
+**完全由区块高度决定，与 canonical tip 无关**）：
 
-- **难度下限**：`target` 不得超过 `T(MaxTargetBits)`，即难度不得低于初始值；
-- **难度上限**：`bits` 不得超过 `MaxDifficultyBits`（本链 `== MaxTargetBits`）。
+- **ruleset v1（height < 2000，LEGACY）**：难度**钉死**在父块 bits（= `MaxTargetBits = 16`），区块版本必须为 `1`。
+  这是旧链「难度不浮动」语义的精确等价，存量链在激活前逐字节不变。
+- **ruleset v2（2000 ≤ height < 3000）**：难度**浮动**，采用 `AdjustBits`（**Ceil** 取整），钳制在 [`MaxTargetBits=16`, `MaxDifficultyBits=32`]；
+  区块版本强制为 `2`；时间戳启用 MTP 规则。
+- **ruleset v3（height ≥ 3000）**：改用 `AdjustBitsNearest`（**Nearest** 取整，抑制 Ceil 的系统性 +1 overshoot），
+  钳制区间同上；`height == 3000` 处**一次性注入** `NewRulesetInitialBits = 27`（把 v2 漂移校正回 Nearest 稳态）；区块版本强制为 `3`。
 
-因此在本链当前共识参数下，**链上可达难度被固定为 16，难度不会浮动**。这是**测试网调优决定，
-不是缺陷**：本链以 CPU 毫秒级出块为目标，实际出块间隔远小于 60 秒；若允许难度自由上升，
-每个调整周期会 `+2 bits`（16→18→20…），约 200 块后单块需枚举 `2^36` 次哈希，
-单块耗时从毫秒级升到小时级，学习与回归价值随之消失。
+两套取整函数共享同一 core，均经「floor clamp(`MaxTargetBits=16`) → 取整 → ceiling clamp(`MaxDifficultyBits=32`)」，
+**单次调整幅度恒 ≤ 4 倍**（实际跨度夹到 [expected/4, expected×4]）。
 
-需要难度真正浮动时，必须**重设 clamp 带宽**并把 `MaxDifficultyBits` 抬到预期上限——
-这属于**独立的共识参数阶段**：难度是共识真值，改动会让老节点拒绝新区块。
+> ⚠️ **为何现网仍有「不浮动」的观感**：当前生产链高度远低于 2000（约 1000+），因此**现网出块仍走 v1 钉死 16 的路径**
+> ——这是预期行为，不是缺陷；待链高越过 2000 / 3000，难度将按上述规则浮动。
+> 注意：v2 / v3 是**结构性硬分叉**（旧节点对 v2/v3 块确定性拒绝），改动难度是真值变更，会让老节点拒绝新区块。
+
 相关的单元级与链级证据见 `internal/pow/pow_test.go`、`internal/blockchain/blockchain_test.go`。
 
 ## 目录结构
@@ -237,14 +252,14 @@ bash scripts/smoke-e2e.sh   # 双真实节点进程：出块→同步→转账�
 
 ## 已知限制（明确不做）
 
-以下能力超出学习项目边界，**有意未实现**：
+以下能力超出学习项目边界，**有意未实现**（reorg / 难度浮动 / 孤儿持久化 / 启动恢复 等能力已实现，见上方「已实现的功能」，其当前未提交状态见同节状态同步说明）：
 
-- **分叉处理 / 链重组（reorg）**：单链追加式，收到父哈希不匹配的区块直接拒绝。设计原则上遵循最长链，但未实现树状链与重组。
-- **难度浮动**：难度按设计固定在最低难度（上限 = 下限 = `16`），详见「难度为何不浮动」。放开浮动属独立共识参数阶段。
 - **secp256k1 / RIPEMD160**：标准库限制，用 P-256 + SHA256 截断 20 字节替代；升级路径见代码注释。
 - **SPV / 轻节点**：所有节点都是全节点。
 - **TLS / 加密传输 / 对等认证**：P2P 明文传输，仅适合本地/可信网络。
 - **代币经济模型**：无预挖、无分配，仅原生出块奖励。
+- **完整 orphan pool / 定时重播 / 评分 / 封禁**：孤儿仅限内存 + 检查点投影，不做定时重播/评分/封禁（REORG-1G/B5，明确 DEFER）。
+- **MaxReorgDepth 深度策略**：`blocktree.SetTip` 永不因深度拒绝更高 work 链（「告警 + 限速，永不拒绝」），深度策略属 REORG-1I，未实现、不检查。
 
 ## 文档
 
