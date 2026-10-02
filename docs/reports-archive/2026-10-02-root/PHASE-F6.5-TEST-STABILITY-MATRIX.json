@@ -1,0 +1,249 @@
+{
+  "phase": "F-6.5",
+  "title": "GENESIS TEST STABILITY FORENSIC AUDIT",
+  "mode": "STRICT READ-ONLY / FORENSIC TEST STABILITY AUDIT",
+  "timestamp_utc": "2026-09-27T14:28:45Z",
+  "timestamp_local": "2026-09-27 22:28:46 +0800",
+  "repository": "E:/wakuang/p2pchain",
+  "experiment_root": "E:/wakuang/f65-verify",
+  "baseline": {
+    "head": "4d892be355a38886a83c123faad915c9f3cd62e4",
+    "branch": "main",
+    "staged": 0,
+    "tracked_modified": 35,
+    "porcelain_M": 36,
+    "untracked_files": 373,
+    "untracked_porcelain_lines": 200,
+    "gitignore_sha256_16": "f43418cf74ea996c",
+    "node_exe_sha256_16": "3972843aff90428d",
+    "p31_doc_sha256_16": "e9def9aa1f90e5ac",
+    "gap4_sha256_16": {
+      "internal/attribution/attribution.go": "3f4cb77820b43747",
+      "internal/attribution/classify.go": "bb7b00bc135c6146",
+      "internal/attribution/attribution_test.go": "4d7841d418a66881",
+      "cmd/coinbase-attribution/main.go": "c634c1ecaea59551"
+    },
+    "tokens_bytes": {
+      "audit-run/control-token": 33,
+      "f5-verify/control-token": 64,
+      "gui-test/token": 34
+    }
+  },
+  "authoritative_inputs": [
+    { "n": 1, "path": "PHASE-F6.4-GENESIS-CLOSURE-COMMIT-BOUNDARY-AUDIT.md", "present": true, "sha256": "bcbe5ddfe760536f2b26d3678db44ef82f8a6a638713e149765d1614855efc2e" },
+    { "n": 2, "path": "PHASE-F6.4-GENESIS-COMMIT-CANDIDATE-MANIFEST.md", "present": true, "sha256": "9bbfb663f174e5d19ddc3f950944d25116fafbfc3a5f7dd2e83106f26e8877e3" },
+    { "n": 3, "path": "PHASE-F6.1-OWNER-DECISION-FINALIZATION.md", "present": true, "sha256": "5b95d47009dd49c88aacf890ed0df1f17f2dc99127e9bd583214923221c749cf" },
+    { "n": 4, "path": "PHASE-F6.2-SCOPE-FREEZE-MATRIX.md", "present": false },
+    { "n": 5, "path": "PHASE-F6.2-OWNER-DECISION-RECORD.md", "present": false }
+  ],
+  "timeouts": {
+    "acceptance_timeout_seconds": 600,
+    "acceptance_timeout_source": "go test default per-package timeout (10m0s)",
+    "acceptance_timeout_changed": false,
+    "measurement_timeout_seconds": 1500,
+    "measurement_timeout_flag": "-timeout 25m",
+    "measurement_timeout_scope": "forensic isolation runs only"
+  },
+  "gcs": {
+    "file_count": 33,
+    "composition": { "A_f3b_production_tracked": 7, "B_f3b_fixtures_tracked": 22, "F_f3b_new_untracked": 3, "X01_f1n1_untracked": 1 }
+  },
+  "set_b": {
+    "file_count": 6,
+    "files": [
+      "cmd/node/r1_boundary_test.go",
+      "internal/explorer/explorer_test.go",
+      "internal/control/server.go",
+      "internal/control/console_test.go",
+      "internal/control/web/console.html",
+      "internal/control/console_mine_auth_test.go"
+    ]
+  },
+  "experiments": [
+    { "id": "E1", "tree": "pristine HEAD", "mode": "vet", "cmd": "go vet ./...", "exit": 1, "note": "undefined: f1n1UTXOSig (internal/blockchain.test)" },
+    { "id": "L1", "tree": "GCS(33)", "mode": "build", "cmd": "go build ./...", "exit": 0 },
+    { "id": "L1b", "tree": "GCS(33)", "mode": "vet", "cmd": "go vet ./...", "exit": 0 },
+    { "id": "L2", "tree": "GCS(33)", "mode": "isolated test", "cmd": "go test -count=1 ./internal/blockchain/...", "exit": 0, "pkg_elapsed_s": 78.857, "wall_s": 91 },
+    { "id": "E2", "tree": "GCS(33)", "mode": "full suite", "cmd": "go test -count=1 -json ./...", "exit": 1, "wall_s": 624,
+      "packages": { "cmd/node": {"action": "fail", "elapsed_s": 600.429}, "internal/storage": {"action": "pass", "elapsed_s": 320.845}, "internal/blockchain": {"action": "pass", "elapsed_s": 85.812}, "internal/mempool": {"action": "pass", "elapsed_s": 42.262}, "internal/p2p": {"action": "pass", "elapsed_s": 15.730}, "internal/explorer": {"action": "fail", "elapsed_s": 0.791} },
+      "timeout_last_test": "TestR4B_DualProcessCompetitiveForkConverges/L=64" },
+    { "id": "E3", "tree": "GCS+SET B(39)", "mode": "full suite", "cmd": "go test -count=1 -json ./...", "exit": 1, "wall_s": 630,
+      "packages": { "cmd/node": {"action": "fail", "elapsed_s": 600.494}, "internal/storage": {"action": "pass", "elapsed_s": 323.816}, "internal/blockchain": {"action": "pass", "elapsed_s": 95.622}, "internal/mempool": {"action": "pass", "elapsed_s": 50.709}, "internal/explorer": {"action": "pass", "elapsed_s": 0.857} },
+      "timeout_last_test": "TestResetRefusesWhenStopFailed/hard_kill_then_reset_takes_over" },
+    { "id": "E4-run1", "tree": "GCS+SET B(39)", "mode": "cmd/node isolated", "cmd": "go test -count=1 -json -timeout 25m ./cmd/node", "exit": 0, "pkg_elapsed_s": 586.721, "wall_s": 602 },
+    { "id": "E4-run2", "tree": "GCS+SET B(39)", "mode": "cmd/node isolated", "cmd": "go test -count=1 -json -timeout 25m ./cmd/node", "exit": 0, "pkg_elapsed_s": 590.410, "wall_s": 607 },
+    { "id": "E4-run3", "tree": "GCS+SET B(39)", "mode": "cmd/node isolated", "cmd": "go test -count=1 -json -timeout 25m ./cmd/node", "exit": 0, "pkg_elapsed_s": 597.772, "wall_s": 612 },
+    { "id": "E5", "tree": "GCS(33)", "mode": "cmd/node isolated", "cmd": "go test -count=1 -json -timeout 25m ./cmd/node", "exit": 0, "pkg_elapsed_s": 735.852, "wall_s": 749 }
+  ],
+  "repeatability": {
+    "tree": "GCS+SET B(39)",
+    "mode": "cmd/node isolated, -timeout 25m",
+    "runs_s": [586.721, 590.410, 597.772],
+    "min_s": 586.721,
+    "max_s": 597.772,
+    "mean_s": 591.634,
+    "range_s": 11.051,
+    "acceptance_timeout_s": 600.0,
+    "margin_min_s": 13.279,
+    "margin_max_s": 2.228,
+    "margin_min_pct": 2.21,
+    "margin_max_pct": 0.37,
+    "f64_correction": {
+      "f64_recorded_isolated_s": 571.249,
+      "f64_recorded_margin_s": 28.751,
+      "f64_recorded_margin_pct": 4.8,
+      "f65_measured_mean_s": 591.634,
+      "f65_measured_worst_margin_s": 2.228,
+      "f65_measured_worst_margin_pct": 0.37,
+      "verdict": "F-6.4 single-sample underestimated; margin revised down"
+    }
+  },
+  "minimality": {
+    "M_series_remove": [
+      { "id": "M1", "removed": "internal/blockchain/f1n1_reorg_coverage_test.go", "vet_exit": 1, "symbol": "f1n1UTXOSig", "verdict": "REQUIRED(compile)" },
+      { "id": "M2", "removed": "internal/blockchain/identity.go", "vet_exit": 1, "symbol": "ErrUninitializedStore, VerifyGenesisIdentity", "package_has_test_suffix": false, "verdict": "REQUIRED(production compile)" },
+      { "id": "M3", "removed": "cmd/node/f3b_test_helpers_test.go", "vet_exit": 1, "symbol": "newNodeRuntimeForTest", "verdict": "REQUIRED(compile)" },
+      { "id": "M4", "removed": "cmd/node/f3b_identity_test.go", "vet_exit": 0, "verdict": "OPTIONAL(compile)" },
+      { "id": "M5", "removed": "group B reverted to HEAD (22 fixtures)", "vet_exit": 0, "verdict": "OPTIONAL(compile)" }
+    ],
+    "E_series_add": [
+      { "id": "E1", "added": "GAP-4 (4 files)", "vet_exit": 0, "verdict": "EXCLUDABLE" },
+      { "id": "E2", "added": "Console C3-C6", "vet_exit": 0, "verdict": "EXCLUDABLE" },
+      { "id": "E3", "added": "F1-N1/N2 residual (4 files)", "vet_exit": 0, "verdict": "EXCLUDABLE" },
+      { "id": "E4", "added": "SET B C1-C6", "vet_exit": 0, "verdict": "EXCLUDABLE(compile)/REQUIRED-for-green(runtime)" }
+    ],
+    "compile_minimal_set": ["internal/blockchain/identity.go", "cmd/node/f3b_test_helpers_test.go", "internal/blockchain/f1n1_reorg_coverage_test.go"]
+  },
+  "failures": [
+    {
+      "id": "FAILURE-F1",
+      "package": "p2pchain/cmd/node",
+      "symptom": "panic: test timed out after 10m0s",
+      "timeout_last_test": ["TestR4B_DualProcessCompetitiveForkConverges/L=64 (E2)", "TestResetRefusesWhenStopFailed/hard_kill_then_reset_takes_over (E3)"],
+      "root_cause_classes": [5, 6, 7],
+      "genesis_defect": false
+    },
+    {
+      "id": "FAILURE-F2",
+      "package": "p2pchain/internal/explorer",
+      "test": "TestPathBoundaryRawTCP",
+      "symptom": "expected 301, got 307 (Go 1.22+ ServeMux StatusTemporaryRedirect)",
+      "head_asserts": 301,
+      "worktree_c2_asserts": 307,
+      "root_cause_classes": [2, 7],
+      "genesis_defect": false
+    },
+    {
+      "id": "F1N1-FLAKY",
+      "test": "TestF1N1_C_MixedLegacyV2Reorg",
+      "location": "internal/blockchain/f1n1_reorg_coverage_test.go:560",
+      "root_cause": "NewCandidateBlock Timestamp=time.Now().Unix() => hash time-seeded; bounded 256-attempt harvest; P(fail)~1/257 per harvest",
+      "root_cause_classes": [5],
+      "observed_this_phase": "2/2 PASS (not reproduced)",
+      "genesis_defect": false
+    }
+  ],
+  "cmd_node_cost_attribution": {
+    "tree": "GCS+SET B(39)",
+    "mode": "isolated run-1",
+    "pkg_elapsed_s": 586.721,
+    "top_tests_s": {
+      "TestR4B_DualProcessCompetitiveForkConverges": 151.180,
+      "TestR3_RealProcessCrashRestartLegacyPrefix": 132.640,
+      "TestRealProcessForkReorgConvergesByHash": 39.220,
+      "TestR1GlobalKeyCeilingPreserved": 30.800,
+      "TestR4B_ProductionReorgPathTraversed": 22.930,
+      "TestRealProcessPairConvergesToSameTip": 17.230,
+      "TestRepeatedStartStop": 16.730,
+      "TestResetWithDatadirBeforeAndAfter": 12.190,
+      "TestPrintchainWithDatadirBeforeAndAfter": 11.920,
+      "TestVerifyWithDatadirBeforeCommand": 10.370
+    },
+    "top10_sum_s": 445.21,
+    "top10_pct": 75.9,
+    "genesis_owned_test": { "name": "TestF3BExplicitInitializationStateMatrix", "elapsed_s": 1.46, "pct": 0.249 }
+  },
+  "r1f4_effect": {
+    "test": "TestR1F4PreParkRejectionReasons",
+    "gcs_head_version": { "full_suite_s": 151.380, "isolated_s": 148.380 },
+    "gcs_setb_c1_version": { "full_suite_s": 0.550, "isolated_s": [0.15, 0.50, 0.38] },
+    "speedup_approx": "275x-990x",
+    "package_effect_s": "735.852 (no C1) -> ~590 (C1), delta ~146-148s"
+  },
+  "environment": {
+    "logical_processors": 16,
+    "go_version": "go1.27.0 windows/amd64",
+    "goroot": "D:\\Software\\go",
+    "gocache": "E:\\DevCache\\go",
+    "go_test_default_p": "NumCPU (16)",
+    "contention_evidence": {
+      "internal/blockchain": { "gcs_full_s": 85.812, "e4_full_s": 95.622, "drift_pct": 11.4, "content_changed": false },
+      "internal/mempool": { "gcs_full_s": 42.262, "e4_full_s": 50.709, "drift_pct": 20.0, "content_changed": false },
+      "internal/storage": { "gcs_full_s": 320.845, "e4_full_s": 323.816, "drift_pct": 0.9, "content_changed": false }
+    }
+  },
+  "cross_workstream_contamination": {
+    "structural_x01": "internal/blockchain/f1n1_reorg_coverage_test.go (F1-N1, OD-03 BLOCKED) forced into GCS by tracked p1_reorg_fail_before_commit_test.go:63 needing f1n1UTXOSig",
+    "structural_cmd_node": "cmd/node is a mixed-workstream package; Genesis cost 0.25%, non-Genesis ~99.75%",
+    "runtime_set_b": "REQUIRED-FOR-GREEN(explorer C2) / INSUFFICIENT-FOR-STABLE-GREEN(cmd/node C1)",
+    "not_contaminating": ["GAP-4", "F1-N1/N2 residual", "docs", "secrets"]
+  },
+  "stability_classification": {
+    "scale": { "S0": "STABLE", "S1": "STABLE-NARROW", "S2": "LOAD/TIME-SENSITIVE", "S3": "FLAKY", "S4": "DETERMINISTIC FAIL", "S5": "ENVIRONMENT-DEPENDENT", "S6": "UNRESOLVED" },
+    "objects": {
+      "genesis_owned_tests": "S0",
+      "internal/blockchain_L2": "S0/S1",
+      "cmd_node": "S2 + S1",
+      "internal/explorer_TestPathBoundaryRawTCP": "S4 + S5",
+      "TestF1N1_C_MixedLegacyV2Reorg": "S3 + S5",
+      "TestR1F4PreParkRejectionReasons_HEAD": "S4",
+      "genesis_test_baseline_aggregate": "S2"
+    }
+  },
+  "root_cause_taxonomy": {
+    "1_genesis_functional_defect": "RULED OUT",
+    "2_deterministic_test_failure": "PRESENT (explorer 301 vs 307; not Genesis)",
+    "3_f1n1_f1n2_cross_contamination": "PRESENT (structural)",
+    "4_console_explorer_other_contamination": "PRESENT",
+    "5_load_timing_sensitive": "PRESENT (primary)",
+    "6_harness_time_budget_fragility": "PRESENT (primary)",
+    "7_environment_resource_contention": "PRESENT",
+    "8_unresolved_genesis_stability": "NONE FOUND"
+  },
+  "genesis_acceptance": {
+    "functional_defect": "NO",
+    "caused_by_genesis": "NO",
+    "stable_green_baseline": "NO (non-Genesis causes)",
+    "verdict": "YES (Genesis-scoped)"
+  },
+  "pass_fail_distribution": {
+    "cmd_node_full_suite": "0/2 PASS",
+    "cmd_node_isolated": "3/3 PASS",
+    "explorer_gcs": "0/1 PASS",
+    "explorer_gcs_setb": "1/1 PASS",
+    "f1n1_flaky": "2/2 PASS (not reproduced)",
+    "silent_retries": "NONE"
+  },
+  "cache_control": { "count_flag": "-count=1 (all runs)", "test_result_cache_used": false, "gocache_shared": true },
+  "zero_drift": {
+    "head_unchanged": true,
+    "staged_unchanged": true,
+    "tracked_modified_unchanged": true,
+    "porcelain_M_unchanged": true,
+    "protected_objects_unchanged": true,
+    "tokens_unchanged": true,
+    "repo_writes": 0,
+    "git_writes": 0
+  },
+  "anomalies": [
+    { "id": "F6.5-ANOM-1", "desc": "Authoritative inputs 4/5 absent (F-6.2 never produced them)", "action": "registered, not fabricated" },
+    { "id": "F6.5-ANOM-2", "desc": "F-6.4 recorded isolated 571.249s vs F-6.5 3-run 586.721/590.410/597.772s", "action": "registered; F-6.4 margin revised down" }
+  ],
+  "final_gate": {
+    "status": "COMPLETE",
+    "finding": "TIME-LOAD FRAGILITY IDENTIFIED",
+    "aggregate_stability_class": "S2",
+    "hard_stop": true,
+    "auto_advance": false
+  }
+}
