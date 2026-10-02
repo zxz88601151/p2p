@@ -56,7 +56,7 @@ Verification Runtime · Verifiable Work Runtime · Contribution Network
 - **孤儿块持久化与启动恢复**：`<datadir>/orphan_waiting.bin` 检查点（原子写 `temp+fsync+rename` + SHA-256 校验，fail-closed）；启动加载缺失父键集，握手后复用 by-hash 分支拉取（`requestBranch`）重连缺失分支
 - **端到端恢复校验**：`ORPHAN-DURABILITY-E2E-RECOVERY-1` 以真实网络/磁盘/进程边界验证「孤儿产生 → 检查点落盘 → 崩溃重启 → 恢复加载 → 握手消费 → 分支请求 → 父块到达 → 孤儿消解 → 链一致」全链路
 
-> ⚠️ **实现状态同步（CONSOLIDATION-2）**：reorg / 难度浮动（v2@2000、v3@3000）/ 孤儿持久化 / 启动恢复 等功能已在仓库**工作树**中实现，并经单元、集成与端到端测试验证；但截至本文档同步（HEAD = `52fb464`）**尚未提交、未部署、未做生产变更**。以 `internal/blockchain`、`internal/blocktree`、`cmd/node/orphan_checkpoint.go` 与阶段报告为准（详见 `PROJECT-AI-CONTEXT.md` §17）。
+> ⚠️ **实现状态同步（CONSOLIDATION-2）**：reorg / 难度浮动（v2@2000、v3@3000）/ 孤儿持久化 / 启动恢复 等功能已实现并经单元、集成与端到端测试验证；**孤儿耐久与启动恢复代码已提交**（`36f9630` feat(node): orphan durability §4-B1/B1.5/B2），**协议真相同步文档已提交**（`8410036` docs: synchronize documentation truth），当前 HEAD = `8410036`。**尚未打 tag、尚未部署、尚未做生产变更**。以 `internal/blockchain`、`internal/blocktree`、`cmd/node/orphan_checkpoint.go` 与阶段报告为准（详见 `PROJECT-AI-CONTEXT.md` §17）。
 
 ## 快速开始
 

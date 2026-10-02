@@ -4,7 +4,7 @@
 > **已经实现**的启动恢复接线（§4-B2：`prepareOrphanRestore` + `consumeRestorePending`）。
 > **不含任何新设计、新接口、新能力。** 任何解释若与本文件冲突，以源码为准。
 >
-> **治理状态**：本 spec 描述的能力位于**未提交工作树**（HEAD = `52fb464` 不含 §4-B2）。
+> **治理状态**：本 spec 描述的启动恢复接线（§4-B2）**已提交**于 `36f9630`（feat(node): orphan durability），协议真相同步**已提交**于 `8410036`（docs: synchronize documentation truth），当前 HEAD = `8410036`。**尚未打 tag、尚未部署、尚未做生产发布**。
 > 见 `PROJECT-AI-CONTEXT.md` §17 关键状态区分。孤儿持久化的数据格式见 `ORPHAN-DURABILITY-SPEC-v1.md`。
 
 ---

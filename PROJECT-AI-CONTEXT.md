@@ -31,12 +31,12 @@
 
 **它的自我定位（README 原文，务必尊重）**：这是一个 **Developer Node** —— 学习/实验项目，**未做安全审计，不得用于任何真实资产场景**。
 
-> ⚠️ **README 与代码存在已知漂移（接手 AI 必读）**：
-> `README.md` 的「已知限制」一节仍写着「**分叉处理 / 链重组（reorg）未实现**，收到父哈希不匹配的区块直接拒绝」。
-> 这一表述**已经过时**：本仓库已实装 `internal/blocktree`、`blockchain.executeReorg`、`internal/utxo/undo.go`
-> 以及多条 reorg / orphan / recovery 阶段。以**源码与阶段报告为准**，README 此处是残留旧文案。
+> ⚠️ **README 与代码的历史漂移（已修复，接手 AI 参考）**：
+> `README.md` 的「已知限制」一节**曾**写着「分叉处理 / 链重组（reorg）未实现」，该表述已过时——
+> 本仓库已实装 `internal/blocktree`、`blockchain.executeReorg`、`internal/utxo/undo.go` 及多条 reorg / orphan / recovery 阶段。
+> 该 README 漂移已在 **CONSOLIDATION-2** 修正并**随 `8410036` 提交**（见 §17）。
 > 同理，`docs/MASTER-DESIGN.md`（早期）写的奖励公式 `50 >> (height/210)` 也已过时，
-> 现行公式见 §7（来自 `internal/utxo/apply.go`）。
+> 现行公式见 §7（来自 `internal/utxo/apply.go`），该处同样已在 `8410036` 同步。
 
 ---
 
@@ -315,7 +315,7 @@ else:  确定性 tie-break：tip hash 大端较大者胜
   entry = parentHash(32B) + childCount(u32 BE) + childHash×N。
   上界 entryCount ≤ 256、每 entry childCount ≤ 64，文件 ≤ ~524 KB。原子写 = temp + fsync + rename。
   **失败语义 fail-closed**：任何失败只影响孤儿可用性，**绝不反向影响 canonical**。
-- **§4-B1.5**：把 §4-B1 在**生产中真正激活**——`cmd/node/main.go` 的 D1（`newOrphanCheckpoint(cfg.DataDir)` → `CleanupTmp()` → `svc.orphanCP = orphanCP` → `prepareOrphanRestore(orphanCP)`，**在 `p2pNode.Start()` 之前**）+ D2（`runSyncSweep` 经 `orphanCP.FlushIfDirty(5s)` 周期落盘）。**已实现并验证**（含 §4-B1.5 合规报告与全量测试），仍处**未提交工作树**（见 §17）。
+- **§4-B1.5**：把 §4-B1 在**生产中真正激活**——`cmd/node/main.go` 的 D1（`newOrphanCheckpoint(cfg.DataDir)` → `CleanupTmp()` → `svc.orphanCP = orphanCP` → `prepareOrphanRestore(orphanCP)`，**在 `p2pNode.Start()` 之前**）+ D2（`runSyncSweep` 经 `orphanCP.FlushIfDirty(5s)` 周期落盘）。**已实现并验证**（含 §4-B1.5 合规报告与全量测试），**已提交**（`36f9630` feat(node): orphan durability，见 §17）。
 - **§4-B2**：启动恢复接线（**已实现 + E2E 验证**）—— `OnHandshake` → `consumeRestorePending(peerAddr)` → 复用 `requestBranch` 重拉缺失分支。
   语义：父已知 → 双删 drain（`restorePending` + checkpoint，`Remove` 幂等，且**仅在父已知时**执行，绝不误删 live waiting）；
   父未知 → `requestBranch` 并**保留**在集合中（隐式有界重试，由 inflight/TTL/rounds 压制）。
@@ -470,9 +470,9 @@ reorg/fork-choice/undo（`f1n1_*` `f1n2_*` `r4b_*`）、storage 崩溃矩阵（`
 
 ## §16 当前已知问题
 
-1. **README「已知限制」与代码漂移**：已于 **CONSOLIDATION-2** 在本工作树中修复——README 现声明 reorg / 难度浮动 / 孤儿持久化 / 启动恢复 为已实现（并附未提交状态同步说明）。**修复仍处未提交状态**（见 §17），以源码与阶段报告为准。
+1. **README「已知限制」与代码漂移**：已于 **CONSOLIDATION-2** 修复——README 现声明 reorg / 难度浮动 / 孤儿持久化 / 启动恢复 为已实现。**修复已随 `8410036` 提交**（docs: synchronize documentation truth，见 §17）。
 2. **被引用但缺失的 spec 文档**：已于 **CONSOLIDATION-2** 创建 `docs/spec/ORPHAN-DURABILITY-SPEC-v1.md` 与 `docs/spec/STARTUP-RECOVERY-PLAN-1.md`（仅记录已实现行为，无新设计）。
-   `cmd/node/orphan_checkpoint.go` 顶部注释原引用名 `ORPHAN-DURABILITY-IMPLEMENTATION-SPEC-v1` 已同步更正为 `ORPHAN-DURABILITY-SPEC-v1`（工作树未提交）。
+   `cmd/node/orphan_checkpoint.go` 顶部注释原引用名 `ORPHAN-DURABILITY-IMPLEMENTATION-SPEC-v1` 已同步更正为 `ORPHAN-DURABILITY-SPEC-v1`（已随 `36f9630` 提交）。
 3. **P2P 出站队列满即静默丢帧**、**无重传**（LTM-001，`docs/LIMITATIONS.md` 登记）。
 4. **无 peer scoring / ban / isolation**（LTM-002），**无独立 P2P 协议版本/能力协商字段**（LTM-003）。
 5. **完整 orphan pool 与重播策略明确未做**（REORG-1G/B5）：孤儿**仅限内存 + checkpoint 投影**，
@@ -516,6 +516,12 @@ F-1 → F-2 → F-3 → F-4 → F-5 → F6 / F6.1 … F6.8 → CB1 → CB2   （
 
 ### 🔴 关键状态区分（接手 AI 必须先看这一段）
 
+> ⚠️ **时点标注（2026-10-02 后续更新）**：以下为 **CONSOLIDATION-2 打包时点**的历史快照。
+> 当时 §4-B1 / §4-B1.5 / §4-B2 确实处于「工作树未提交」状态；但此后已由
+> **`36f9630`（feat(node): orphan durability）** 与 **`8410036`（docs: synchronize documentation truth）**
+> 两个提交收口，当前 `HEAD = 8410036` **已包含**三者全部实现与文档。
+> **尚未打 tag、尚未部署、尚未做生产发布。** 阅读下方历史状态时请以本标注为准。
+
 - **已提交基线（`git HEAD`）**：**不含** §4-B1 / §4-B1.5 / §4-B2 的任何代码 —— 三者目前全部是**工作树未提交**状态。
 - **当前工作树**：**同时包含** §4-B1 + §4-B1.5 + §4-B2 的实现代码与测试。
 - **本次打包时实测（2026-10-02）**：
@@ -551,6 +557,10 @@ F-1 → F-2 → F-3 → F-4 → F-5 → F6 / F6.1 … F6.8 → CB1 → CB2   （
 ---
 
 ## §19 当前未完成工作
+
+> ⚠️ **时点标注（2026-10-02 后续更新）**：下表为 **CONSOLIDATION-2 打包时点**的历史快照。
+> 表中「§4-B2 提交入库」「git commit」两项当时标注 ⛔ 未完成，但已由 **`36f9630`** 完成提交（§4-B1/B1.5/B2 代码全部入库）。
+> 当前 `HEAD = 8410036`；其余 DEFER / 未做 / SKELETON 项仍为真实未完成状态，未被本阶段变更。
 
 | # | 事项 | 状态 |
 |---|---|---|
