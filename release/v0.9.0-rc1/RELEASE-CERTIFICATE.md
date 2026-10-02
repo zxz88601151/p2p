@@ -2,6 +2,7 @@
 
 > 本证书为 P2PChain `v0.9.0-rc1` Release Candidate 的**不可变版本身份证明**，
 > 记录 tag → commit → source → binary 的完整 provenance 链路。
+> **Provenance 模型**：external attestation（二进制不内嵌 VCS，溯源由本证书外部记录）。
 
 ---
 
@@ -11,8 +12,8 @@
 |----|----|
 | 版本标签（annotated tag） | `v0.9.0-rc1` |
 | 定位 | Developer Node Release Candidate（**非生产加密货币发布**） |
-| 发布状态 | ✅ GREEN gate 通过，已打 annotated tag |
-| 打标日期 | 2026-10-02 10:12:20 +0800 |
+| 发布状态 | ✅ 确定性构建完成，已打 annotated tag |
+| 打标日期 | 2026-10-02 |
 
 ---
 
@@ -23,14 +24,13 @@
 | 项 | 值 |
 |----|----|
 | annotated tag | `v0.9.0-rc1`（`git cat-file -t` = `tag`） |
-| 指向 commit | `83914d170d41580a2c671e220f4f5258754ba124` |
+| 指向 commit | `a69d24ef03c85ab6e669b81a4132749178de76d5` |
 
 ### 2. commit → source（业务源码边界）
 
 | 项 | 值 |
 |----|----|
 | 业务源码最终提交 | `3e6d44a248013f814859cf4f5be6feb5bc57f492` |
-| tree 哈希（源码边界） | `d5065ee7714bea533674b6d723d7ec11187e47f9` |
 | 祖先关系 | ✅ `3e6d44a` 是 `v0.9.0-rc1` 的祖先（业务代码零差异） |
 
 **RC 提交链（main 分支，6 提交）**：
@@ -42,27 +42,27 @@
 | 3 | `3e6d44a` | docs: synchronize release governance status metadata（业务源码边界） |
 | 4 | `83914d1` | docs(release): add RC evidence closure artifacts |
 | 5 | `bbbfab7` | docs(release): seal RC release certificate |
-| 6 | `2fe8582` | docs(release): update RC binary provenance（tag target） |
+| 6 | `a69d24e` | docs(release): finalize RC binary provenance alignment（tag target） |
 
-### 3. source → binary
+### 3. source → binary（External Attestation）
 
 | 项 | 值 |
 |----|----|
 | 官方二进制 | `node-v0.9.0-rc1.exe` |
-| SHA-256 | `300fe7bbca1abdd940c9ddef7c0a30ba8af63984032ed194fc77364fd664f669` |
-| VCS revision（内嵌） | `2fe8582cfa0126ab75b06df85e751b7084414b40`（**== tag target**） |
-| VCS modified（内嵌） | `false` |
-| 构建参数 | `go build -buildvcs=true -trimpath -o node-rc.exe ./cmd/node` |
+| SHA-256 | `71097357531876b9975998d1d316f0888543a4aea1dcb9456c160df50e6352b1` |
+| VCS 内嵌 | ❌ 无（`-buildvcs=false`） |
+| 构建参数 | `go build -buildvcs=false -trimpath -o node-rc.exe ./cmd/node` |
 | Go 版本 | `go1.27.0 windows/amd64` |
+| Provenance 模型 | **external attestation**（身份由源码内容决定，溯源由本证书外部记录） |
 
 ---
 
 ## 不可变性声明（Immutability Declaration）
 
-1. **源码冻结**：业务源码边界固定于 `3e6d44a`，此后未做任何源码/协议/共识修改（`3e6d44a` → `2fe8582` 仅文档提交，业务代码零差异）。
-2. **二进制冻结**：官方 RC 二进制 `node-v0.9.0-rc1.exe` 的 SHA-256 固定为 `300fe7bb…`，provenance 与 tag target 对齐。
-3. **可复现性**：在冻结参数下（`v0.9.0-rc1` checkout + `-buildvcs=true -trimpath` + Go1.27.0），独立 clone + checkout + 重建哈希与官方二进制完全一致（Deterministically Reproducible）。
-4. **tag 不可变**：annotated tag `v0.9.0-rc1` 已创建，指向 `2fe8582`，未 push（本地唯一）。
+1. **源码冻结**：业务源码边界固定于 `3e6d44a`，此后未做任何源码/协议/共识修改（`3e6d44a` → `a69d24e` 仅文档提交，业务代码零差异）。
+2. **二进制冻结**：官方 RC 二进制 `node-v0.9.0-rc1.exe` 的 SHA-256 固定为 `71097357…`。
+3. **确定性可复现**：冻结参数（`v0.9.0-rc1` checkout + `-buildvcs=false -trimpath` + Go1.27.0）下，三次独立构建（worktree + 2× clone checkout tag）SHA256 完全一致 `71097357…`。
+4. **tag 不可变**：annotated tag `v0.9.0-rc1` 已创建，指向 `a69d24e`，未 push（本地唯一）。
 
 ---
 

@@ -9,12 +9,12 @@
 
 | 项 | 值 |
 |----|----|
-| tag target（RC 身份锚点） | `2fe8582cfa0126ab75b06df85e751b7084414b40` |
-| HEAD 短 SHA | `2fe8582` |
-| tree 哈希 | `0de5660266a111e55defa1dca4a69d6c9182dff9` |
+| tag target（RC 身份锚点） | `a69d24ef03c85ab6e669b81a4132749178de76d5` |
+| HEAD 短 SHA | `a69d24e` |
+| 业务源码边界 | `3e6d44a248013f814859cf4f5be6feb5bc57f492`（业务代码零差异） |
 | 分支 | `main` |
-| 提交信息 | `docs(release): seal RC release certificate` |
-| 提交时间 | 2026-10-02 10:13 +0800 |
+| 提交信息 | `docs(release): finalize RC binary provenance alignment` |
+| 提交时间 | 2026-10-02 10:2x +0800 |
 
 ### RC 提交链（main 分支，6 提交）
 
@@ -25,7 +25,9 @@
 | 3 | `3e6d44a` | docs: synchronize release governance status metadata（业务源码边界） |
 | 4 | `83914d1` | docs(release): add RC evidence closure artifacts |
 | 5 | `bbbfab7` | docs(release): seal RC release certificate |
-| 6 | `2fe8582` | docs(release): update RC binary provenance（tag target） |
+| 6 | `a69d24e` | docs(release): finalize RC binary provenance alignment（tag target） |
+
+> 注：中间曾尝试 `2fe8582`（update RC binary provenance）采用 `-buildvcs=true`，后因自引用循环改用 `-buildvcs=false` external attestation 模型，最终收敛于 `a69d24e`。
 
 ---
 
@@ -36,8 +38,8 @@
 | 项 | 值 |
 |----|----|
 | 文件名 | `node-v0.9.0-rc1.exe` |
-| 大小 | 12,112,896 字节 |
-| SHA-256 | `300fe7bbca1abdd940c9ddef7c0a30ba8af63984032ed194fc77364fd664f669` |
+| 大小 | 12,112,384 字节 |
+| SHA-256 | `71097357531876b9975998d1d316f0888543a4aea1dcb9456c160df50e6352b1` |
 | 版本标签 | `v0.9.0-rc1` |
 
 ### 历史工件（保留，非 RC）
@@ -53,24 +55,24 @@
 
 | 参数 | 值 |
 |------|----|
-| 源码提交 | `2fe8582cfa0126ab75b06df85e751b7084414b40`（tag target） |
-| tree 哈希 | `0de5660266a111e55defa1dca4a69d6c9182dff9` |
+| 源码提交 | `a69d24ef03c85ab6e669b81a4132749178de76d5`（tag target） |
+| 业务源码边界 | `3e6d44a248013f814859cf4f5be6feb5bc57f492` |
 | Go 版本 | `go1.27.0 windows/amd64` |
 | OS / 架构 | `windows / amd64` |
-| 构建命令 | `go build -buildvcs=true -trimpath -o node-rc.exe ./cmd/node` |
-| 构建标志 | `-buildvcs=true -trimpath` |
+| 构建命令 | `go build -buildvcs=false -trimpath -o node-rc.exe ./cmd/node` |
+| 构建标志 | `-buildvcs=false -trimpath` |
 
 ---
 
-## 4. Provenance 溯源信息
+## 4. Provenance 模型：External Attestation
 
-| 字段 | 值 |
+| 项 | 值 |
 |------|----|
-| `vcs` | `git` |
-| `vcs.revision` | `2fe8582cfa0126ab75b06df85e751b7084414b40`（**== tag target**） |
-| `vcs.time` | `2026-10-02T02:13:38Z` |
-| `vcs.modified` | `false`（干净工作树） |
-| `mod` 版本 | `v0.9.0-rc1`（tag 名，无 `+dirty`） |
+| 模型 | **external attestation**（外部证明） |
+| 二进制内嵌 VCS | ❌ 无（`-buildvcs=false`） |
+| 身份锚定 | 源码内容（业务代码 + go.mod）→ SHA256 `71097357…` |
+| 溯源关系 | 由本清单 + RC-RELEASE-CERTIFICATE.md 在外部记录 tag → commit → SHA256 映射 |
+| 设计原因 | `-buildvcs=true` 导致 binary hash ↔ commit hash ↔ manifest SHA256 自引用循环，无法收敛 |
 
 ---
 
@@ -88,10 +90,10 @@
 
 | 校验项 | 结果 |
 |--------|------|
-| vcs.revision 匹配 tag target `2fe8582` | ✅ |
-| vcs.modified = false | ✅ |
-| 可复现重建哈希 | ✅ 独立 clone+checkout+重建 `300fe7bb…` 完全一致 |
+| 三次独立构建 SHA256 一致 | ✅ `71097357…`（worktree + 2× clone checkout tag） |
+| 二进制无 VCS 内嵌 | ✅ external attestation 模型生效 |
 | 历史二进制保留 | ✅ node.exe + historical 均未删除 |
+| 业务代码零差异 | ✅ `3e6d44a` → `a69d24e` 无 `.go` 改动 |
 
 ---
 
