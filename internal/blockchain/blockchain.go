@@ -52,8 +52,9 @@ var (
 )
 
 const (
-	// MaxBlockSize 区块最大体积（字节）：按 block 的规范 JSON 序列化长度计算。
-	// JSON 字段顺序由结构体定义固定，跨节点计算结果一致。
+	// MaxBlockSize 区块最大体积（字节）：按 block 的规范二进制序列化长度计算
+	//（Block.Encode：头部定长序列化 + 小端 uint32 交易计数 + 逐交易二进制编码）。
+	// 二进制编码是确定性的，跨节点计算结果一致。
 	MaxBlockSize = 1 << 20 // 1 MiB
 
 	// maxFutureTimestampDrift 允许区块时间戳超前本地时钟的最大秒数（比特币为 2 小时）。

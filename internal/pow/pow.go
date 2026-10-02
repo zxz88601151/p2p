@@ -57,7 +57,7 @@ const (
 const (
 	// ActivationHeight 是难度浮动 + 新时间戳/MTP 规则 + 新版本强制生效的**固定激活高度**。
 	//
-	// 选择 2000 是刻意大于当前生产链高度（约 1275），保证**存量链在激活前的行为与旧节点
+	// 选择 2000 是刻意大于当前生产链高度（2026-10-02 实测约 137），保证**存量链在激活前的行为与旧节点
 	// 逐字节等价**——已落盘的 blocks.dat 回放时不触发任何新规则（旧块全部 bits=16、
 	// version=1、时间戳满足旧共识区间），因此无需任何迁移或重挖。
 	//
@@ -79,13 +79,13 @@ const (
 // 规则集完全由区块高度唯一确定，绝不依赖 canonical tip（OD-15 §4 硬性约束）。
 //
 // 术语纪律（OD-14/OD-15）：FROZEN = YES / IMPLEMENTED = YES（本阶段落地）/ ACTIVATED = NO。
-// 本阶段只实现代码，**不激活网络**：生产链高度（约 1765）远低于 3000，存量链行为逐字节不变。
+// 本阶段只实现代码，**不激活网络**：生产链高度（2026-10-02 实测约 137）远低于 3000，存量链行为逐字节不变。
 const (
 	// NewRulesetActivationHeight 是第二激活高度（H_nearest），ruleset v3 的**起点高度**。
 	//
 	// 冻结值 = 3000（MNC-OD-15-D 正式冻结）。约束核验（OD-15-D §3.1）：
 	//   - > 2000（严格后于 v2 边界，不复用 ActivationHeight）；
-	//   - > 当前生产链高（1765），留 1235 块余量；
+	//   - > 当前生产链高（2026-10-02 实测约 137），留 2863 块余量；
 	//   - 为 DifficultyAdjustmentInterval(20) 的整数倍（3000/20=150），注入后首个周期干净；
 	//   - v2 稳定观察区间 [2000,3000) = 1000 块 = 50 周期。
 	//
@@ -530,8 +530,8 @@ func VersionForHeight(height, activationHeight int) uint32 {
 //
 // 规则（三态，冻结于 DESIGN-1 / GATE-1 / MNC-OD-14 / MNC-OD-15-D）：
 //   - height == 0：创世，固定 MaxTargetBits(16)。（**genesis 恒 16，注入 27 绝不外溢**）
-//   - 0 < height < ActivationHeight（ruleset v1，LEGACY）：难度钉死在父块 bits
-//     （= MaxTargetBits=16），即旧链「难度不浮动」语义的精确等价。
+//   - 0 < height < ActivationHeight（ruleset v1，LEGACY）：难度沿用父块 bits
+//     （有效链上恒为 MaxTargetBits=16，由创世归纳保证），即旧链「难度不浮动」语义的精确等价。
 //   - ActivationHeight <= height < 3000（ruleset v2，Ceil 浮动）：
 //     非周期边界沿用父块 bits；周期边界 AdjustBits（**Ceil**）钳制在 [16,32]。
 //   - height == 3000（ruleset v3 起点）：**无条件**返回 NewRulesetInitialBits(27)

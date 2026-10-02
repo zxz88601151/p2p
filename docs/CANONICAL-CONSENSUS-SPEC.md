@@ -141,8 +141,8 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 |---|---|---|
 | **ALGORITHM**（算法是否存在） | **存在**。两套取整入口均已实现：`AdjustBits`（Ceil）、`AdjustBitsNearest`（Nearest），共享 `adjustTargetCore` | `pow.go:416 / 440 / 326` |
 | **PARAMETER**（参数值） | `MaxTargetBits=16`、`MaxDifficultyBits=32`、`DifficultyAdjustmentInterval=20`、`TargetBlockTimeSeconds=60` | `pow.go:29/52/37/33` |
-| **ACTIVATION**（是否已激活） | **v2 未激活**（生产链高约 1765 < 2000）；**v3 未激活**（< 3000）。二者均为 **FROZEN + IMPLEMENTED + ACTIVATED=NO** | `pow.go:81-82` |
-| **CURRENT CHAIN STATE**（当前链上实测） | 生产链高度约 **1765** < 2000 ⇒ **当前链上难度恒为 16** | 生产现态 |
+| **ACTIVATION**（是否已激活） | **v2 未激活**（生产链高度 2026-10-02 实测约 137 < 2000）；**v3 未激活**（< 3000）。二者均为 **FROZEN + IMPLEMENTED + ACTIVATED=NO** | `pow.go:81-82` |
+| **CURRENT CHAIN STATE**（当前链上实测） | 生产链高度约 **137**（2026-10-02 实测）< 2000 ⇒ **当前链上难度恒为 16** | 生产现态 |
 
 > **核心裁定**：
 > `ALGORITHM EXISTS ≠ CONSENSUS CURRENTLY USES VARIABLE DIFFICULTY`。

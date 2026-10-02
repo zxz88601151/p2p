@@ -151,7 +151,7 @@ func legacyPrefixBytes(t *testing.T, dir string, records int) []byte {
 // 后果：**任何落点对 legacy 前缀内部的 reorg 都会被存储层拒绝**
 //（ErrCorruptStore: 高度 N 由 v2 区块占据）。而节点自启动以来写的第一个 canonical
 // 块必然是 legacy 的，所以「现实持久化链上的首次 reorg」当前一定失败——
-// 生产 .123 的 1284 块全是 legacy，影响面是真实且严重的。
+// 生产 .123 的 137 块全是 legacy，影响面是真实且严重的。
 //
 // 本函数用一枚**累积工作量必定低于当前链尾**的短链分叉块把存储切进 v2：
 // 该块只会被存为 detached（v2 记录），不会触发 reorg，之后本节点所有新的
