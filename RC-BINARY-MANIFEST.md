@@ -11,14 +11,14 @@
 |----|----|
 | 文件名 | `node-v0.9.0-rc1.exe` |
 | 大小 | 12,112,896 字节 |
-| SHA-256 | `90f86e9a4c4d465e1c1ea78b4930e9077532ed124a074b102ae65f254030efb6` |
+| SHA-256 | `300fe7bbca1abdd940c9ddef7c0a30ba8af63984032ed194fc77364fd664f669` |
 | 版本标签 | `v0.9.0-rc1`（Developer Node Release Candidate，非生产加密货币发布） |
 
 ## 冻结构建参数（Reproducibility）
 
 | 参数 | 值 |
 |------|----|
-| 源码提交（source commit） | `bbbfab7760259ef275afcad2980c6e7b3ca12773`（tag `v0.9.0-rc1` target） |
+| 源码提交（source commit） | `2fe8582cfa0126ab75b06df85e751b7084414b40`（tag `v0.9.0-rc1` target） |
 | tree 哈希 | `0de5660266a111e55defa1dca4a69d6c9182dff9` |
 | Go 版本 | `go1.27.0 windows/amd64` |
 | OS / 架构 | `windows / amd64` |
@@ -30,7 +30,7 @@
 | 字段 | 值 |
 |------|----|
 | `vcs` | `git` |
-| `vcs.revision` | `bbbfab7760259ef275afcad2980c6e7b3ca12773`（**== tag target**） |
+| `vcs.revision` | `2fe8582cfa0126ab75b06df85e751b7084414b40`（**== tag target**） |
 | `vcs.time` | `2026-10-02T02:13:38Z` |
 | `vcs.modified` | `false`（干净工作树，无未提交改动） |
 | `mod` 版本 | `v0.9.0-rc1`（tag 名，无 `+dirty` 后缀） |
@@ -45,10 +45,10 @@ cd /tmp/p2pchain-rc-verify
 # 2. 冻结参数重建
 go build -buildvcs=true -trimpath -o node-rc.exe ./cmd/node
 
-# 3. 核对哈希（期望 90f86e9a…）
+# 3. 核对哈希（期望 300fe7bb…）
 sha256sum node-rc.exe
 
-# 4. 核对溯源（revision 必须 = bbbfab7）
+# 4. 核对溯源（revision 必须 = 2fe8582）
 go version -m node-rc.exe | grep -E 'vcs.revision|vcs.modified'
 ```
 
@@ -69,7 +69,7 @@ go version -m node-rc.exe | grep -E 'vcs.revision|vcs.modified'
 
 ## 完整性声明
 
-- 官方 RC 二进制 `node-v0.9.0-rc1.exe` 由干净 checkout（`v0.9.0-rc1` = `bbbfab7`，零漂移）+ 冻结参数（`-buildvcs=true -trimpath`）构建。
-- VCS 溯源 `vcs.revision=bbbfab7` + `vcs.modified=false` 已核验，**与 tag target 严格一致**（provenance 对齐）。
-- 可复现性：独立 clone + checkout tag + 重建，哈希 `90f86e9a…` 完全一致（Deterministically Reproducible）。
+- 官方 RC 二进制 `node-v0.9.0-rc1.exe` 由干净 checkout（`v0.9.0-rc1` = `2fe8582`，零漂移）+ 冻结参数（`-buildvcs=true -trimpath`）构建。
+- VCS 溯源 `vcs.revision=2fe8582` + `vcs.modified=false` 已核验，**与 tag target 严格一致**（provenance 对齐）。
+- 可复现性：独立 clone + checkout tag + 重建，哈希 `300fe7bb…` 完全一致（Deterministically Reproducible）。
 - 此二进制为 **source-only release** 的构建产物，不含任何链数据 / 钱包 / 凭据（均被 gitignore 排除）。
