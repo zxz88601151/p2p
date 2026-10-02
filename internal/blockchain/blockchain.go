@@ -522,6 +522,15 @@ func (bc *Blockchain) addBlock(b *block.Block, persist bool) error {
 		return fmt.Errorf("%w: parent %x not in tree", ErrOrphanParent, parentHash[:4])
 	}
 
+	// P0-1 修复：入树前先做头部共识预检（PoW/难度/时间戳/Merkle/体积）。
+	// 任何头部非法的块都不得进入 blocktree——否则 PoW 无效块会以 StatusUnknown
+	// 残留树中，攻击者再在其上接合法 PoW 子块即可绕过校验、经 reorg 把无效块
+	// 拱上主链（且入树零 PoW 成本，附带无界内存 DoS）。
+	// 包装方式与下方 fork 校验失败一致：保持既有测试对 ErrInvalidPrevHash 的断言兼容。
+	if err := bc.validateForkHeader(b, parentNode); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPrevHash, err)
+	}
+
 	// 加入 blocktree（轻量级元数据索引）
 	height := parentNode.Height + 1
 	node, err := bc.tree.AddBlock(b.Header.Hash(), parentHash, height, b.Header.Bits, b.Header.Timestamp)
@@ -718,12 +727,16 @@ func (bc *Blockchain) validateForkBlock(b *block.Block, parentNode *blocktree.Bl
 	return err
 }
 
-// validateForkBlockInner 是 validateForkBlock 的原始实现体（I0 拆分，仅观测包装变更）。
-func (bc *Blockchain) validateForkBlockInner(b *block.Block, parentNode *blocktree.BlockNode) error {
-	baseUTXO, err := bc.utxoAtNode(parentNode)
-	if err != nil {
-		return fmt.Errorf("rebuild parent UTXO failed: %w", err)
-	}
+// validateForkHeader 对 fork block 做**不依赖 UTXO 的头部共识预检**：
+// 链式结构 → 版本 → PoW → 难度（fork 视图）→ 时间戳（fork 视图）→ Merkle → 体积。
+//
+// P0-1 修复：调用方（addBlock Case 2）必须在 tree.AddBlock **之前**调用本函数。
+// 任何头部非法的块都不得进入 blocktree——否则 PoW 无效块会以 StatusUnknown
+// 残留树中（Status 字段从未被赋值），攻击者再在其上挖出合法 PoW 子块即可绕过
+// 校验、经 reorg 把无效块拱上主链；且入树零 PoW 成本，附带无界内存 DoS。
+//
+// 本函数是纯校验（仅读 parent 块与祖先视图），可在持有 bc.mu 写锁时安全调用。
+func (bc *Blockchain) validateForkHeader(b *block.Block, parentNode *blocktree.BlockNode) error {
 	parentBlock, err := bc.blockAtHash(parentNode.Hash)
 	if err != nil {
 		return fmt.Errorf("get parent block failed: %w", err)
@@ -761,6 +774,21 @@ func (bc *Blockchain) validateForkBlockInner(b *block.Block, parentNode *blocktr
 	if size := b.Size(); size > MaxBlockSize {
 		return fmt.Errorf("%w: %d > %d", ErrBlockTooLarge, size, MaxBlockSize)
 	}
+	return nil
+}
+
+// validateForkBlockInner 是 validateForkBlock 的原始实现体（I0 拆分，仅观测包装变更）。
+func (bc *Blockchain) validateForkBlockInner(b *block.Block, parentNode *blocktree.BlockNode) error {
+	baseUTXO, err := bc.utxoAtNode(parentNode)
+	if err != nil {
+		return fmt.Errorf("rebuild parent UTXO failed: %w", err)
+	}
+	// 头部预检（与 addBlock 入树前调用的 validateForkHeader 同一实现，此处复跑
+	// 以保持单函数完整校验语义；幂等且便宜——PoW/Merkle 均为纯计算）。
+	if err := bc.validateForkHeader(b, parentNode); err != nil {
+		return err
+	}
+	height := parentNode.Height + 1
 	// 8. 交易层
 	_, _, err = utxo.ApplyBlock(baseUTXO, b.Transactions, height)
 	if err != nil {
