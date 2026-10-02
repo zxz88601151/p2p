@@ -9,20 +9,22 @@
 
 | 项 | 值 |
 |----|----|
-| HEAD 完整 SHA | `3e6d44a248013f814859cf4f5be6feb5bc57f492` |
-| HEAD 短 SHA | `3e6d44a` |
-| tree 哈希 | `d5065ee7714bea533674b6d723d7ec11187e47f9` |
+| tag target（RC 身份锚点） | `bbbfab7760259ef275afcad2980c6e7b3ca12773` |
+| HEAD 短 SHA | `bbbfab7` |
+| tree 哈希 | `0de5660266a111e55defa1dca4a69d6c9182dff9` |
 | 分支 | `main` |
-| 提交信息 | `docs: synchronize release governance status metadata` |
-| 提交时间 | 2026-10-02 09:52:59 +0800 |
+| 提交信息 | `docs(release): seal RC release certificate` |
+| 提交时间 | 2026-10-02 10:13 +0800 |
 
-### RC 三连提交（main 分支）
+### RC 提交链（main 分支，5 提交）
 
 | 顺序 | SHA | 说明 |
 |------|-----|------|
 | 1 | `36f9630` | feat(node): orphan durability §4-B1/B1.5/B2 implementation |
 | 2 | `8410036` | docs: synchronize documentation truth |
-| 3 | `3e6d44a` | docs: synchronize release governance status metadata |
+| 3 | `3e6d44a` | docs: synchronize release governance status metadata（业务源码边界） |
+| 4 | `83914d1` | docs(release): add RC evidence closure artifacts |
+| 5 | `bbbfab7` | docs(release): seal RC release certificate（tag target） |
 
 ---
 
@@ -34,14 +36,15 @@
 |----|----|
 | 文件名 | `node-v0.9.0-rc1.exe` |
 | 大小 | 12,112,896 字节 |
-| SHA-256 | `17e5ce8180f66526ed06826bbe84c74949e8f01b114f2d1895aa2964bfeb0edf` |
+| SHA-256 | `90f86e9a4c4d465e1c1ea78b4930e9077532ed124a074b102ae65f254030efb6` |
 | 版本标签 | `v0.9.0-rc1` |
 
-### 历史开发工件（保留，非 RC）
+### 历史工件（保留，非 RC）
 
 | 文件名 | SHA-256 | 状态 |
 |--------|---------|------|
 | `node.exe` | `fb3d2b57dd8adbd02d3c6d501f42a2cfa3c076657694e35756967caf9307b717` | 开发工件，溯源缺口，仅本地测试 |
+| `node-v0.9.0-rc1-historical-3e6d44a.exe` | `17e5ce8180f66526ed06826bbe84c74949e8f01b114f2d1895aa2964bfeb0edf` | 打 tag 前 RC 构建，revision 与 tag target 不符 |
 
 ---
 
@@ -49,12 +52,12 @@
 
 | 参数 | 值 |
 |------|----|
-| 源码提交 | `3e6d44a248013f814859cf4f5be6feb5bc57f492` |
-| tree 哈希 | `d5065ee7714bea533674b6d723d7ec11187e47f9` |
+| 源码提交 | `bbbfab7760259ef275afcad2980c6e7b3ca12773`（tag target） |
+| tree 哈希 | `0de5660266a111e55defa1dca4a69d6c9182dff9` |
 | Go 版本 | `go1.27.0 windows/amd64` |
 | OS / 架构 | `windows / amd64` |
-| 构建命令 | `go build -trimpath -o node-rc.exe ./cmd/node` |
-| 构建标志 | `-trimpath` |
+| 构建命令 | `go build -buildvcs=true -trimpath -o node-rc.exe ./cmd/node` |
+| 构建标志 | `-buildvcs=true -trimpath` |
 
 ---
 
@@ -63,10 +66,10 @@
 | 字段 | 值 |
 |------|----|
 | `vcs` | `git` |
-| `vcs.revision` | `3e6d44a248013f814859cf4f5be6feb5bc57f492` |
-| `vcs.time` | `2026-10-02T01:52:59Z` |
+| `vcs.revision` | `bbbfab7760259ef275afcad2980c6e7b3ca12773`（**== tag target**） |
+| `vcs.time` | `2026-10-02T02:13:38Z` |
 | `vcs.modified` | `false`（干净工作树） |
-| `mod` 伪版本 | `v0.0.0-20261002015259-3e6d44a24801`（无 `+dirty`） |
+| `mod` 版本 | `v0.9.0-rc1`（tag 名，无 `+dirty`） |
 
 ---
 
@@ -84,10 +87,10 @@
 
 | 校验项 | 结果 |
 |--------|------|
-| vcs.revision 匹配 `3e6d44a` | ✅ |
+| vcs.revision 匹配 tag target `bbbfab7` | ✅ |
 | vcs.modified = false | ✅ |
-| 可复现重建哈希 | ✅ 独立重跑 `17e5ce81…` 完全一致 |
-| 历史二进制保留 | ✅ node.exe 未删除 |
+| 可复现重建哈希 | ✅ 独立 clone+checkout+重建 `90f86e9a…` 完全一致 |
+| 历史二进制保留 | ✅ node.exe + historical 均未删除 |
 
 ---
 
