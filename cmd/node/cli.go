@@ -54,7 +54,8 @@ const usageText = `p2pchain 节点与钱包工具
 
 节点选项（node / ui）:
   -listen  :6688              P2P 监听地址
-  -rpc     127.0.0.1:6689     控制接口监听地址（仅本机，无鉴权）
+  -rpc     127.0.0.1:6689     控制接口监听地址（默认仅回环；读端点无鉴权，mutation 端点需 Bearer Token）
+  -allow-non-loopback          允许控制接口监听非回环地址（危险：读端点无鉴权，确认网络隔离再开）
   -seed    host:port           种子节点地址（可留空）
   -datadir <目录>              数据目录（默认 ~/.p2pchain）
   -mine                        启用挖矿

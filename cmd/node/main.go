@@ -52,6 +52,9 @@ type nodeConfig struct {
 	MaxBlocks     int
 	Miners        int    // 并行挖矿 worker 数，<=1 表示单线程
 	AuthTokenFile string // mutation 端点 Bearer Token 文件（路径可上命令行，token 本身绝不）
+	// P0-8：允许控制接口监听非回环地址。默认为 false——控制接口的读端点无鉴权，
+	// 非回环绑定会直接暴露未鉴权接口，必须由运维显式确认（--allow-non-loopback）。
+	AllowNonLoopback bool
 	// P0-4：钱包口令文件（0600），必填；缺失/无效时节点拒绝启动（fail-closed）。
 	WalletPasswordFile string
 }
@@ -75,6 +78,12 @@ type nodeRuntime struct {
 // newNodeRuntime 按配置组装并启动节点（P2P 监听 + 控制接口 + 种子重连）。
 // 返回后节点已可接受连接与查询；不启动挖矿（由调用方决定）。
 func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
+	// P0-8：非回环绑定 fail-closed。控制接口的读端点无鉴权（见 CANONICAL-RPC-SPEC
+	// §2），-rpc 误配成 0.0.0.0/公网地址会直接暴露未鉴权接口；此前仅记一条日志警告
+	// 仍继续启动。本检查在数据目录加锁前执行——失败即无任何副作用。
+	if !isLoopback(cfg.RPCAddr) && !cfg.AllowNonLoopback {
+		return nil, fmt.Errorf("控制接口地址 %s 为非回环地址：读端点无鉴权，绑定到非回环地址会暴露未鉴权接口；\n  如确需远程访问，请显式确认风险并加 --allow-non-loopback 重新启动", cfg.RPCAddr)
+	}
 	// 第一步：独占锁定数据目录。失败（含已被占用）直接返回，绝不打开 blocks.dat。
 	lock, err := storage.AcquireDirLock(cfg.DataDir)
 	if err != nil {
@@ -214,7 +223,11 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 		return nil, fmt.Errorf("启动控制接口失败: %w", err)
 	}
 	if !isLoopback(actualRPC) {
-		log.Printf("[node] 警告：控制接口监听在 %s，非回环地址且无鉴权，请勿暴露到不可信网络", actualRPC)
+		// P0-6：旧文案「非回环地址且无鉴权」已作废——CONTROL-AUTH-1 后 6 个 mutation
+		// 端点（/send /mine /mine/start /mine/stop /console/mine /stop）已强制 Bearer Token；
+		// 无鉴权的是 7 个只读端点，它们的安全边界是回环绑定。此处只能走到显式
+		// --allow-non-loopback 确认过的非回环绑定，仍给出准确的风险提示。
+		log.Printf("[node] 警告：控制接口监听在 %s（已显式 --allow-non-loopback 确认）：只读端点无鉴权（安全边界为回环绑定），mutation 端点需 Bearer Token；请勿暴露到不可信网络", actualRPC)
 	}
 	log.Printf("[node] 控制接口已启动: %s", actualRPC)
 
@@ -366,6 +379,8 @@ type nodeFlags struct {
 	maxBlocks   int
 	miners      int
 	authTokFile string
+	// P0-8：--allow-non-loopback 开关，默认关闭。
+	allowNonLoopback bool
 	// P0-4：--wallet-password-file 开关。
 	walletPassFile string
 }
@@ -380,7 +395,11 @@ func newNodeFlagSet(errHandling flag.ErrorHandling) (*flag.FlagSet, *nodeFlags) 
 	nf := &nodeFlags{}
 	fs := flag.NewFlagSet("node", errHandling)
 	fs.StringVar(&nf.listen, "listen", ":6688", "本节点监听地址")
-	fs.StringVar(&nf.rpc, "rpc", control.DefaultAddr, "控制接口监听地址（仅本机）")
+	fs.StringVar(&nf.rpc, "rpc", control.DefaultAddr, "控制接口监听地址（默认仅回环；非回环需 --allow-non-loopback 显式确认）")
+	// P0-8：显式放行非回环绑定。控制接口读端点无鉴权，误绑 0.0.0.0 即暴露；
+	// 未传本开关时 newNodeRuntime 对非回环地址 fail-closed 拒绝启动。
+	fs.BoolVar(&nf.allowNonLoopback, "allow-non-loopback", false,
+		"允许控制接口监听非回环地址（危险：读端点无鉴权，确认已做好网络隔离再开启）")
 	// PHASE CONTROL-AUTH-1：mutation 端点 token 文件。相对路径按工作目录解析，
 	// 服务端（WorkingDirectory）与 CLI/ExecStop 同目录运行时天然一致。
 	// 只传路径，token 本身绝不进命令行/环境变量/日志。
@@ -417,14 +436,16 @@ func startNode(args []string, openConsole bool) {
 	}()
 
 	rt2, err := newNodeRuntime(nodeConfig{
-		ListenAddr:         nf.listen,
-		RPCAddr:            nf.rpc,
-		Seeds:              splitSeeds(nf.seed),
-		DataDir:            nf.dataDir,
-		Mine:               nf.mine,
-		MaxBlocks:          nf.maxBlocks,
-		Miners:             nf.miners,
-		AuthTokenFile:      nf.authTokFile,
+		ListenAddr:    nf.listen,
+		RPCAddr:       nf.rpc,
+		Seeds:         splitSeeds(nf.seed),
+		DataDir:       nf.dataDir,
+		Mine:          nf.mine,
+		MaxBlocks:     nf.maxBlocks,
+		Miners:        nf.miners,
+		AuthTokenFile: nf.authTokFile,
+		// P0-8：--allow-non-loopback 开关透传。
+		AllowNonLoopback:   nf.allowNonLoopback,
 		WalletPasswordFile: nf.walletPassFile,
 	})
 	if err != nil {
