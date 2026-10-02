@@ -87,8 +87,9 @@ func TestAllInitFailuresReleaseLock(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"wallet加载失败(wallet.json为目录)", func(dir string) {
-			if err := os.MkdirAll(filepath.Join(dir, "wallet.json"), 0o700); err != nil {
+		{"wallet加载失败(secrets/wallet.json为目录)", func(dir string) {
+			// P0-4：钱包路径已迁至 <datadir>/secrets/wallet.json
+			if err := os.MkdirAll(filepath.Join(dir, "secrets", "wallet.json"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -151,7 +152,10 @@ func TestCLIHintPresentOnLocked(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0")
+		// P0-4：子进程节点需钱包口令文件
+		pwFile := writeTestWalletPWFile(t)
+		cmd := exec.CommandContext(ctx, bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0",
+			"--wallet-password-file="+pwFile)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Start(); err != nil {
@@ -188,7 +192,10 @@ func TestCLIHintPresentOnLocked(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0")
+		// P0-4：子进程节点需钱包口令文件
+		pwFile := writeTestWalletPWFile(t)
+		cmd := exec.CommandContext(ctx, bin, "--datadir="+dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0",
+			"--wallet-password-file="+pwFile)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if runErr := cmd.Run(); runErr == nil { // 期望快速非零退出（log.Fatalf → os.Exit(1)）
@@ -224,12 +231,16 @@ func TestPanicPathReleasesLock(t *testing.T) {
 		// 子进程分支：注入 panic 并运行节点
 		dir := os.Getenv("P2PCHAIN_PANIC_DIR")
 		testPanicAtStart = func() { panic("injected panic at runtime start (PHASE P3.1 Test 7)") }
-		runNode([]string{"--datadir=" + dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0"})
+		// P0-4：panic 钩子在 newNodeRuntime 之后，需口令文件才能走到钩子
+		runNode([]string{"--datadir=" + dir, "--listen=127.0.0.1:0", "--rpc=127.0.0.1:0",
+			"--wallet-password-file=" + os.Getenv("P2PCHAIN_PANIC_PWFILE")})
 		return
 	}
 	dir := t.TempDir()
+	pwFile := writeTestWalletPWFile(t)
 	cmd := exec.Command(os.Args[0], "-test.run=^TestPanicPathReleasesLock$")
-	cmd.Env = append(os.Environ(), "P2PCHAIN_PANIC_SUBTEST=1", "P2PCHAIN_PANIC_DIR="+dir)
+	cmd.Env = append(os.Environ(), "P2PCHAIN_PANIC_SUBTEST=1", "P2PCHAIN_PANIC_DIR="+dir,
+		"P2PCHAIN_PANIC_PWFILE="+pwFile)
 	var childOut bytes.Buffer
 	cmd.Stderr = &childOut
 	cmd.Stdout = &childOut

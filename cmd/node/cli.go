@@ -46,7 +46,7 @@ const usageText = `p2pchain 节点与钱包工具
   mine          按需立即挖出区块（开发/测试用，对标 bitcoind 的 generatetoaddress）
   stop          请求运行中的节点优雅停止（释放数据目录锁后退出）
   init          显式初始化新数据目录并创建 canonical Genesis
-  wallet        查看或创建本地钱包（离线）
+  wallet        查看/创建本地加密钱包（离线；wallet encrypt 做 v1 明文迁移）
   printchain    打印本地区块链（离线，只读）
   verify        只读校验本地区块链（离线，绝不修改任何数据）
   reset         清空本地实验状态（离线，破坏性：删除链/钱包/锁）
@@ -494,28 +494,92 @@ func resolveAddress(client *control.Client, explicit string) (string, error) {
 // ---- 离线命令 ----
 
 func cmdWallet(args []string, stdout, stderr io.Writer) int {
+	// 子命令：wallet encrypt（v1 明文 → v2 加密迁移）
+	if len(args) > 0 && args[0] == "encrypt" {
+		return cmdWalletEncrypt(args[1:], stdout, stderr)
+	}
 	fs := newFlagSet("wallet", stderr)
 	dataDir := fs.String("datadir", defaultDataDir(), "数据目录")
 	addressOnly := fs.Bool("address", false, "只输出地址（便于脚本使用）")
+	pwFile := fs.String("password-file", "", "钱包口令文件（0600；P0-4 唯一口令来源）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	path := filepath.Join(*dataDir, "wallet.json")
-	w, created, err := wallet.LoadOrCreate(path)
+	// --address 无需口令：v2 信封的公钥为明文（地址本就是公开身份）。
+	if *addressOnly {
+		addr, err := wallet.LoadAddressOnly(wallet.DefaultWalletPath(*dataDir))
+		if err != nil {
+			return fail(stderr, "读取地址失败: %v", err)
+		}
+		fmt.Fprintln(stdout, addr)
+		return 0
+	}
+	if *pwFile == "" {
+		return fail(stderr, "需要口令文件：请提供 --password-file <0600 口令文件>")
+	}
+	password, err := wallet.LoadPasswordFile(*pwFile)
+	if err != nil {
+		return fail(stderr, "口令文件无效: %v", err)
+	}
+	defer wallet.ZeroBytes(password)
+	w, created, err := wallet.LoadOrCreateForDataDir(*dataDir, password)
 	if err != nil {
 		return fail(stderr, "加载/创建钱包失败: %v", err)
 	}
-	if *addressOnly {
-		fmt.Fprintln(stdout, w.Address())
-		return 0
-	}
 	if created {
-		fmt.Fprintf(stdout, "已创建新钱包: %s\n", path)
+		fmt.Fprintf(stdout, "已创建新加密钱包: %s\n", wallet.DefaultWalletPath(*dataDir))
 	} else {
-		fmt.Fprintf(stdout, "已加载钱包: %s\n", path)
+		fmt.Fprintf(stdout, "已加载钱包: %s\n", wallet.DefaultWalletPath(*dataDir))
 	}
 	fmt.Fprintf(stdout, "地址: %s\n", w.Address())
+	return 0
+}
+
+// cmdWalletEncrypt v1 明文钱包 → v2 加密钱包的迁移命令（P0-4）。
+//
+// 流程：读取旧路径 v1 → 口令加密 → 原子写入新路径 → 删除旧明文文件。
+// 拒绝覆盖已存在的新路径钱包；迁移成功后旧明文文件被删除（不留明文残留）。
+func cmdWalletEncrypt(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("wallet encrypt", stderr)
+	dataDir := fs.String("datadir", defaultDataDir(), "数据目录")
+	pwFile := fs.String("password-file", "", "钱包口令文件（0600；P0-4 唯一口令来源）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *pwFile == "" {
+		return fail(stderr, "需要口令文件：请提供 --password-file <0600 口令文件>")
+	}
+	legacyPath := wallet.LegacyWalletPath(*dataDir)
+	newPath := wallet.DefaultWalletPath(*dataDir)
+	if _, err := os.Stat(newPath); err == nil {
+		return fail(stderr, "已存在加密钱包 %s，拒绝覆盖", newPath)
+	}
+	legacyData, err := os.ReadFile(legacyPath)
+	if err != nil {
+		return fail(stderr, "未发现旧版明文钱包 %s: %v", legacyPath, err)
+	}
+	if ver, verr := wallet.DetectVersion(legacyData); verr != nil || ver != 1 {
+		return fail(stderr, "旧钱包文件不是 v1 明文格式，无需迁移")
+	}
+	w, err := wallet.LoadFromFile(legacyPath)
+	if err != nil {
+		return fail(stderr, "读取旧钱包失败: %v", err)
+	}
+	password, err := wallet.LoadPasswordFile(*pwFile)
+	if err != nil {
+		return fail(stderr, "口令文件无效: %v", err)
+	}
+	defer wallet.ZeroBytes(password)
+	if err := w.SaveEncryptedToFile(newPath, password); err != nil {
+		return fail(stderr, "写入加密钱包失败: %v", err)
+	}
+	// 迁移成功后删除旧明文文件：P0-4 的目标就是消灭明文私钥残留。
+	if err := os.Remove(legacyPath); err != nil {
+		return fail(stderr, "加密钱包已写入 %s，但删除旧明文文件失败（请手动删除 %s）: %v", newPath, legacyPath, err)
+	}
+	fmt.Fprintf(stdout, "迁移完成：%s → %s（v2 加密）；旧明文文件已删除\n", legacyPath, newPath)
+	fmt.Fprintf(stdout, "地址: %s\n请妥善备份口令文件，口令丢失则钱包无法恢复\n", w.Address())
 	return 0
 }
 
@@ -686,7 +750,9 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 //
 // 这里只列真正会落盘的文件。UTXO / mempool / 网络状态纯内存，日志只在内存
 // ring 中，没有配置文件（internal/config 是未被引用的死包），因此无需清理。
-var resetDataFiles = []string{"blocks.dat", "wallet.json"}
+// P0-4：钱包已迁移到 <datadir>/secrets/wallet.json；旧版 <datadir>/wallet.json
+// 仍列入清理（迁移残留/回滚场景）。删除顺序的意义不变（见 resetDataFiles 注释）。
+var resetDataFiles = []string{"blocks.dat", "wallet.json", filepath.Join("secrets", "wallet.json")}
 
 // resetReport 是 reset 的结果报告（-json 输出，字段风格与 verify 一致）。
 type resetReport struct {
@@ -814,6 +880,15 @@ func cmdReset(args []string, stdout, stderr io.Writer) int {
 		}
 	} else {
 		resetOne(&rep, lockPath, "node.lock")
+	}
+
+	// P0-4：secrets 目录若已空（钱包文件已删），一并清理，避免空目录残留
+	// 导致后续 init 误判"目录非空"。
+	if !aborted {
+		secretsDir := filepath.Join(*dataDir, wallet.WalletSecretsDir)
+		if entries, err := os.ReadDir(secretsDir); err == nil && len(entries) == 0 {
+			_ = os.Remove(secretsDir)
+		}
 	}
 
 	// 4) 复核：目录里是否还有任何已知状态文件（RESET-INV-01/02/03）

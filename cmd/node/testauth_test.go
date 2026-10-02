@@ -31,6 +31,19 @@ func writeTestTokenFile(t *testing.T) string {
 	return p
 }
 
+// testWalletPassword 供测试节点（-wallet-password-file）使用的固定口令。
+const testWalletPassword = "p2pchain-itest-wallet-password-0123456789"
+
+// writeTestWalletPWFile 在临时目录写出一个 0600 钱包口令文件（P0-4）。
+func writeTestWalletPWFile(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "wallet-password")
+	if err := os.WriteFile(p, []byte(testWalletPassword), 0o600); err != nil {
+		t.Fatalf("写入测试口令文件失败: %v", err)
+	}
+	return p
+}
+
 // authedClient 返回携带测试 token 的 control 客户端（mutation 调用必须用它）。
 func authedClient(rpc string) *control.Client {
 	c := control.NewClient(rpc)

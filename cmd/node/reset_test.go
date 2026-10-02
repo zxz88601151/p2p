@@ -37,14 +37,24 @@ import (
 
 // ---- 夹具 ----
 
-const stateFileNames = 3 // blocks.dat / wallet.json / node.lock
+// P0-4：可删除的状态文件 = blocks.dat + wallet.json(v1 残留) + secrets/wallet.json(v2)
+const stateFileNames = 3
 
 // seedFullState 在 dir 中建立一个「做过实验」的数据目录：链 + 钱包。
+// P0-4：同时播种新路径加密钱包与旧路径 v1 残留，验证 reset 双清。
 func seedFullState(t *testing.T, dir string, blocks int) {
 	t.Helper()
 	buildChainForVerify(t, dir, blocks)
-	if _, _, err := wallet.LoadOrCreate(filepath.Join(dir, "wallet.json")); err != nil {
-		t.Fatalf("创建钱包失败: %v", err)
+	pw := []byte("test-password-0123456789")
+	if _, _, err := wallet.LoadOrCreate(wallet.DefaultWalletPath(dir), pw); err != nil {
+		t.Fatalf("创建加密钱包失败: %v", err)
+	}
+	legacyW, err := wallet.NewWallet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyW.SaveToFile(wallet.LegacyWalletPath(dir)); err != nil { // v1 明文残留
+		t.Fatalf("创建旧版钱包失败: %v", err)
 	}
 }
 
@@ -67,7 +77,7 @@ func runResetErr(t *testing.T, dir string, extra ...string) (int, string, string
 // assertClean 断言目录里三个已知状态文件全部不存在（RESET-INV-01/02/03）。
 func assertClean(t *testing.T, dir string) {
 	t.Helper()
-	for _, name := range []string{"blocks.dat", "wallet.json", "node.lock"} {
+	for _, name := range []string{"blocks.dat", "wallet.json", filepath.Join("secrets", "wallet.json"), "node.lock"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			t.Fatalf("reset 后 %s 仍存在", name)
 		}

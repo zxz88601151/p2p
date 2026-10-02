@@ -5,6 +5,7 @@
 //   - D2 生产 Flush 生命周期（关机边界落盘 + 周期节流）；
 //   - 缺失文件 / corrupt 文件 fail-closed；
 //   - 对 canonical 链零影响。
+//
 // 明确不涉及：OnHandshake 变更、网络行为、块请求/恢复、共识路径、reorg/fork-choice。
 package main
 
@@ -22,7 +23,8 @@ func TestOrphanDurability_RuntimeInit(t *testing.T) {
 	if code := cmdInit([]string{"-datadir", dir}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
 		t.Fatalf("init failed: code=%d", code)
 	}
-	rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+	rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+		WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 	if err != nil {
 		t.Fatalf("newNodeRuntime: %v", err)
 	}
@@ -54,7 +56,8 @@ func TestOrphanDurability_RuntimeInitLoadsCheckpoint(t *testing.T) {
 		t.Fatalf("seed flush: %v", err)
 	}
 
-	rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+	rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+		WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 	if err != nil {
 		t.Fatalf("newNodeRuntime: %v", err)
 	}
@@ -82,7 +85,8 @@ func TestOrphanDurability_PersistenceAcrossRestart(t *testing.T) {
 	child := [32]byte{0xcd}
 
 	// 第一次启动：模拟 deferOrphan 的持久投影（直接 MarkDirty），干净关机触发 D2 落盘。
-	rt1, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+	rt1, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+		WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 	if err != nil {
 		t.Fatalf("newNodeRuntime#1: %v", err)
 	}
@@ -90,7 +94,8 @@ func TestOrphanDurability_PersistenceAcrossRestart(t *testing.T) {
 	rt1.Close() // 关机 flush
 
 	// 重启：应加载到同一检查点。
-	rt2, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+	rt2, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+		WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 	if err != nil {
 		t.Fatalf("newNodeRuntime#2: %v", err)
 	}
@@ -123,7 +128,8 @@ func TestOrphanDurability_CorruptCheckpointFailClosed(t *testing.T) {
 		t.Fatalf("write corrupt: %v", err)
 	}
 
-	rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+	rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+		WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 	if err != nil {
 		t.Fatalf("newNodeRuntime must not fail on corrupt checkpoint: %v", err)
 	}

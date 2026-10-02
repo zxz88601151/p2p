@@ -76,18 +76,30 @@ func runNodeBin(t *testing.T, timeout time.Duration, args ...string) cmdRun {
 // dirSnapshot 记录目录内每个文件的名字与内容哈希，用于断言「没有任何写入」。
 func dirSnapshot(t *testing.T, dir string) map[string]string {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("读取数据目录失败: %v", err)
-	}
-	snap := make(map[string]string, len(entries))
-	for _, e := range entries {
-		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+	snap := make(map[string]string)
+	// P0-4：数据目录现含 secrets/ 子目录（加密钱包），递归快照。
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("读取 %s 失败: %v", e.Name(), err)
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			snap[rel+"/"] = "dir"
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("读取 %s 失败: %v", rel, err)
 		}
 		sum := sha256.Sum256(data)
-		snap[e.Name()] = hex.EncodeToString(sum[:])
+		snap[rel] = hex.EncodeToString(sum[:])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("快照数据目录失败: %v", err)
 	}
 	return snap
 }

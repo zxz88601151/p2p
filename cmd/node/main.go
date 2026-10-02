@@ -51,6 +51,8 @@ type nodeConfig struct {
 	MaxBlocks     int
 	Miners        int    // 并行挖矿 worker 数，<=1 表示单线程
 	AuthTokenFile string // mutation 端点 Bearer Token 文件（路径可上命令行，token 本身绝不）
+	// P0-4：钱包口令文件（0600），必填；缺失/无效时节点拒绝启动（fail-closed）。
+	WalletPasswordFile string
 }
 
 // nodeRuntime 一个已启动节点的全部运行时组件。
@@ -123,15 +125,23 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	log.Printf("[node] 本地区块链已就绪: 高度=%d 链尾=%s 数据文件=%s",
 		chain.Height(), tip.Header.HashHex(), store.FilePath())
 
-	walletPath := filepath.Join(cfg.DataDir, "wallet.json")
-	nodeWallet, created, err := wallet.LoadOrCreate(walletPath)
+	// P0-4：钱包口令 fail-closed。口令只走 0600 口令文件；缺失/无效/旧版明文钱包
+	// 均拒绝启动（旧版明文需先 `p2pchain wallet encrypt` 迁移）。
+	walletPassword, err := wallet.LoadPasswordFile(cfg.WalletPasswordFile)
+	if err != nil {
+		_ = store.Close()
+		_ = lock.Release()
+		return nil, fmt.Errorf("钱包口令不可用: %w", err)
+	}
+	defer wallet.ZeroBytes(walletPassword)
+	nodeWallet, created, err := wallet.LoadOrCreateForDataDir(cfg.DataDir, walletPassword)
 	if err != nil {
 		_ = store.Close()
 		_ = lock.Release()
 		return nil, fmt.Errorf("加载/创建钱包失败: %w", err)
 	}
 	if created {
-		log.Printf("[node] 已生成新钱包: %s", walletPath)
+		log.Printf("[node] 已生成新加密钱包: %s", wallet.DefaultWalletPath(cfg.DataDir))
 	}
 	log.Printf("[node] 节点钱包地址=%s", nodeWallet.Address())
 
@@ -332,6 +342,8 @@ type nodeFlags struct {
 	maxBlocks   int
 	miners      int
 	authTokFile string
+	// P0-4：--wallet-password-file 开关。
+	walletPassFile string
 }
 
 // newNodeFlagSet 创建节点选项集。
@@ -350,6 +362,9 @@ func newNodeFlagSet(errHandling flag.ErrorHandling) (*flag.FlagSet, *nodeFlags) 
 	// 只传路径，token 本身绝不进命令行/环境变量/日志。
 	fs.StringVar(&nf.authTokFile, "auth-token-file", "secrets/control-token",
 		"mutation 端点（/send /mine /stop）Bearer Token 文件（0600；相对工作目录；缺省 secrets/control-token）")
+	// P0-4：钱包口令文件，必填。口令只走文件（0600 校验），绝不进命令行/日志。
+	fs.StringVar(&nf.walletPassFile, "wallet-password-file", "",
+		"钱包口令文件（0600；必填；缺失则节点拒绝启动）")
 	fs.StringVar(&nf.seed, "seed", "", "种子节点地址，多个用逗号分隔；留空表示作为第一个节点启动")
 	fs.StringVar(&nf.dataDir, "datadir", defaultDataDir(), "数据目录（存放区块数据与钱包）")
 	fs.BoolVar(&nf.mine, "mine", false, "是否启用挖矿")
@@ -378,14 +393,15 @@ func startNode(args []string, openConsole bool) {
 	}()
 
 	rt2, err := newNodeRuntime(nodeConfig{
-		ListenAddr:    nf.listen,
-		RPCAddr:       nf.rpc,
-		Seeds:         splitSeeds(nf.seed),
-		DataDir:       nf.dataDir,
-		Mine:          nf.mine,
-		MaxBlocks:     nf.maxBlocks,
-		Miners:        nf.miners,
-		AuthTokenFile: nf.authTokFile,
+		ListenAddr:         nf.listen,
+		RPCAddr:            nf.rpc,
+		Seeds:              splitSeeds(nf.seed),
+		DataDir:            nf.dataDir,
+		Mine:               nf.mine,
+		MaxBlocks:          nf.maxBlocks,
+		Miners:             nf.miners,
+		AuthTokenFile:      nf.authTokFile,
+		WalletPasswordFile: nf.walletPassFile,
 	})
 	if err != nil {
 		// 数据目录被另一节点占用时给出明确、可执行的用户级错误（与「数据损坏」区分）。

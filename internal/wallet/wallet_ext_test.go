@@ -116,8 +116,9 @@ func b58check(version byte, payload []byte) string {
 func TestWalletSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wallet.dat")
+	pw := []byte("test-password-0123456789")
 
-	w1, created, err := wallet.LoadOrCreate(path)
+	w1, created, err := wallet.LoadOrCreate(path, pw)
 	if err != nil {
 		t.Fatalf("创建钱包失败: %v", err)
 	}
@@ -125,7 +126,7 @@ func TestWalletSaveLoadRoundTrip(t *testing.T) {
 		t.Fatal("首次调用应创建新钱包")
 	}
 
-	w2, created, err := wallet.LoadOrCreate(path)
+	w2, created, err := wallet.LoadOrCreate(path, pw)
 	if err != nil {
 		t.Fatalf("加载钱包失败: %v", err)
 	}

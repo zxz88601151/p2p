@@ -17,7 +17,8 @@ import (
 func TestF3BExplicitInitializationStateMatrix(t *testing.T) {
 	t.Run("empty node fails closed", func(t *testing.T) {
 		dir := t.TempDir()
-		_, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+		_, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+			WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 		if !errors.Is(err, blockchain.ErrUninitializedStore) {
 			t.Fatalf("new node error = %v, want ErrUninitializedStore", err)
 		}
@@ -55,7 +56,8 @@ func TestF3BExplicitInitializationStateMatrix(t *testing.T) {
 	t.Run("matching node and verify continue", func(t *testing.T) {
 		dir := t.TempDir()
 		initTestDir(t, dir)
-		rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+		rt, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+			WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 		if err != nil {
 			t.Fatalf("matching node startup: %v", err)
 		}
@@ -69,7 +71,8 @@ func TestF3BExplicitInitializationStateMatrix(t *testing.T) {
 	t.Run("mismatch node and verify fail closed before replay", func(t *testing.T) {
 		dir := t.TempDir()
 		writeForeignGenesis(t, dir)
-		_, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+		_, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+			WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 		if !errors.Is(err, blockchain.ErrGenesisMismatch) {
 			t.Fatalf("node mismatch error = %v, want ErrGenesisMismatch", err)
 		}
@@ -94,7 +97,8 @@ func TestF3BExplicitInitializationStateMatrix(t *testing.T) {
 				if err := os.WriteFile(path, tc.data, 0o600); err != nil {
 					t.Fatal(err)
 				}
-				_, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0"})
+				_, err := newNodeRuntime(nodeConfig{DataDir: dir, ListenAddr: "127.0.0.1:0", RPCAddr: "127.0.0.1:0",
+					WalletPasswordFile: mustTestWalletPasswordFile(t, dir)})
 				if err == nil {
 					t.Fatal("node unexpectedly started")
 				}

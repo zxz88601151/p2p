@@ -41,6 +41,7 @@ import (
 	"p2pchain/internal/blockchain"
 	"p2pchain/internal/control"
 	"p2pchain/internal/storage"
+	"p2pchain/internal/wallet"
 )
 
 // ---- 真实子进程辅助 ----
@@ -103,8 +104,11 @@ func startRealNode(t *testing.T, dir string, extra ...string) *realNode {
 	listen := freePort(t)
 	// PHASE CONTROL-AUTH-1：子进程节点同样启用 mutation 认证（fail-closed 契约）。
 	tokenFile := writeTestTokenFile(t)
+	// P0-4：子进程节点同样需要钱包口令文件（fail-closed 契约）。
+	pwFile := writeTestWalletPWFile(t)
 
-	args := []string{"-datadir", dir, "-listen", listen, "-rpc", rpc, "-auth-token-file", tokenFile}
+	args := []string{"-datadir", dir, "-listen", listen, "-rpc", rpc, "-auth-token-file", tokenFile,
+		"-wallet-password-file", pwFile}
 	args = append(args, extra...)
 
 	cmd := exec.Command(bin, args...)
@@ -345,7 +349,8 @@ func TestStopPreservesChainAndWallet(t *testing.T) {
 		t.Fatalf("挖矿失败: %v", err)
 	}
 	before := map[string][]byte{}
-	for _, name := range []string{"blocks.dat", "wallet.json"} {
+	// P0-4：钱包路径已迁至 <datadir>/secrets/wallet.json
+	for _, name := range []string{"blocks.dat", filepath.Join(wallet.WalletSecretsDir, wallet.WalletFileName)} {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatalf("读取 %s 失败: %v", name, err)
