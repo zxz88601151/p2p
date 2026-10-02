@@ -5,7 +5,7 @@
 //   - 只做本机控制，不做远程钱包服务。默认绑定 127.0.0.1。
 //   - 读端点（GET /status /balance /utxos /block /blocks /logs）无鉴权——
 //     回环绑定即是其安全边界（Explorer 依赖这些端点，保持免认证）。
-//   - mutation 端点（POST /send /mine /stop）自 PHASE CONTROL-AUTH-1 起要求
+//   - mutation 端点（POST /send /mine/start /mine/stop /stop）自 PHASE CONTROL-AUTH-1 起要求
 //     Bearer Token（授权头：Authorization: Bearer <token>），认证失败统一 401
 //     并带固定延迟；未配置 token 时 fail-closed（一律 401）。
 //   - 即便如此仍绝不可绑定到公网地址（远程管理走 SSH 隧道，属 Option A 基线）。
@@ -261,7 +261,7 @@ type Server struct {
 	stopHook func()
 	stopOnce sync.Once
 
-	// authToken 为 mutation 端点（/send /mine /stop）的 Bearer Token
+	// authToken 为 mutation 端点（/send /mine/start /mine/stop /stop）的 Bearer Token
 	//（PHASE CONTROL-AUTH-1，Option E-lite 冻结设计）。
 	// 为空（未配置）时 mutation 端点 fail-closed：一律 401；读端点不受影响。
 	authToken string
@@ -284,7 +284,7 @@ func NewServer(node Node) *Server {
 	return &Server{node: node, authFailureDelay: defaultAuthFailureDelay}
 }
 
-// SetAuthToken 设置 mutation 端点（/send /mine /stop）的 Bearer Token。
+// SetAuthToken 设置 mutation 端点（/send /mine/start /mine/stop /stop）的 Bearer Token。
 // 必须在 Start 之前调用。传入空串等价于「未配置」：mutation 端点保持
 // fail-closed（一律 401）。token 来源文件请用 LoadTokenFile 读取，
 // 绝不通过命令行参数或环境变量传递 token 本身。

@@ -1,6 +1,8 @@
 // p06_p08_regression_test.go 回归测试：
-//   - P0-6：控制接口「无鉴权」误导文案已修正（mutation 6 端点已 Bearer 认证，
+//   - P0-6：控制接口「无鉴权」误导文案已修正（mutation 端点已 Bearer 认证，
 //     只有只读端点无鉴权；help 文案不再笼统写「无鉴权」）；
+//     注：mutation 端点原为 6 条，按需出块下线后为 4 条
+//     （/send /mine/start /mine/stop /stop）。
 //   - P0-8：-rpc 指向非回环地址时默认 fail-closed 拒绝启动，必须显式
 //     --allow-non-loopback 确认（此前仅记一条日志警告仍继续启动）。
 package main

@@ -2,7 +2,7 @@ package main
 
 // PHASE CONTROL-AUTH-1 测试共享凭据 helper。
 //
-// 背景自 PHASE CONTROL-AUTH-1 起，mutation 端点（POST /send /mine /stop）
+// 背景自 PHASE CONTROL-AUTH-1 起，mutation 端点（POST /send /mine/start /mine/stop /stop）
 // 要求 Bearer Token（fail-closed：未配置即 401）。既有生命周期/全栈测试
 // 需要以「已授权客户端」身份访问 mutation 端点，故统一经由本文件的
 // 测试 token 与 helper。token 为临时测试凭据，严禁替换为真实生产 token。

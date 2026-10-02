@@ -206,11 +206,11 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 	}
 
 	ctl := control.NewServer(svc)
-	// PHASE CONTROL-AUTH-1：mutation 端点（/send /mine /stop）启用 Bearer Token。
+	// PHASE CONTROL-AUTH-1：mutation 端点（/send /mine/start /mine/stop /stop）启用 Bearer Token。
 	// token 文件缺失/无效时 fail-closed：mutation 一律 401，读端点不受影响。
 	// 日志只记路径与结论，绝不记 token 内容。
 	if tok, tokErr := control.LoadTokenFile(cfg.AuthTokenFile); tokErr != nil {
-		log.Printf("[node] 警告：mutation token 不可用（%v）；/send /mine /stop 已禁用（fail-closed），读端点不受影响", tokErr)
+		log.Printf("[node] 警告：mutation token 不可用（%v）；/send /mine/start /mine/stop /stop 已禁用（fail-closed），读端点不受影响", tokErr)
 	} else {
 		ctl.SetAuthToken(tok)
 		log.Printf("[node] mutation 端点认证已启用（token 文件: %s）", cfg.AuthTokenFile)
@@ -223,8 +223,9 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 		return nil, fmt.Errorf("启动控制接口失败: %w", err)
 	}
 	if !isLoopback(actualRPC) {
-		// P0-6：旧文案「非回环地址且无鉴权」已作废——CONTROL-AUTH-1 后 6 个 mutation
-		// 端点（/send /mine /mine/start /mine/stop /console/mine /stop）已强制 Bearer Token；
+		// P0-6：旧文案「非回环地址且无鉴权」已作废——CONTROL-AUTH-1 后 mutation 端点
+		// 已强制 Bearer Token（现存 4 条：/send /mine/start /mine/stop /stop；按需出块
+		// /mine 与 /console/mine 已在 ON-DEMAND-MINING-REMOVAL-1 整体下线）；
 		// 无鉴权的是 7 个只读端点，它们的安全边界是回环绑定。此处只能走到显式
 		// --allow-non-loopback 确认过的非回环绑定，仍给出准确的风险提示。
 		log.Printf("[node] 警告：控制接口监听在 %s（已显式 --allow-non-loopback 确认）：只读端点无鉴权（安全边界为回环绑定），mutation 端点需 Bearer Token；请勿暴露到不可信网络", actualRPC)
@@ -404,7 +405,7 @@ func newNodeFlagSet(errHandling flag.ErrorHandling) (*flag.FlagSet, *nodeFlags) 
 	// 服务端（WorkingDirectory）与 CLI/ExecStop 同目录运行时天然一致。
 	// 只传路径，token 本身绝不进命令行/环境变量/日志。
 	fs.StringVar(&nf.authTokFile, "auth-token-file", "secrets/control-token",
-		"mutation 端点（/send /mine /stop）Bearer Token 文件（0600；相对工作目录；缺省 secrets/control-token）")
+		"mutation 端点（/send /mine/start /mine/stop /stop）Bearer Token 文件（0600；相对工作目录；缺省 secrets/control-token）")
 	// P0-4：钱包口令文件，必填。口令只走文件（0600 校验），绝不进命令行/日志。
 	fs.StringVar(&nf.walletPassFile, "wallet-password-file", "",
 		"钱包口令文件（0600；必填；缺失则节点拒绝启动）")

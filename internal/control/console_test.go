@@ -487,7 +487,11 @@ func TestConsoleHiddenAttributeIsEffective(t *testing.T) {
 // TestConsoleReadRequestsHaveTimeout §11：接口「连得上但不回」时不得产生 stale status。
 // 缺少超时的 fetch 会永久挂起，而轮询采用单飞去重，一次挂起会让之后所有 tick 复用同一个
 // 未落定的 Promise —— 轮询彻底停摆，UI 永久停留在陈旧的 Online。
-// 同时必须保证 /mine 不带这个短超时：出块耗时不确定，套用短超时会把正常出块误判为失败。
+//
+// 同时锁定「页面只读」：按需出块（POST /mine、POST /console/mine）已全量下线，
+// 控制台页面零凭据 ⇒ 页面内不得再构造任何 mutation 请求。原「出块请求不得带短超时」
+// 的断言随该端点下线而失去断言对象（会退化为永真的空断言），故改写为更强的形式：
+// 整页只允许 jget 这一个 fetch，且不得出现 method: 声明。
 func TestConsoleReadRequestsHaveTimeout(t *testing.T) {
 	_, srv := newConsoleTestPair(t, &fakeNode{}, nil)
 	_, body, _ := getBody(t, srv.URL+"/")
@@ -500,11 +504,16 @@ func TestConsoleReadRequestsHaveTimeout(t *testing.T) {
 			t.Fatalf("jget 缺少读取超时防护（接口挂起会让单飞轮询永久停摆）: %q", need)
 		}
 	}
-	// PHASE CONSOLE-MINE-AUTH-FIX-1：控制台出块改走同源端点 /console/mine
-	//（/mine 受 Bearer Token 保护，页面无凭据恒 401）。断言路径随之更新——
-	// 若仍写死 "/mine"，正则会静默失配，令本用例退化为空断言。
-	if regexp.MustCompile(`fetch\(API \+ "/console/mine"[\s\S]{0,600}?signal`).MatchString(body) {
-		t.Fatal("/console/mine 不应携带读取超时信号：出块耗时不确定，短超时会把正常出块误判为失败")
+
+	// 页面只读：唯一允许的 fetch 在 jget 内（带读取超时）。任何新增的裸 fetch 或
+	// method: 构造都意味着页面开始直接发请求 —— 那正是必须重新审视「超时 + 凭据」
+	// 的时刻，必须显式改动本断言并说明理由。
+	if n := strings.Count(body, "fetch("); n != 1 {
+		t.Fatalf("控制台页面应恰好 1 处 fetch（jget 的读取超时包装），实际 %d 处；"+
+			"新增 fetch 必须同时说明其超时与凭据策略", n)
+	}
+	if regexp.MustCompile(`\bmethod\s*:`).MatchString(body) {
+		t.Fatal("控制台页面零凭据，不得构造 mutation 请求（发现 method: 声明）")
 	}
 }
 

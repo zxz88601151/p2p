@@ -32,7 +32,7 @@ func NewClient(addr string) *Client {
 	}
 }
 
-// SetToken 设置 mutation 请求（POST /send /mine /stop）携带的 Bearer Token；
+// SetToken 设置 mutation 请求（POST /send /mine/start /mine/stop /stop）携带的 Bearer Token；
 // 空串表示不携带。token 仅保存在内存中，绝不写入日志或错误信息。
 // 非 goroutine-safe：调用方应在并发使用前完成设置。
 func (c *Client) SetToken(tok string) { c.token = tok }

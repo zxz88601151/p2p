@@ -4,7 +4,7 @@ package control_test
 //
 // 冻结契约（CONTROL-PLANE AUTH DESIGN / IMPLEMENTATION）：
 //   - 读端点（GET /status /balance /utxos /block /blocks /logs）无 token = 原有行为；
-//   - mutation 端点（POST /send /mine /stop）：missing/invalid/wrong token → 统一 401；
+//   - mutation 端点（POST /send /mine/start /mine/stop /stop）：missing/invalid/wrong token → 统一 401；
 //   - 有效 token → 进入既有 handler（原有行为不变）；
 //   - 认证失败固定延迟（本文件中单独用例验证），无锁定/黑名单/全局限流；
 //   - 失败响应不回显 token、无 panic/stack trace；

@@ -51,6 +51,7 @@
 | `README.md` | 端点表重写（含鉴权列）、CLI 示例改 `-mine -maxblocks`、Console 描述去掉「+ 按需出块」 |
 | `PROJECT-AI-CONTEXT.md` | 端点表 + CLI 子命令列表同步 |
 | `scripts/smoke-e2e.sh` | 出块路径改造（见 §3） |
+| `scripts/verify-mining-sync-gate.sh` | **新建**：把本报告的验收清单固化为只读复核脚本（见 §8） |
 
 ### 1.4 测试改造
 
@@ -63,6 +64,7 @@
 | `cmd/node/cli_auth_test.go` | 删 `cliFakeNode.Mine`；`TestCLIMine*` → `TestCLIStopTokenFile*`（同走 `LoadTokenFile`）+ 新增 `TestCLIMineSubcommandRemoved` |
 | `cmd/node/testauth_test.go` | 新增 `mineViaRPC` / `postMineLifecycle` / `waitMiningStopped` helper |
 | `cmd/node/stop_lifecycle_test.go`、`seed_parallel_test.go`、`p2p_branch_process_test.go`、`explorer_api_test.go` | 6 + 1 + 1 + 1 处 `Mine(n)` 调用改走持续挖矿生命周期 / `-mine -maxblocks N` |
+| `internal/control/console_test.go` | `TestConsoleReadRequestsHaveTimeout` 中的「`/console/mine` 不带短超时」断言在端点下线后退化为空断言 ⇒ 改写为「整页只允许 1 处 `fetch(`（`jget`）且无 `method:` 声明」的更强只读锁（详见 §4.7 R1） |
 | `cmd/node/mining_sync_gate_test.go` | `TestMiningSyncGateDoesNotAffectOnDemandMine` **已删除**（断言对象已不存在） |
 
 ---
@@ -147,27 +149,30 @@ go vet ./...     → exit 0
 [contract] timeout : 25m
 
 ?   	p2pchain/cmd/explorer	[no test files]
-ok  	p2pchain/cmd/node	759.455s
-ok  	p2pchain/internal/block	1.000s
-ok  	p2pchain/internal/blockchain	87.783s
-ok  	p2pchain/internal/blocktree	0.311s
+ok  	p2pchain/cmd/node	775.743s
+ok  	p2pchain/internal/block	0.459s
+ok  	p2pchain/internal/blockchain	87.178s
+ok  	p2pchain/internal/blocktree	0.487s
 ?   	p2pchain/internal/config	[no test files]
-ok  	p2pchain/internal/control	3.649s
-ok  	p2pchain/internal/explorer	0.488s
-ok  	p2pchain/internal/mempool	33.836s
-ok  	p2pchain/internal/obs	0.425s
-ok  	p2pchain/internal/p2p	21.748s
-ok  	p2pchain/internal/pow	3.706s
-ok  	p2pchain/internal/storage	305.749s
-ok  	p2pchain/internal/transaction	0.346s
-ok  	p2pchain/internal/txbuild	0.395s
-ok  	p2pchain/internal/utxo	0.423s
-ok  	p2pchain/internal/wallet	19.846s
+ok  	p2pchain/internal/control	4.078s
+ok  	p2pchain/internal/explorer	0.545s
+ok  	p2pchain/internal/mempool	36.163s
+ok  	p2pchain/internal/obs	0.402s
+ok  	p2pchain/internal/p2p	21.888s
+ok  	p2pchain/internal/pow	3.778s
+ok  	p2pchain/internal/storage	319.571s
+ok  	p2pchain/internal/transaction	0.402s
+ok  	p2pchain/internal/txbuild	0.394s
+ok  	p2pchain/internal/utxo	0.432s
+ok  	p2pchain/internal/wallet	21.930s
 
-→ 15 包 ok / 0 FAIL / exit 0（总耗时 12m57s）
+→ 15 包 ok / 0 FAIL / exit 0（总耗时 13m18s）
 ```
 
-> 注：`cmd/node` 单包 759.455s，**超过 Go 每包默认超时 600s**。这不是缺陷，
+> 上表为**最终树**（含 §4.7 残留清扫）的回归结果。清扫前的首次回归为
+> `cmd/node 759.455s`，同样 15 包 ok / 0 FAIL；两次均在 25m 契约内。
+>
+> 注：`cmd/node` 单包 775.743s，**超过 Go 每包默认超时 600s**。这不是缺陷，
 > 而是仓库既有的已知边界（`docs/TEST-EXECUTION-CONTRACT.md` 记录实测 583.5–605.3s），
 > canonical 入口已把 `TEST_TIMEOUT` 固化为 25m。
 
@@ -220,6 +225,38 @@ TTL 过期→忽略；TTL 未过期→生效；多对端取「有效且更重者
 （尝试直接复用失败：`DLL load failed while importing QtCore`），当前 Python 环境无可用安装。
 GUI 侧的结论仅为**静态验证**（语法 + 引用审计）。建议在有 PySide6 的环境补跑一次 GUI 全功能测试。
 
+### 4.7 `/mine` 残留引用全仓库清扫（清单项 2）
+
+清扫范围：全仓库，**排除** `dist/`（独立 module 的冻结归档）与 `docs/reports-archive/`。
+
+**必须为零的项 —— 全部为零**：
+
+| 检查项 | 命令 | 结果 |
+|---|---|---|
+| 控制面路由注册 | `grep -n 'HandleFunc("/mine' internal/control/*.go` | 仅 `/mine/start`、`/mine/stop` ✓ |
+| Go 源码精确字面量 `"/mine"` | `grep -rn '"/mine"' --include=*.go cmd/ internal/` | 命中**全部是负例测试**（断言 404）与注释 ✓ |
+| CLI 子命令表 `"mine"` | `grep -rn '"mine"' cmd/node/*.go` | 仅 `-mine` 启动开关 + 负例测试 ✓ |
+| Console 页面痕迹 | banned strings 逐条 `grep -cF` | 7/7 全部为 0 ✓ |
+| GUI 页面 | `do_mine` / `btn_mine` / `ClientClient.mine` | 0 残留 ✓ |
+
+**清扫中发现并修复的 3 处真实残留**（第一轮提交后追加）：
+
+| # | 位置 | 问题 | 处置 |
+|---|---|---|---|
+| R1 | `internal/control/console_test.go` `TestConsoleReadRequestsHaveTimeout` | 原断言「`/console/mine` 不得带短超时」在该端点下线后**退化为永真的空断言**（负向匹配不存在的模式） | 改写为**更强**的形式：整页只允许 1 处 `fetch(`（即 `jget` 的读取超时包装），且不得出现 `method:` 声明 —— 同时锁定「页面只读、零凭据」 |
+| R2 | `cmd/node/main.go` 的 `-auth-token-file` **帮助文案**（用户可见） | 仍写 `mutation 端点（/send /mine /stop）` | 改为 `（/send /mine/start /mine/stop /stop）` |
+| R3 | `cmd/node/main.go` 启动日志 + `internal/control/server.go`（3 处）/`client.go`/`auth_test.go`/`testauth_test.go`/`p06_p08_regression_test.go` 注释 | 仍把 `/mine` 列为现存 mutation 端点 | 全部改为 4 条现存的端点列表 |
+
+**保留不改的命中（有意）**：
+
+- `docs/PHASE-*.md`、`docs/PHASE-BRAND-0D.*`、`docs/PHASE-PRODUCT-DEV-1C*`、
+  `docs/PHASE-P2PCHAIN-A1-*` 等**历史阶段报告**：它们是**时点记录**，改写即伪造历史；
+  仓库约定由 `docs/reports-archive/` 承载归档，`CANONICAL-*` 才随实现更新。
+- `internal/explorer/explorer_test.go`：该用例**断言 Explorer 的 app.js 不得引用 `/mine`**
+  （Explorer 只代理 `/api/mine/start|stop`）—— 是**保护性断言**，且它一直在通过，
+  反过来证明 Explorer 侧从未存在按需出块入口。
+- 编译产物二进制（`*.exe`，已被 `.gitignore` 排除）。
+
 ---
 
 ## §5 设计 §4 改写结果（`ON-DEMAND-MINING-REMOVAL-1` 的核心决策）
@@ -261,16 +298,52 @@ GUI 侧的结论仅为**静态验证**（语法 + 引用审计）。建议在有
 ## §7 变更规模
 
 ```
-24 files changed, 635 insertions(+), 556 deletions(-)     （tracked）
+提交 1（9a5c582）：27 files changed, 1453 insertions(+), 556 deletions(-)
+提交 2（残留清扫）：见 git log —— 1 处空断言改写 + 6 处端点列表注释/文案修正
 + cmd/node/mining_sync_gate_test.go（新建）
 + MINING-SYNC-GATE-1-DESIGN.md（新建）
 ```
 
 `internal/` 侧改动**全部**落在 `internal/control/*`（控制面）—— 共识 / 存储 / P2P 零改动。
 
+> 提交边界守卫：`bash scripts/git-guard.sh` → **GUARD RESULT: PASS (27 paths checked)**。
+> `/gui/` 为治理禁止跟踪目录（D-WT §4.5，外部辅助工具），**GUI 改动不入 Git**（见 §4.6）。
+
 ---
 
-## §8 观察到的既有问题（**不在本阶段范围，仅登记**）
+## §8 一键复核脚本（`scripts/verify-mining-sync-gate.sh`）
+
+为便于独立复核，上述四项清单已固化为**只读**脚本（不修改文件、不提交、不推送、不启停节点）：
+
+```bash
+bash scripts/verify-mining-sync-gate.sh          # [1][2][3] + 专项测试 + build/vet
+bash scripts/verify-mining-sync-gate.sh --full   # 追加 canonical 全量回归（约 13 分钟）
+bash scripts/verify-mining-sync-gate.sh <基线ref> # 覆盖默认阶段前基线（默认 4676217）
+```
+
+本次执行结果：
+
+```
+== [1] 同步门代码三处（peerHeights 写入 / 过期 / 判定）      → 4 PASS
+== [2] /mine 残留引用（全仓库 grep）                        → 5 PASS
+== [3] internal/ 零改动断言（相对 4676217）                  → 14 PASS
+== [4] 测试（专项 + build + vet）                            → 3 PASS
+
+  PASS 25 项，FAIL 0 项
+  全部通过。   （exit 0）
+```
+
+脚本内建的关键断言（不只是打印，会 FAIL）：
+
+- 闸门插入点行号 **必须小于** `switch mineOnce(...)` 的行号 —— 从结构上保证「未就绪时不执行 PoW」；
+- `internal/` 的改动**必须全部**落在 `internal/control/`，且 `blockchain / pow / utxo /
+  storage / p2p / blocktree / mempool / transaction / block / wallet / config` 逐个断言零改动；
+- 精确字面量 `"/mine"` 的命中**必须全部**是 `*_test.go` 或注释行；
+- Console 页面 `fetch(` 计数**必须恰好为 1** 且无 `method:` 声明。
+
+---
+
+## §9 观察到的既有问题（**不在本阶段范围，仅登记**）
 
 | # | 问题 | 说明 |
 |---|---|---|
@@ -280,7 +353,7 @@ GUI 侧的结论仅为**静态验证**（语法 + 引用审计）。建议在有
 
 ---
 
-## §9 结论
+## §10 结论
 
 | 验收项 | 结果 |
 |---|---|
