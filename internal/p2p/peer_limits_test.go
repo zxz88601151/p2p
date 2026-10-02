@@ -110,15 +110,16 @@ func TestHandshakeQuotaEnforced(t *testing.T) {
 	waitFor(t, func() bool { return n1.PeerCount() == 0 }, 5*time.Second, "静默连接未清理")
 }
 
-// TestInboundCapEnforced R1-B：入站连接至多 maxInbound(125) 个（含已完成握手者），
+// TestInboundCapEnforced R1-B：入站连接至多 maxInbound 个（含已完成握手者），
 // 超额连接被立即拒绝；对端总数仍受 maxPeers(128) 约束。
+// P0-5：maxInbound = maxPeers - maxOutboundReserved（112），引用常量而非硬编码。
 // 顺序拨入 + 即时握手，使「未握手配额」不成为干扰因素。
 func TestInboundCapEnforced(t *testing.T) {
 	h1 := &recordHandler{}
 	n1, addr1 := startTestNode(t, h1)
 	defer n1.Stop()
 
-	const capInbound = 125 // 与生产常量一致
+	const capInbound = p2p.MaxInbound // 与生产常量一致（P0-5：112）
 	accepted, rejected := 0, 0
 	// 必须持有全部已接受连接的引用：否则 conn 被循环覆盖失引后，GC 的
 	// os.File finalizer 会提前关闭 fd，节点侧将其当作断开清理出注册表，

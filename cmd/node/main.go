@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -234,19 +235,26 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 }
 
 // connectSeeds 尝试连接全部尚未连接的种子节点。
-func (rt *nodeRuntime) connectSeeds() {
+// connectSeeds 补齐种子连接，返回是否全部种子已连接。
+//
+// P0-5：种子走 ConnectToSeed 优先通道——满员时驱逐价值最低的入站腾出槽位，
+// 入站挤占攻击下种子永远有路（此前满员直接放弃）。
+func (rt *nodeRuntime) connectSeeds() bool {
 	connected := make(map[string]bool)
 	for _, a := range rt.p2p.PeerAddrs() {
 		connected[a] = true
 	}
+	allConnected := true
 	for _, seed := range rt.seeds {
 		if seed == "" || connected[seed] {
 			continue
 		}
-		if err := rt.p2p.ConnectToPeer(seed); err != nil {
+		if err := rt.p2p.ConnectToSeed(seed); err != nil {
 			log.Printf("[p2p] 连接种子节点 %s 失败: %v", seed, err)
+			allConnected = false
 		}
 	}
+	return allConnected
 }
 
 // watchSeeds 周期性补齐与种子节点的连接。
@@ -254,26 +262,42 @@ func (rt *nodeRuntime) connectSeeds() {
 // 为什么要重连：种子节点重启、网络抖动都会让连接消失，而单链 PoW 节点如果
 // 掉线后再也不重连，就会永久成为一个「孤岛链」——继续挖自己的分叉。
 // 这里用「只补不足」的简单策略：已连接的种子不动，缺失的才重连。
+// watchSeeds 周期性补齐与种子节点的连接。
+//
+// P0-5：固定 5s 改为抖动指数退避——全连上则回到基准周期；有种子未连上则
+// 退避增长（5s→10s→20s…上限 5min，±20% 抖动），防惊群与重连指纹。
+// 退避只影响"补连尝试频率"，不影响已建立连接。
 func (rt *nodeRuntime) watchSeeds() {
 	if len(rt.seeds) == 0 {
 		return
 	}
 	go func() {
-		ticker := time.NewTicker(seedReconnectInterval)
-		defer ticker.Stop()
+		backoff := seedReconnectInterval
 		for {
+			// ±20% 抖动
+			half := int64(backoff) / 10
+			jitter := time.Duration(rand.Int63n(2*half+1) - half)
+			timer := time.NewTimer(backoff + jitter)
 			select {
 			case <-rt.stopPeer:
+				timer.Stop()
 				return
-			case <-ticker.C:
-				rt.connectSeeds()
+			case <-timer.C:
+			}
+			if rt.connectSeeds() {
+				backoff = seedReconnectInterval // 全连上：回到基准
+			} else if backoff < seedReconnectMaxBackoff {
+				backoff *= 2 // 有缺口：指数退避
 			}
 		}
 	}()
 }
 
-// seedReconnectInterval 种子节点重连检查周期。
-const seedReconnectInterval = 5 * time.Second
+// seedReconnectInterval 种子节点重连基准周期；seedReconnectMaxBackoff 退避上限。
+const (
+	seedReconnectInterval   = 5 * time.Second
+	seedReconnectMaxBackoff = 5 * time.Minute
+)
 
 // Close 关闭节点持有的全部资源。
 //

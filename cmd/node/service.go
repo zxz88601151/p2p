@@ -418,16 +418,20 @@ func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 	var payload p2p.BlockPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		log.Printf("[node] 解析区块广播失败（来自 %s）: %v", peerAddr, err)
+		// P0-5：畸形消息记分（重复发送畸形块的对端会被封禁）。
+		s.net.Penalize(peerAddr, 10, "区块广播解析失败")
 		return
 	}
 	rawBytes, err := hex.DecodeString(payload.Encoded)
 	if err != nil {
 		log.Printf("[node] 区块编码非法（来自 %s）: %v", peerAddr, err)
+		s.net.Penalize(peerAddr, 10, "区块编码非法")
 		return
 	}
 	b, err := block.DecodeBlock(rawBytes)
 	if err != nil {
 		log.Printf("[node] 区块解码失败（来自 %s）: %v", peerAddr, err)
+		s.net.Penalize(peerAddr, 10, "区块解码失败")
 		return
 	}
 
@@ -435,6 +439,10 @@ func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 	switch {
 	case err != nil:
 		log.Printf("[node] 区块拒绝（来自 %s）: %v", peerAddr, err)
+		// P0-5：共识层拒绝的非法块是明确的不良行为：记分并立即断开，
+		// 防止其零成本无限重发垃圾块占据连接位。
+		s.net.Penalize(peerAddr, 50, "发送共识非法区块")
+		s.net.Disconnect(peerAddr, "发送共识非法区块")
 		return
 	case orphan:
 		log.Printf("[node] 区块 %s 父块 %s 未知，已发起 by-hash 分支拉取",
@@ -456,16 +464,19 @@ func (s *nodeService) OnNewTx(peerAddr string, raw json.RawMessage) {
 	var payload p2p.TxPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		log.Printf("[node] 解析交易广播失败（来自 %s）: %v", peerAddr, err)
+		s.net.Penalize(peerAddr, 10, "交易广播解析失败")
 		return
 	}
 	rawBytes, err := hex.DecodeString(payload.Encoded)
 	if err != nil {
 		log.Printf("[node] 交易编码非法（来自 %s）: %v", peerAddr, err)
+		s.net.Penalize(peerAddr, 10, "交易编码非法")
 		return
 	}
 	tx, err := transaction.DecodeTx(rawBytes)
 	if err != nil {
 		log.Printf("[node] 交易解码失败（来自 %s）: %v", peerAddr, err)
+		s.net.Penalize(peerAddr, 10, "交易解码失败")
 		return
 	}
 
@@ -479,6 +490,11 @@ func (s *nodeService) OnNewTx(peerAddr string, raw json.RawMessage) {
 
 // OnGetBlocks 响应区块同步请求。
 func (s *nodeService) OnGetBlocks(peerAddr string, payload p2p.GetBlocksPayload) {
+	// P0-5：同步请求洪水检测（超限自动记分，本次请求直接忽略）。
+	if s.net.NoteSyncRequest(peerAddr) {
+		log.Printf("[node] 来自 %s 的 get_blocks 请求过于频繁，已忽略", peerAddr)
+		return
+	}
 	count := payload.Count
 	if count <= 0 || count > MaxSyncBatch {
 		count = MaxSyncBatch

@@ -63,7 +63,8 @@ const (
 	handshakeTimeout = 10 * time.Second
 	// R1-B（SEC-CLOSE MUST FIX 2）：连接资源限额，堵住无上限 accept 的资源耗尽面
 	//（连接洪水 / 慢握手槽位占用 / 日食式连接挤占）。测试按生产值直接验证。
-	maxInbound     = 125 // 入站连接上限（含未完成握手者）
+	// P0-5：maxInbound 移到 eclipse.go，= maxPeers - maxOutboundReserved（112）；
+	// 16 个槽位预留给外拨，入站挤占不再堵死外拨/种子。
 	maxPeers       = 128 // 对端总数上限（入站 + 外拨）
 	handshakeQuota = 32  // 同时处于「已注册未握手」状态的连接配额
 	// readTimeout / writeTimeout 单次读写超时。
@@ -229,6 +230,11 @@ type Node struct {
 	known    map[string]struct{}
 	closing  bool
 	listener net.Listener
+	// P0-5：不良行为记分（IP → 分数）、封禁表（IP → 解封时间）、
+	// get_blocks 洪水检测（addr → 请求时间戳）。
+	scores   map[string]*peerScore
+	banned   map[string]time.Time
+	syncReqs map[string][]time.Time
 }
 
 // NewNode 创建节点；nodeID / genesisHash 用于握手时的网络识别。
@@ -240,6 +246,9 @@ func NewNode(listenAddr, nodeID, genesisHash string, handler Handler) *Node {
 		handler:     handler,
 		peers:       make(map[string]*Peer),
 		known:       make(map[string]struct{}),
+		scores:      make(map[string]*peerScore),
+		banned:      make(map[string]time.Time),
+		syncReqs:    make(map[string][]time.Time),
 	}
 }
 
@@ -345,10 +354,27 @@ func (n *Node) ConnectToPeer(addr string) error {
 		n.mu.RUnlock()
 		return nil // 已连接
 	}
-	full := len(n.peers) >= maxPeers // R1-B：外拨预检（handleConn 侧还有第二道闸）
+	total := len(n.peers)
+	outboundN := 0
+	subnets := make(map[string]int)
+	for _, p := range n.peers {
+		if !p.inbound {
+			outboundN++
+			if ip := hostOf(p.Addr); !isLoopbackHost(ip) {
+				subnets[subnet16(ip)]++
+			}
+		}
+	}
 	n.mu.RUnlock()
-	if full {
-		return fmt.Errorf("对端总数已达上限 %d，拒绝外拨 %s", maxPeers, addr)
+	// P0-5：外拨预留——总数满但外拨预留未用满时仍允许外拨（handleConn 侧第二道闸同逻辑）。
+	if total >= maxPeers && outboundN >= maxOutboundReserved {
+		return fmt.Errorf("对端总数已达上限 %d 且外拨预留已用完，拒绝外拨 %s", maxPeers, addr)
+	}
+	// P0-5：外拨 /16 多样性（回环豁免，防整段 IP 封锁式 eclipse）。
+	if ip := hostOf(addr); !isLoopbackHost(ip) {
+		if subnets[subnet16(ip)] >= maxOutboundPer16 {
+			return fmt.Errorf("目标 /16 网段 %s 外拨已达上限 %d，拒绝外拨 %s", subnet16(ip), maxOutboundPer16, addr)
+		}
 	}
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -389,13 +415,29 @@ func (n *Node) KnownPeers() []string {
 }
 
 // learnPeer 记录一个在网络上可达的对等地址（忽略空值与自身监听地址）。
+//
+// P0-5 硬化：调用点在握手处理中（创世校验之后），只从通过创世检查的对端学习；
+// 校验地址格式（防投毒灌垃圾）；上限 maxKnownPeers，超限随机驱逐
+// （随机而非 LRU：攻击者无法预测驱逐目标定向占据）。
 func (n *Node) learnPeer(addr string) {
 	if addr == "" || addr == n.listenAddr {
 		return
 	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return
+	}
 	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, ok := n.known[addr]; ok {
+		return
+	}
+	if len(n.known) >= maxKnownPeers {
+		for k := range n.known {
+			delete(n.known, k)
+			break
+		}
+	}
 	n.known[addr] = struct{}{}
-	n.mu.Unlock()
 }
 
 // Broadcast 向全部对等节点发送消息。
@@ -619,20 +661,40 @@ func (n *Node) dropPeerByAddr(addr, reason string) {
 // handshakeQuota=已注册但尚未完成握手者（含入站与外拨）。
 func (n *Node) peerLimitRejectionLocked(peer *Peer) string {
 	total := len(n.peers)
-	inboundN, pending := 0, 0
+	inboundN, outboundN, pending := 0, 0, 0
 	for _, p := range n.peers {
 		if p.inbound {
 			inboundN++
+		} else {
+			outboundN++
 		}
 		if !p.handshaked.Load() {
 			pending++
 		}
 	}
 	if total >= maxPeers {
-		return fmt.Sprintf("对端总数已达上限 %d", maxPeers)
+		// P0-5：外拨预留——外拨连接在预留未用满时即使总数满也放行，
+		// 入站挤占攻击不再堵死外拨/种子拨号。
+		if peer.inbound || outboundN >= maxOutboundReserved {
+			return fmt.Sprintf("对端总数已达上限 %d", maxPeers)
+		}
 	}
 	if peer.inbound && inboundN >= maxInbound {
 		return fmt.Sprintf("入站连接已达上限 %d", maxInbound)
+	}
+	// P0-5：per-IP 入站上限（回环豁免，防单机多端口挤占）。
+	if peer.inbound {
+		if ip := hostOf(peer.Addr); !isLoopbackHost(ip) {
+			ipN := 0
+			for _, p := range n.peers {
+				if p.inbound && hostOf(p.Addr) == ip {
+					ipN++
+				}
+			}
+			if ipN >= maxInboundPerIP {
+				return fmt.Sprintf("来自 %s 的入站连接已达上限 %d", ip, maxInboundPerIP)
+			}
+		}
 	}
 	if pending >= handshakeQuota {
 		return fmt.Sprintf("未握手连接已达配额 %d", handshakeQuota)
@@ -646,6 +708,12 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	inbound := !outbound
 	peer := newPeer(remote, conn, inbound)
 
+	// P0-5：封禁 IP 的连接在注册前直接拒绝（按 IP 归集，防换端口绕过）。
+	if n.isBannedIP(hostOf(remote)) {
+		obs.Emit("CONN_REJECTED", "peer", remote, "reason", "banned")
+		_ = conn.Close()
+		return
+	}
 	n.mu.Lock()
 	if n.closing {
 		n.mu.Unlock()
@@ -738,6 +806,8 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 		// 未握手前只接受握手消息，避免未识别连接直接注入区块/交易
 		if !handshaked && msg.Type != MsgHandshake {
 			log.Printf("[p2p] 来自 %s 的 %s 消息在握手前到达，忽略", remote, msg.Type)
+			// P0-5：握手前乱发消息是典型的探测/攻击行为，记分。
+			n.Penalize(remote, scorePreHandshake, "握手前发送非握手消息")
 			prevCycleEnd = time.Now()
 			continue
 		}
