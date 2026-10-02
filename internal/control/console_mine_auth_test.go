@@ -1,29 +1,28 @@
 package control_test
 
-// PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1：/console/mine 认证加固测试矩阵（E6-C-1 修复）。
+// 按需出块（POST /mine 与 POST /console/mine）**下线后**的端点契约测试。
 //
-// 回归背景（E6-SECURITY-HARDENING-AUDIT-1 E6-C-1，HIGH）：
-//   - 旧 /console/mine 由「同源闸门」放行（Sec-Fetch-Site: same-origin 或
-//     Origin == 本服务源）；其信任的请求头对**非浏览器 HTTP 客户端**（curl/python）
-//     可任意伪造 ⇒ 无 Bearer 即可出块，是一条未授权 mutation 路径。
-//   - 本阶段退役该闸门：/console/mine 与 /mine 一致，仅认 Bearer Token。
+// 历史：本文件原为 PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1 的
+// /console/mine 认证加固矩阵（E6-C-1 修复）—— 当时该端点仍然存在，只是从
+// 「同源闸门放行」收紧为「强制 Bearer Token」，因为同源闸门信任的
+// Sec-Fetch-Site / Origin 对 curl / python 等非浏览器客户端可任意伪造。
 //
-// 本文件锁定以下不变量（hardened contract）：
-//  1. 无 token（无论是否伪造 Sec-Fetch-Site / Origin）→ 401，且**不触达** node.Mine；
-//  2. 伪造 Sec-Fetch-Site: same-origin（无 token）→ 401（伪造头不再是凭据）；
-//  3. 伪造 Origin == 本服务源（无 token）→ 401；
-//  4. 跨站 Origin / cross-site Sec-Fetch-Site（无 token）→ 401；
-//  5. 有效 token → 200 并真正出块（与 /mine 行为一致）；
-//  6. 非 POST → 405 + Allow: POST（既有方法守卫语义不变）；
-//  7. 控制台页面不再声明「同源可用」，不得保留零凭据可用性声明；
-//  8. /mine 仍要求 Bearer Token（加固不得削弱既有边界）。
+// 现状：按需出块已**整体下线** —— 端点、客户端方法、服务层实现、CLI 子命令
+// 全部移除。于是「401 还是 404」的问题不再成立：路由根本不存在，这是比 401
+// 更强的边界。本文件据此改写为「端点已移除」的回归锁：
+//
+//	若有人把路由加回来（哪怕加了认证），下面的用例会立刻失败。
+//
+// 锁定的不变量：
+//  1. POST /console/mine → 404，且与请求头、是否携带 token 无关；
+//  2. POST /mine → 404，同上；
+//  3. 控制台页面不再残留出块按钮与相关脚本（UI 与后端能力一致）。
 
 import (
 	"io"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
+	"strings"
 )
 
 // consoleMinePost 向 url 发送 POST，并附加 headers 指定的头；返回状态码与响应体文本。
@@ -46,145 +45,53 @@ func consoleMinePost(t *testing.T, url string, headers map[string]string, body s
 	return resp.StatusCode, string(data)
 }
 
-// newConsoleMineServer 起一个**已配置 token** 的 httptest 服务。
-// delay 传 0 以免测试被 500ms 失败延迟拖慢。
-func newConsoleMineServer(t *testing.T) (*fakeNode, *httptest.Server) {
-	t.Helper()
-	node := &fakeNode{}
-	_, srv := newAuthServer(t, node, goodToken, 0)
-	return node, srv
-}
-
-// --- 1. 伪造同源头不再放行：无 token → 401（且不触达出块）---
-
-func TestConsoleMineRejectedWithoutToken(t *testing.T) {
+// TestOnDemandMineEndpointsRemoved 锁定「按需出块端点已整体下线」。
+//
+// 输入维度刻意沿用原加固矩阵：伪造同源头、跨站 Origin、有效 token、无头。
+// 在原实现下这些维度会产生不同的状态码（401 / 200）；现在必须**一律 404** ——
+// 这恰好证明判定发生在路由层，而不是「认证层碰巧挡住」。
+func TestOnDemandMineEndpointsRemoved(t *testing.T) {
 	cases := []struct {
 		note    string
 		headers map[string]string
 	}{
-		{"伪造 Sec-Fetch-Site: same-origin", map[string]string{"Sec-Fetch-Site": "same-origin"}},
 		{"无任何头", nil},
+		{"伪造 Sec-Fetch-Site: same-origin", map[string]string{"Sec-Fetch-Site": "same-origin"}},
 		{"跨站 Origin（CSRF）", map[string]string{"Origin": "http://evil.example"}},
-		{"Sec-Fetch-Site: cross-site", map[string]string{"Sec-Fetch-Site": "cross-site"}},
-		{"cross-site 头 + 伪造同源 Origin", map[string]string{
-			"Sec-Fetch-Site": "cross-site", "Origin": "http://127.0.0.1:1",
-		}},
+		{"有效 Bearer Token", map[string]string{"Authorization": "Bearer " + goodToken}},
 	}
-	for _, c := range cases {
-		node, srv := newConsoleMineServer(t)
-		code, body := consoleMinePost(t, srv.URL+"/console/mine", c.headers, `{"count":1}`)
-		if code != http.StatusUnauthorized {
-			t.Fatalf("%s：无 token 应 401（加固后伪造头不再放行），实际 %d: %s", c.note, code, body)
-		}
-		if node.lastMineN != 0 {
-			t.Fatalf("%s：未认证请求绝不应触达出块逻辑，实际 lastMineN=%d", c.note, node.lastMineN)
+	paths := []string{"/mine", "/console/mine"}
+	for _, path := range paths {
+		for _, c := range cases {
+			_, srv := newAuthServer(t, &fakeNode{}, goodToken, 0)
+			code, body := consoleMinePost(t, srv.URL+path, c.headers, `{"count":1}`)
+			if code != http.StatusNotFound {
+				t.Fatalf("POST %s（%s）= %d, want 404（按需出块已下线，端点不应存在）: %s",
+					path, c.note, code, body)
+			}
 		}
 	}
 }
 
-// --- 2. 伪造 Origin == 本服务源（无 token）→ 401 ---
-
-func TestConsoleMineRejectsForgedSelfOrigin(t *testing.T) {
-	// 该头在旧实现下被当作同源证据放行；加固后必须被拒（它是可伪造的）。
-	node := &fakeNode{}
-	_, srv := newAuthServer(t, node, goodToken, 0)
-
-	code, body := consoleMinePost(t, srv.URL+"/console/mine",
-		map[string]string{"Origin": srv.URL}, `{"count":1}`)
-	if code != http.StatusUnauthorized {
-		t.Fatalf("伪造 Origin == 本服务源且无 token 应 401，实际 %d: %s", code, body)
-	}
-	if node.lastMineN != 0 {
-		t.Fatalf("未认证请求绝不应触达出块逻辑，实际 lastMineN=%d", node.lastMineN)
-	}
-}
-
-// --- 3. 有效 token → 200 并真正出块（与 /mine 一致）---
-
-func TestConsoleMineWithValidTokenReachesHandler(t *testing.T) {
-	node, srv := newConsoleMineServer(t)
-
-	code, body := consoleMinePost(t, srv.URL+"/console/mine",
-		map[string]string{"Authorization": "Bearer " + goodToken}, `{"count":1}`)
-	if code != http.StatusOK {
-		t.Fatalf("/console/mine 带有效 token 应 200，实际 %d: %s", code, body)
-	}
-	if node.lastMineN != 1 {
-		t.Fatalf("应真正触达出块逻辑且 count=1，实际 lastMineN=%d", node.lastMineN)
-	}
-}
-
-// --- 4. fail-closed：未配置 token 时 /console/mine 恒 401 ---
-
-func TestConsoleMineFailClosedWhenNoTokenConfigured(t *testing.T) {
-	node := &fakeNode{}
-	_, srv := newAuthServer(t, node, "", 0) // 未配置 token
-	code, _ := consoleMinePost(t, srv.URL+"/console/mine",
-		map[string]string{"Sec-Fetch-Site": "same-origin"}, `{"count":1}`)
-	if code != http.StatusUnauthorized {
-		t.Fatalf("未配置 token 时 /console/mine 应 401（fail-closed），实际 %d", code)
-	}
-	if node.lastMineN != 0 {
-		t.Fatalf("未认证请求绝不应触达出块逻辑，实际 lastMineN=%d", node.lastMineN)
-	}
-}
-
-// --- 5. 非 POST → 405 + Allow: POST（既有方法守卫语义不变）---
-
-func TestConsoleMineRejectsNonPost(t *testing.T) {
-	_, srv := newConsoleMineServer(t)
-
-	resp, err := http.Get(srv.URL + "/console/mine")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("GET /console/mine 应 405，实际 %d", resp.StatusCode)
-	}
-	if got := resp.Header.Get("Allow"); got != http.MethodPost {
-		t.Fatalf("405 应带 Allow: POST，实际 %q", got)
-	}
-}
-
-// --- 6. 控制台页面：不得保留零凭据可用性声明 ---
-
-func TestConsolePageNoLongerClaimsCredentiallessMining(t *testing.T) {
+// TestConsolePageHasNoMiningButton 控制台页面必须与后端能力一致：
+// 出块端点下线后，页面不得再保留按钮、脚本调用或「可用」声明。
+//
+// 保留「痕迹扫描」而非仅删代码：UI 与后端不一致（页面按钮必然 404）是
+// 一类典型回归，静态扫描能在无人点按钮时就抓住它。
+func TestConsolePageHasNoMiningButton(t *testing.T) {
 	_, srv := newConsoleTestPair(t, &fakeNode{}, nil)
 	_, body, _ := getBody(t, srv.URL+"/")
 
-	// 旧的「同源可用」声明必须消失（网页零凭据，出块端点已要求 token）。
-	if strings.Contains(body, "可用：POST /console/mine") {
-		t.Fatal("页面仍声明 /console/mine 同源可用 —— 加固后该声明为虚假可用性")
-	}
-	if strings.Contains(body, "可用：POST /mine count=1") {
-		t.Fatal("页面仍声明 /mine 可用 —— 虚假可用性声明")
-	}
-	// 不得再直接调用受 token 保护的 /mine。
-	if strings.Contains(body, `fetch(API + "/mine"`) {
-		t.Fatal("控制台页面仍直接调用 /mine（受 Bearer Token 保护，页面无凭据必 401）")
-	}
-}
-
-// --- 7. 既有边界不得被削弱：/mine 仍要求 token ---
-
-func TestMineEndpointStillRequiresToken(t *testing.T) {
-	node, srv := newConsoleMineServer(t)
-
-	// 无 token：401（即使伪造同源头）。
-	code, _ := consoleMinePost(t, srv.URL+"/mine",
-		map[string]string{"Sec-Fetch-Site": "same-origin"}, `{"count":1}`)
-	if code != http.StatusUnauthorized {
-		t.Fatalf("/mine 无 token 应仍为 401，实际 %d", code)
-	}
-	if node.lastMineN != 0 {
-		t.Fatalf("未认证请求绝不应触达出块逻辑，实际 lastMineN=%d", node.lastMineN)
-	}
-
-	// 有效 token：200（原有行为不变）。
-	code, body := consoleMinePost(t, srv.URL+"/mine",
-		map[string]string{"Authorization": "Bearer " + goodToken}, `{"count":1}`)
-	if code != http.StatusOK {
-		t.Fatalf("/mine 带有效 token 应 200，实际 %d: %s", code, body)
+	for _, banned := range []string{
+		`fetch(API + "/mine"`,
+		`fetch(API + "/console/mine"`,
+		`id="mineBtn"`,
+		`id="mineBtnText"`,
+		"可用：POST /console/mine",
+		"可用：POST /mine count=1",
+	} {
+		if strings.Contains(body, banned) {
+			t.Fatalf("控制台页面仍残留已下线功能的痕迹 %q（UI 必须与后端能力一致）", banned)
+		}
 	}
 }

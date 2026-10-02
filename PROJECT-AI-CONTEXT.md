@@ -384,7 +384,7 @@ else:  确定性 tie-break：tip hash 大端较大者胜
 | `/logs?tail=` | GET | 无 | 最近日志（`MaxLogTail=500`） |
 | `/console` | GET | 无 | 内嵌 Console 页面 |
 | `/send` | POST | **Bearer** | 用节点钱包转账 |
-| `/mine` `/mine/start` `/mine/stop` | POST | **Bearer** | 按需出块（并行会有 `MineConflictError`） |
+| `/mine/start` `/mine/stop` | POST | **Bearer** | 持续挖矿生命周期（冲突 ⇒ 409）。按需出块 `/mine` `/console/mine` 已全量下线（恒 404） |
 | `/stop` | POST | **Bearer** | 远程停止（未启用时 `ErrStopUnsupported`） |
 
 鉴权（`PHASE CONTROL-AUTH-1`）：`requireAuth` 中间件，**未配置 token 时 fail-closed（一律 401）**，
@@ -395,7 +395,7 @@ else:  确定性 tie-break：tip hash 大端较大者胜
 **不提供通用 `/api/*` 反向代理**；未命中白名单的请求一律在 Explorer 本地拒绝（upstreamHits == 0）。
 mutation 白名单仅 `POST /api/mine/start`、`/api/mine/stop`；token 只存在于 Explorer 进程内，**浏览器零接触**。
 
-**CLI（`cmd/node/cli.go`）**：`status / balance / utxos / send / mine / stop / init / wallet / printchain / verify / reset`（另有上层入口 `ui` / `node`）。
+**CLI（`cmd/node/cli.go`）**：`status / balance / utxos / send / stop / init / wallet / printchain / verify / reset`（另有上层入口 `ui` / `node`）。原 `mine` 子命令随按需出块全量下线。
 
 **离线只读校验 `verify`**：以只读方式打开 `blocks.dat`，逐块重跑**与启动时完全相同**的共识校验，
 输出带**失败高度 / 哈希 / 具体原因**（绝不是泛化的 "invalid"），退出码 `0=通过 / 1=不通过或无法执行 / 2=参数错误`。

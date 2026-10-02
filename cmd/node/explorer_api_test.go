@@ -150,7 +150,8 @@ func TestExplorerBlockByHashRealChain(t *testing.T) {
 	}
 }
 
-// TestExplorerRegressionRealChain 回归：/status、/block?height=、/mine 既有契约不变。
+// TestExplorerRegressionRealChain 回归：/status、/block?height= 既有契约不变；
+// 按需出块（POST /mine）已下线，端点必须返回 404。
 func TestExplorerRegressionRealChain(t *testing.T) {
 	rt, _, _ := startTestRuntime(t, false)
 	base := "http://" + rt.ctl.Addr()
@@ -180,19 +181,13 @@ func TestExplorerRegressionRealChain(t *testing.T) {
 		t.Fatalf("/block?height= 回归: code=%d body=%+v", resp.StatusCode, blk)
 	}
 
-	// POST /mine（mine=false 节点 → 按需出块可用）
-	// /mine 为 mutation 端点：PHASE CONTROL-AUTH-1 起需携带 Bearer Token。
+	// 按需出块已整体下线：POST /mine 必须不再存在（404）。
+	// 原用例断言「/mine 既有契约不变」；端点下线后该断言改为「端点已移除」，
+	// 使「误把路由加回来」这类回归立刻暴露。
 	mresp := postAuthed(t, base+"/mine", `{"count":1}`)
 	defer mresp.Body.Close()
-	var mineBody struct {
-		Mined  int `json:"mined"`
-		Height int `json:"height"`
-	}
-	if err := json.NewDecoder(mresp.Body).Decode(&mineBody); err != nil {
-		t.Fatal(err)
-	}
-	if mresp.StatusCode != http.StatusOK || mineBody.Mined != 1 || mineBody.Height != 3 {
-		t.Fatalf("/mine 回归: code=%d body=%+v", mresp.StatusCode, mineBody)
+	if mresp.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /mine 状态码 = %d, want 404（按需出块已下线）", mresp.StatusCode)
 	}
 }
 

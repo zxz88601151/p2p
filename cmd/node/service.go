@@ -150,6 +150,36 @@ type syncRequest struct {
 	nextRetry time.Time
 }
 
+// ---- MINING-SYNC-GATE：自动矿工的「同步门」（纯策略层，不触碰共识）----
+//
+// 背景：新数据目录的节点带 `-mine` 启动时，在「尚未追上网络」的窗口内会按本机
+// 链尾自铸区块（v1 规则下高度 < 2000 难度钉死 16，出块极快）；这些块随后几乎
+// 全部被对端更重的链 reorg 丢弃 —— 实测 5 分钟自铸 72 块、全部作废，纯浪费。
+//
+// 修法：让自动矿工在「本地明显落后于网络」时暂停出块，追上后自动恢复。
+// **只读对端握手时自报的高度/工作量，不新增 P2P 消息类型、不改握手协议、
+// 不改任何共识规则（高度/难度/出块规则零改动）。**
+const (
+	// miningSyncLagBlocks 是同步门容许的落后块数。
+	// 本地高度 + 该值 >= 对端最高高度 即视为已追上，允许自动挖矿。
+	// 取 5 的目的：抵消新块在网络中传播的天然抖动（本节点可能恰好比某个对端
+	// 晚几十秒收到同一批块），避免正常运行时被误判为「未追上」而误停挖矿。
+	miningSyncLagBlocks = 5
+
+	// miningSyncPeerTTL 是对端高度条目的存活时长。
+	// 本节点没有对端断开回调，条目只能靠时间自愈：超过该时长未再收到该对端的
+	// 握手即视为失效，不再参与同步门判定。这样「一个已经消失的对端」不会
+	// 永久挡住挖矿（旧节点不填 ChainWork 时按高度退化处理，语义不受影响）。
+	miningSyncPeerTTL = 10 * time.Minute
+)
+
+// peerHeightEntry 是对端最近一次握手报告的高度与累积工作量（MINING-SYNC-GATE）。
+type peerHeightEntry struct {
+	height int       // 对端握手时自报的链高
+	work   string    // 对端握手时自报的累积工作量（十进制字符串；空 = 未知/旧节点）
+	at     time.Time // 记录时刻，仅用于 TTL 过期判定
+}
+
 // nodeService 实现 p2p.Handler。
 type nodeService struct {
 	chain *blockchain.Blockchain
@@ -250,8 +280,9 @@ type nodeService struct {
 	// startHeight 是挖矿循环启动时的链高（用于回答「链是否真的在推进」）。
 	startHeight atomic.Int64
 
-	// mineMu 串行化所有挖矿入口（持续挖矿循环与按需出块），
-	// 保证任一时刻只有一个候选区块在被求解。
+	// mineMu 串行化所有挖矿入口（启动期 -mine 与 POST /mine/start 共用同一条
+	// 持续挖矿循环），保证任一时刻只有一个候选区块在被求解。
+	// 注：按需出块（原 POST /mine）已全量下线，不再是入口之一。
 	mineMu sync.Mutex
 
 	// minerLife 是持续挖矿生命周期管理器（PHASE MINING-LIFECYCLE-1）。
@@ -261,6 +292,16 @@ type nodeService struct {
 
 	// miners 是并行挖矿的 worker 数（<=1 表示单线程，结果确定）。
 	miners int
+
+	// ---- MINING-SYNC-GATE：对端高度登记表（由 mu 保护，纯内存，绝不持久化）----
+	//
+	// 键 = 对端地址；值 = 该对端最近一次握手报告的高度/工作量/时刻。
+	// 只被 recordPeerHeight（写）与 miningSyncReady（读）访问，
+	// **不参与任何共识判断**，也绝不进入 /status 之外的任何对外状态。
+	//
+	// 不持久化的理由：对端高度是易失的运行时观测，重启后由下一次握手重建；
+	// 落盘只会引入又一份需要在崩溃恢复中证明正确性的状态。
+	peerHeights map[string]peerHeightEntry
 }
 
 func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *wallet.Wallet) *nodeService {
@@ -280,6 +321,8 @@ func newNodeService(chain *blockchain.Blockchain, pool *mempool.Mempool, miner *
 		syncTTL:           defaultSyncReqTTL,
 		syncRetryBase:     defaultSyncRetryBase,
 		syncSweepInterval: defaultSyncSweepInterval,
+		// MINING-SYNC-GATE：对端高度登记表（易失，随服务生命周期）。
+		peerHeights: make(map[string]peerHeightEntry),
 	}
 	// atomic.Value 必须先 Store 再 Load，否则 Load 返回 nil 接口导致类型断言 panic。
 	s.mineState.Store(miningState(MiningStopped))
@@ -318,6 +361,10 @@ func (s *nodeService) OnHandshake(peerAddr string, payload p2p.HandshakePayload)
 	localWork := s.chain.BestTipWork()
 	log.Printf("[node] 握手完成: 对端=%s 对端高度=%d 本地高度=%d 对端工作量=%q 对端链尾=%s",
 		peerAddr, payload.ChainHeight, localHeight, payload.ChainWork, shortHash(payload.TipHash))
+
+	// (0) MINING-SYNC-GATE：登记对端高度/工作量，供自动矿工的同步门判定。
+	//     纯观测：不改变本函数任何既有分支的行为，也不新增任何 P2P 消息。
+	s.recordPeerHeight(peerAddr, payload.ChainHeight, payload.ChainWork)
 
 	// (1) 追赶：工作量更大（或工作量未知时高度更高）才值得拉批次。
 	if shouldSyncFrom(payload.ChainWork, payload.ChainHeight, localWork, localHeight) {
@@ -400,6 +447,85 @@ func shortHash(s string) string {
 
 // hashHex32 观测专用：把 32 字节哈希编码为完整十六进制（事件字段用）。
 func hashHex32(h [32]byte) string { return hex.EncodeToString(h[:]) }
+
+// ---- MINING-SYNC-GATE：同步门的登记与判定 ----
+
+// recordPeerHeight 登记/更新某对端最近一次握手报告的高度与累积工作量。
+//
+// 由 OnHandshake 调用；写 peerHeights 前取 mu，与其它共享状态一致。
+// 该函数**只写登记表**，不触发同步、不改变任何既有行为。
+func (s *nodeService) recordPeerHeight(peerAddr string, height int, work string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerHeights == nil {
+		// 防御：最小装配（直接构造 nodeService 的用例）可能未初始化该表，
+		// 对 nil map 写入会 panic —— 惰性补建，语义等价于 newNodeService 的初始化。
+		s.peerHeights = make(map[string]peerHeightEntry)
+	}
+	s.peerHeights[peerAddr] = peerHeightEntry{height: height, work: work, at: time.Now()}
+}
+
+// miningSyncGateDecision 是同步门的**纯函数内核**（不读链、不读全局状态）。
+//
+// 抽成纯函数的原因与 classifyTemplateFailure 相同：让「该不该放行自动挖矿」
+// 这一决策可被确定性单测覆盖 —— 无需构造真实长链即可覆盖「落后 100 块」
+// 这类边界（否则要真的挖出 100 个区块才能到达该状态）。
+//
+// 判定规则：
+//
+//  1. TTL 过期条目忽略（无断开回调，靠时间自愈）。
+//  2. 只统计「值得从它同步」的对端 —— 复用既有 shouldSyncFrom（工作量优先、
+//     高度兜底）。一条更长但累积工作量更轻的分叉不该挡住挖矿；旧版本节点
+//     不填 ChainWork 时该函数自动退化为比高度，与本功能引入前行为一致。
+//  3. peerMax 以 localHeight 为起点：没有更重的对端时门槛就是自己 ⇒ 必然放行。
+//     「无有效对端」（单节点 / 创世 / 隔离测试网）因此天然 ready —— 必须有人
+//     出块，否则整条链永远无法启动。
+//  4. ready = localHeight + miningSyncLagBlocks >= peerMax。
+func miningSyncGateDecision(localHeight int, localWork *big.Int, entries []peerHeightEntry, now time.Time) (ready bool, peerMax int) {
+	peerMax = localHeight
+	for _, e := range entries {
+		if now.Sub(e.at) > miningSyncPeerTTL {
+			continue // TTL 过期：视为该对端已消失
+		}
+		if !shouldSyncFrom(e.work, e.height, localWork, localHeight) {
+			continue // 落后于本节点，或是一条更轻的分叉：不构成阻挡
+		}
+		if e.height > peerMax {
+			peerMax = e.height
+		}
+	}
+	return localHeight+miningSyncLagBlocks >= peerMax, peerMax
+}
+
+// miningSyncReady 判定「本节点是否已追上网络」，供自动矿工的同步门使用。
+//
+// 返回：
+//   - ready：true = 允许自动挖矿；false = 本地明显落后，应暂停自动挖矿。
+//   - local：本节点当前链高。
+//   - peerMax：参与判定的对端中的最高高度（无更重对端时等于 local）。
+//
+// 语义与边界全部由纯函数 miningSyncGateDecision 承载，本方法只负责
+// 「取本地链状态 + 快照登记表」这一步 I/O。取登记表快照后即释放锁，
+// 避免在持锁状态下调用链方法。
+//
+// 已知局限（v1 接受，与设计一致）：若对端更重但同步始终失败（如网络隔离），
+// 门会持续挡住挖矿。日志会明确打出原因（runMiner 的「等待同步」行），
+// 操作员可见；后续版本可加「同步放弃后放行」。
+func (s *nodeService) miningSyncReady() (ready bool, local int, peerMax int) {
+	local = s.chain.Height()
+	localWork := s.chain.BestTipWork()
+
+	now := time.Now()
+	s.mu.Lock()
+	entries := make([]peerHeightEntry, 0, len(s.peerHeights))
+	for _, e := range s.peerHeights {
+		entries = append(entries, e)
+	}
+	s.mu.Unlock()
+
+	ready, peerMax = miningSyncGateDecision(local, localWork, entries, now)
+	return ready, local, peerMax
+}
 
 // waitingChildren 观测专用：返回当前等待该父哈希的孤儿块数（只读，不影响行为）。
 func (s *nodeService) waitingChildren(parent [32]byte) int {

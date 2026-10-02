@@ -589,6 +589,14 @@ const (
 	// 正常的分叉竞争远达不到该值；达到说明存在未预见的循环，转入有界退避。
 	// 注意：**不升级为 FAILED** —— 链尾变化本身是合法情形，不是缺陷。
 	maxConsecutiveStaleRetries = 1000
+	// miningSyncWaitInterval 是「同步门」（MINING-SYNC-GATE）判定为「未追上」
+	// 时的复查间隔。等待期间**不执行任何 PoW**，只按该间隔重新评估是否已追上；
+	// 等待本身对停止请求敏感（sleepOrStop），不会拖慢停机。
+	miningSyncWaitInterval = 5 * time.Second
+	// miningSyncWaitLogEvery 是等待期间「仍在等待」日志的节流周期（按复查次数计）。
+	// 首次进入等待必打一条，之后每该次数补一条，避免长时间同步时刷屏
+	// （12 × 5s = 60s，与挖矿状态日志的其它节流粒度一致）。
+	miningSyncWaitLogEvery = 12
 )
 
 // runMiner 持续挖矿：组装候选区块 → **模板预校验** → 挖矿（可被链尾变化中断）→ 上链 → 广播。
@@ -611,6 +619,8 @@ func runMiner(svc *nodeService, maxBlocks int, stop <-chan struct{}) {
 	mined := 0
 	consecutiveStale := 0
 	consecutiveOperational := 0
+	// syncWaitTicks 统计「连续处于等待同步」的复查次数，仅用于日志节流。
+	syncWaitTicks := 0
 
 	// finish 统一收尾：关闭挖矿标志并落到终态（不干扰已在途的写盘）。
 	finish := func(state miningState, reason string) {
@@ -632,6 +642,31 @@ func runMiner(svc *nodeService, maxBlocks int, stop <-chan struct{}) {
 			<-stop // 继续运行直到被要求停止
 			return
 		}
+
+		// ---- MINING-SYNC-GATE：追上网络之前不自动挖矿 ----
+		//
+		// 纯策略层闸门：不改变高度/难度/出块等任何共识规则，不新增 P2P 消息，
+		// 不改握手协议。它拦的是**唯一的挖矿路径**——持续挖矿循环
+		// （启动期 -mine，或 POST /mine/start，二者共用同一条 runMiner 循环）。
+		// 原「按需出块 POST /mine 不经过本循环」的例外已随该端点下线而消失。
+		//
+		// 判定与边界见 miningSyncReady / miningSyncGateDecision。
+		if ready, local, peerMax := svc.miningSyncReady(); !ready {
+			// 只在「刚进入等待」以及之后每 miningSyncWaitLogEvery 次复查各打一条，
+			// 既保证「为什么没出块」可观测（避免被误报为矿工故障），又不会刷屏。
+			entered := svc.setMineState(MiningWaitingSync, "behind-network")
+			if entered || syncWaitTicks%miningSyncWaitLogEvery == 0 {
+				log.Printf("[miner] 等待同步：本地高度=%d，对端最高=%d，暂停自动挖矿", local, peerMax)
+			}
+			syncWaitTicks++
+			// stop-aware 等待：绝不裸 sleep，保证停止请求能被立即响应。
+			if sleepOrStop(stop, miningSyncWaitInterval) {
+				finish(MiningStopped, "stopped")
+				return
+			}
+			continue
+		}
+		syncWaitTicks = 0
 
 		switch mineOnce(svc, stop) {
 		case mineOutcomeMined:
@@ -753,10 +788,10 @@ func blocksLimitText(max int) string {
 // 修复前本函数返回裸 bool，把「链尾变化 / 收到停止 / 结构性拒绝」压成同一个 false，
 // 上层因而对所有 false 都立即重试 —— 那正是无意义 PoW 热循环（P1-MINING-001）的来源。
 //
-// 全程持有 mineMu：持续挖矿循环与「按需出块」两类入口必须串行，
+// 全程持有 mineMu：所有挖矿入口共用同一条持续挖矿循环，必须串行，
 // 否则同一高度会有两个候选区块在求解，先出块的会白烧 CPU。
 //
-// stop 为 nil 时该中断源不存在（按需出块场景），nil channel 在 select 中永不就绪。
+// stop 为 nil 时该中断源不存在（测试/辅助路径），nil channel 在 select 中永不就绪。
 // 停止只取消「求解过程」，不取消已经开始的写盘：求解成功后的 AddBlock 照常跑完。
 func mineOnce(svc *nodeService, stop <-chan struct{}) mineOutcome {
 	svc.mineMu.Lock()

@@ -64,9 +64,10 @@ type Node interface {
 	// 复用 blockchain.BlockByHash（canonical 链 → store fallback）；
 	// 未命中返回 ErrBlockNotFound（由 HTTP 层映射为 404）。
 	BlockJSONByHash(hash [32]byte) (BlockJSON, error)
-	// Mine 按需立即挖出 count 个区块（测试网/开发用，对标 bitcoind 的 generatetoaddress）。
-	// 若节点正在持续挖矿（-mine）则返回错误，避免两个挖矿路径互相干扰。
-	Mine(count int) (MineResponse, error)
+	// 注：按需出块（原 POST /mine，对标 bitcoind generatetoaddress）已整体下线。
+	// 挖矿只能通过持续挖矿生命周期（StartMining/StopMining）驱动，
+	// 即 `-mine` 启动或 POST /mine/start；控制面不再存在「按需单次出块」入口。
+	//
 	// StartMining 启动持续挖矿（PHASE MINING-LIFECYCLE-1，设计冻结）。
 	// 单飞语义：同一时间最多一个 miner instance；重复/并发 START 返回
 	// *MineConflictError（HTTP 409），无副作用；FAILED 状态拒绝且不自动清除。
@@ -148,17 +149,6 @@ type SendResponse struct {
 	Amount   uint64 `json:"amount"`
 	To       string `json:"to"`
 	InputNum int    `json:"input_num"`
-}
-
-// MineRequest 按需出块请求。
-type MineRequest struct {
-	Count int `json:"count"`
-}
-
-// MineResponse 按需出块结果。
-type MineResponse struct {
-	Mined  int `json:"mined"`
-	Height int `json:"height"`
 }
 
 // MineStartResponse POST /mine/start 的结果（PHASE MINING-LIFECYCLE-1，设计冻结契约）。
@@ -322,18 +312,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/balance", s.handleBalance)
 	mux.HandleFunc("/utxos", s.handleUTXOs)
 	mux.HandleFunc("/send", s.requireAuth(s.handleSend))
-	mux.HandleFunc("/mine", s.requireAuth(s.handleMine))
 	// PHASE MINING-LIFECYCLE-1：持续挖矿生命周期控制（设计冻结契约）。
 	// /mine/start 与 /mine/stop 仅影响挖矿循环（独立 minerStop 通道），
 	// 绝不触碰节点停机路径（/stop 语义保持不变）。
+	//
+	// 按需出块（原 POST /mine 与 /console/mine）已整体下线：挖矿只能经持续挖矿
+	// 生命周期驱动。这同时收窄了控制面的 mutation 面 —— 少一个可被滥用的出块入口。
 	mux.HandleFunc("/mine/start", s.requireAuth(s.handleMineStart))
 	mux.HandleFunc("/mine/stop", s.requireAuth(s.handleMineStop))
-	// PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1（E6-C-1 修复）：/console/mine 与
-	// /mine 完全一致，强制 Bearer Token。原「同源闸门」（Sec-Fetch-Site / Origin）
-	// 经公网前安全审计确认可被任意非浏览器 HTTP 客户端伪造，构成一条无凭据即可
-	// 出块的未授权 mutation 路径，故整体退役。控制面不再有任何绕过认证的 write 入口；
-	// 控制台页面零凭据 ⇒ 其出块按钮不再可用（见 console.html，UI 已如实降级）。
-	mux.HandleFunc("/console/mine", s.requireAuth(s.handleMine))
 	mux.HandleFunc("/block", s.handleBlock)
 	mux.HandleFunc("/blocks", s.handleBlocks)
 	mux.HandleFunc("/logs", s.handleLogs)
@@ -565,34 +551,6 @@ func (s *Server) handleBlocks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, page)
 }
 
-func (s *Server) handleMine(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
-	// 请求体可省略：默认挖 1 个区块
-	req := MineRequest{Count: 1}
-	if r.Body != nil {
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil && err != io.EOF {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("请求体解析失败: %w", err))
-			return
-		}
-	}
-	if req.Count <= 0 || req.Count > MaxMineCount {
-		writeError(w, http.StatusBadRequest,
-			fmt.Errorf("count 必须在 1..%d 之间，实际 %d", MaxMineCount, req.Count))
-		return
-	}
-	resp, err := s.node.Mine(req.Count)
-	if err != nil {
-		writeError(w, http.StatusConflict, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-// MaxMineCount 单次按需出块的上限，避免一次请求长时间占用节点。
-const MaxMineCount = 1000
-
 // handleMineStart 启动持续挖矿（PHASE MINING-LIFECYCLE-1，设计冻结契约）。
 //
 // 契约：body 可省略或 {}（DisallowUnknownFields，未知字段 400——保留扩展位但不静默吞错）；
@@ -722,8 +680,10 @@ func bearerToken(r *http.Request) string {
 // 该闸门信任的请求头对浏览器 JS 确属 forbidden、不可伪造，但**对 curl / python 等
 // 非浏览器 HTTP 客户端可任意设置**，因此它只具备 CSRF 缓解价值，不能充当认证：
 // 它曾是 /console/mine 上一条「无 Bearer 即可出块」的未授权 mutation 路径。
-// 现 /console/mine 与 /mine 一致，仅认 Bearer Token（requireAuth）；控制面无任何
-// 无凭据 write 入口。退役实现见 git 历史与其对应阶段报告。
+// 该端点此后一度改为与 /mine 一致、仅认 Bearer Token（requireAuth）；再之后
+// **按需出块整体下线**，端点本身已不存在。控制面现存 write 入口仅
+// /send /mine/start /mine/stop /stop，全部经 requireAuth，无任何无凭据入口。
+// 退役实现见 git 历史与其对应阶段报告。
 
 // LoadTokenFile 从 path 读取 Bearer Token 并做归一化。
 //

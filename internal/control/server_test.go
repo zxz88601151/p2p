@@ -18,7 +18,6 @@ type fakeNode struct {
 	utxos     []control.UTXOInfo
 	sendResp  control.SendResponse
 	blockHex  string
-	mineResp  control.MineResponse
 	blocks    control.BlocksPageResult
 	blockJSON control.BlockJSON
 
@@ -28,7 +27,6 @@ type fakeNode struct {
 	balanceErr   error
 	sendErr      error
 	blockErr     error
-	mineErr      error
 	blocksErr    error
 	blockJSONErr error
 	mineStartErr error
@@ -38,7 +36,6 @@ type fakeNode struct {
 	lastTo      string
 	lastAmount  uint64
 	lastFee     uint64
-	lastMineN   int
 	lastFrom    int
 	lastCount   int
 	lastHash    [32]byte
@@ -76,17 +73,7 @@ func (f *fakeNode) BlockHex(height int) (string, error) {
 	return f.blockHex, nil
 }
 
-func (f *fakeNode) Mine(count int) (control.MineResponse, error) {
-	f.lastMineN = count
-	if f.mineErr != nil {
-		return control.MineResponse{}, f.mineErr
-	}
-	r := f.mineResp
-	if r.Mined == 0 {
-		r.Mined = count
-	}
-	return r, nil
-}
+// 注：测试替身原有的 Mine(count) 已随按需出块端点一并删除。
 
 // StartMining / StopMining（PHASE MINING-LIFECYCLE-1）：测试替身仅协议层——
 // 返回预设响应/错误，供 handler 契约测试（200/409/500 映射）使用。
@@ -281,37 +268,25 @@ func TestBlockEndpoint(t *testing.T) {
 	}
 }
 
-// TestMineEndpoint 按需出块端点：显式 count、非法 count 返回 400、
-// 业务冲突（如持续挖矿中）返回 409。
-func TestMineEndpoint(t *testing.T) {
+// TestMineEndpointRemoved 锁定「按需出块已下线」这一契约：
+// 原 POST /mine 必须不再存在（404/405），且控制面不再暴露该 mutation 入口。
+//
+// 用 404 断言而非仅删测试：删除端点后若有人误加回路由，本用例会立刻失败。
+func TestMineEndpointRemoved(t *testing.T) {
 	node := &fakeNode{}
-	client, srv := newTestPair(t, node)
+	_, srv := newTestPair(t, node)
 
-	resp, err := client.Mine(3)
-	if err != nil {
-		t.Fatalf("Mine 失败: %v", err)
-	}
-	if resp.Mined != 3 || node.lastMineN != 3 {
-		t.Fatalf("Mine 结果不符: %+v, lastMineN=%d", resp, node.lastMineN)
-	}
-
-	for _, bad := range []string{`{"count":0}`, `{"count":-1}`, `{"count":99999}`} {
-		r := postAuth(t, srv.URL+"/mine", bad)
-		_ = r.Body.Close()
-		if r.StatusCode != http.StatusBadRequest {
-			t.Fatalf("count=%s 状态码 = %d, want 400", bad, r.StatusCode)
-		}
-	}
-
-	// 节点报告业务冲突（例如正在持续挖矿）→ 409
-	node.mineErr = errors.New("节点正在持续挖矿")
 	r := postAuth(t, srv.URL+"/mine", `{"count":1}`)
-	_ = r.Body.Close()
-	if r.StatusCode != http.StatusConflict {
-		t.Fatalf("业务冲突状态码 = %d, want 409", r.StatusCode)
+	defer func() { _ = r.Body.Close() }()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /mine 状态码 = %d, want 404（按需出块已下线，端点不应存在）", r.StatusCode)
 	}
-	if _, err := client.Mine(1); err == nil || !strings.Contains(err.Error(), "持续挖矿") {
-		t.Fatalf("冲突错误未透传: %v", err)
+
+	// /console/mine 同样必须不存在（它曾与 /mine 共用 handler）。
+	rc := postAuth(t, srv.URL+"/console/mine", `{"count":1}`)
+	defer func() { _ = rc.Body.Close() }()
+	if rc.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /console/mine 状态码 = %d, want 404（按需出块已下线）", rc.StatusCode)
 	}
 }
 

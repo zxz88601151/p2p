@@ -172,22 +172,16 @@ button{font:inherit;color:inherit}
 
   <!-- ================= PRIMARY CONTROL ================= -->
   <section class="card bar" aria-label="节点运行控制">
-    <button class="btn primary" id="mineBtn" disabled aria-label="按需立即挖出一个区块">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-      </svg>
-      <span id="mineBtnText">立即出块</span>
-    </button>
     <button class="btn" id="refreshBtn" aria-label="立即刷新全部数据">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M20 11a8 8 0 1 0-2.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M20 11a8 8 0 1 0 -2.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
         <path d="M20 4.6V11h-6.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       刷新
     </button>
-    <span class="hint" id="mineHint"></span>
+    <span class="hint" id="miningHint"></span>
     <span class="spacer"></span>
-    <span class="err-text" id="mineErr" role="alert"></span>
+    <span class="err-text" id="pageErr" role="alert"></span>
     <span class="note mono num" id="lastSync">—</span>
   </section>
 
@@ -294,7 +288,6 @@ button{font:inherit;color:inherit}
       </div>
       <div class="pb">
         <div class="row"><span class="lab">Mining</span><span class="val" id="hMining"></span></div>
-        <div class="row"><span class="lab">On-demand</span><span class="val" id="hOnDemand"></span></div>
         <div class="row"><span class="lab">Hashrate</span><span class="val" id="hHash"></span></div>
         <div class="row"><span class="lab">Device</span><span class="val" id="hDevice"></span></div>
         <div class="row"><span class="lab">Temperature</span><span class="val" id="hTemp"></span></div>
@@ -355,7 +348,7 @@ var API = ""; // 同源
 var $ = function(id){ return document.getElementById(id); };
 
 var UN = {}; // 每处 Unavailable 的原因（title 提示用）
-var online = false, lastStatus = null, logsPaused = false, mining = false, busy = false;
+var online = false, lastStatus = null, logsPaused = false, mining = false;
 
 function unavail(el, reason){
   el.innerHTML = '<span class="un" title="' + String(reason).replace(/"/g,'&quot;') + '">Unavailable</span>';
@@ -395,7 +388,7 @@ function nowTime(){
    永久停留在陈旧的 Online 状态——这正是 §11 明令禁止的 stale status。
    超时后统一降级为失败态。出块在后台 goroutine 中求解、/status 只取读锁，
    不会被挖矿阻塞，故该超时不会在出块期间造成误判离线。
-   注意：仅用于 /status 与 /logs 这类快速读取；/mine 出块耗时不确定，不加超时。 */
+   注意：仅用于 /status 与 /logs 这类快速读取。 */
 var REQ_TIMEOUT_MS = 4000;
 async function jget(path){
   var ctl = (typeof AbortController === "function") ? new AbortController() : null;
@@ -434,7 +427,6 @@ function setOnline(v){
   setText($("nodeStateText"), v ? "Online" : "Offline");
   $("offlineCard").hidden = v;
   $("panels").hidden = !v;
-  $("mineBtn").disabled = !v || mining || busy;
   $("refreshBtn").disabled = false;
   markStale(!v);
 }
@@ -554,12 +546,15 @@ function renderStatus(st){
   }
 
   /* --- mining / hardware --- */
-  $("hMining").innerHTML = mining
-    ? '<span class="state ok"><span class="dot"></span><b>持续挖矿中</b></span>'
-    : '<span class="state"><span class="dot"></span>Mining inactive</span>';
-  $("hOnDemand").innerHTML = mining
-    ? '<span class="state warn"><span class="dot"></span>不可用：持续挖矿期间按需出块被拒绝（409）</span>'
-    : '<span class="state warn"><span class="dot"></span>不可用：出块端点受 Bearer Token 保护（控制台页面零凭据）</span>';
+  // 自动挖矿的三种呈现：等待同步（落后于网络，暂停出块）/ 持续挖矿中 / 未启用。
+  var hstate = (typeof st.mining_state === "string") ? st.mining_state : "";
+  if (hstate === "WAITING_SYNC"){
+    $("hMining").innerHTML = '<span class="state warn"><span class="dot"></span>等待同步：本地落后，暂停自动挖矿</span>';
+  } else if (mining){
+    $("hMining").innerHTML = '<span class="state ok"><span class="dot"></span><b>持续挖矿中</b></span>';
+  } else {
+    $("hMining").innerHTML = '<span class="state"><span class="dot"></span>Mining inactive</span>';
+  }
   unavail($("hHash"),   "全仓无算力统计实现（无 Hashes/sec 采集）");
   unavail($("hDevice"), "无 GPU/设备枚举能力");
   unavail($("hTemp"),   "无温度传感器采集");
@@ -577,15 +572,16 @@ function renderStatus(st){
   unavail($("fProto"), "P2P 消息无协议版本字段");
 
   /* --- primary control 提示 --- */
-  if (mining){
-    setText($("mineHint"), "节点以 -mine 持续挖矿；当前无「停止挖矿」接口，需重启节点方可停止。");
+  // 按需出块（POST /mine、POST /console/mine）已全量下线：自动挖矿仅由启动期
+  // -mine 开关驱动，控制台不提供任何出块按钮，杜绝「虚假可用性」声明。
+  var mstate = (typeof st.mining_state === "string") ? st.mining_state : "";
+  if (mstate === "WAITING_SYNC"){
+    setText($("miningHint"), "自动挖矿：等待同步（本地落后于网络，已暂停出块）");
+  } else if (mining){
+    setText($("miningHint"), "节点以 -mine 持续挖矿；-mine 为启动期开关，停止需重启节点。");
   } else {
-    setText($("mineHint"), "按需出块受 Bearer Token 保护；控制台页面零凭据，出块按钮恒禁用。");
+    setText($("miningHint"), "自动挖矿未启用；如需挖矿请以 -mine 启动节点。");
   }
-  // PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1：/console/mine 与 /mine 一致强制
-  // Bearer Token（原可伪造的同源闸门已退役），而本页面按设计零凭据 ⇒ 出块按钮
-  // 恒禁用，杜绝「虚假可用性」声明。
-  $("mineBtn").disabled = true;
 }
 
 /* ---------------- 日志 ---------------- */
@@ -639,7 +635,7 @@ async function doTick(){
     try {
       renderStatus(st);
     } catch(err){
-      $("mineErr").textContent = "界面渲染异常（节点仍在线）：" + String((err && err.message) || err);
+      $("pageErr").textContent = "界面渲染异常（节点仍在线）：" + String((err && err.message) || err);
     }
     if (!logsPaused){
       try {
@@ -651,7 +647,7 @@ async function doTick(){
       }
     }
     setText($("lastSync"), "最后同步 " + nowTime());
-    $("mineErr").textContent = "";
+    $("pageErr").textContent = "";
   } catch (e){
     if (online) setOnline(false);
     setFailureState(e);
@@ -660,36 +656,8 @@ async function doTick(){
 }
 
 /* ---------------- 控制动作 ---------------- */
-$("mineBtn").addEventListener("click", async function(){
-  busy = true;
-  $("mineBtn").disabled = true;
-  setText($("mineBtnText"), "出块中…");
-  $("mineErr").textContent = "";
-  try {
-    /* PHASE RPC-CONTROL-PLANE-AUTH-HARDENING-1：原「同源闸门」经 E6-C-1 审计
-       可被非浏览器客户端伪造绕过、已退役；/console/mine 现与 /mine 一致强制
-       Bearer Token。控制台页面零凭据 ⇒ 本按钮在 renderStatus 中恒禁用（杜绝
-       虚假可用性），此分支仅在带凭据的变体接管时才有意义；token 依旧绝不下发
-       到浏览器。注意：仍不得携带读取超时（出块耗时不确定）。 */
-    var r = await fetch(API + "/console/mine", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ count: 1 })
-    });
-    var body = await r.json().catch(function(){ return {}; });
-    if (!r.ok){
-      $("mineErr").textContent = "出块失败：" + (body.error || ("HTTP " + r.status));
-    } else {
-      setText($("mineBtnText"), "已出块");
-      setTimeout(function(){ setText($("mineBtnText"), "立即出块"); }, 1200);
-    }
-  } catch (e){
-    $("mineErr").textContent = "出块失败：" + String(e.message || e);
-  } finally {
-    busy = false;
-    await tick();
-  }
-});
+/* 按需出块按钮与其点击处理已全量下线（POST /mine、POST /console/mine 端点亦已
+   移除）。自动挖矿仅由启动期 -mine 开关驱动，控制台不提供出块动作。 */
 
 $("refreshBtn").addEventListener("click", function(){
   var self = this;
@@ -736,7 +704,7 @@ $("cpTip").addEventListener("click", async function(){
     var self = this;
     setTimeout(function(){ self.textContent = "复制"; self.classList.remove("ok"); }, 1200);
   } catch(e){
-    $("mineErr").textContent = "复制失败：" + String(e.message || e);
+    $("pageErr").textContent = "复制失败：" + String(e.message || e);
   }
 });
 

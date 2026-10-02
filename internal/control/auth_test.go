@@ -103,7 +103,9 @@ func TestMutationAuthMatrix(t *testing.T) {
 		body string
 	}{
 		{"send", "/send", `{"to":"A1","amount":1,"fee":0}`},
-		{"mine", "/mine", `{"count":1}`},
+		// 原为 /mine（按需出块）。该端点已整体下线，矩阵改以 /mine/start 承载 ——
+		// 它同为 mutation 端点、同经 requireAuth，认证矩阵的覆盖强度不变。
+		{"mine-start", "/mine/start", `{}`},
 		{"stop", "/stop", `{}`},
 	}
 	authCases := []struct {
@@ -140,13 +142,16 @@ func TestMutationValidTokenReachesHandler(t *testing.T) {
 	node := &fakeNode{}
 	_, srv := newAuthServer(t, node, goodToken, 0)
 
-	// /mine：有效 token → 既有行为（200，Mine 被调用）
-	resp := rawPost(t, srv.URL+"/mine", "Bearer "+goodToken, `{"count":2}`)
+	// /mine/start：有效 token → 既有行为（200，StartMining 被调用）
+	// 原用例用 /mine（按需出块）验证「认证通过后进入既有 handler」；
+	// 该端点已下线，改由 /mine/start 承载同样的证明。
+	node.mineStartResp = control.MineStartResponse{Accepted: true, State: "STARTING", Height: 3}
+	resp := rawPost(t, srv.URL+"/mine/start", "Bearer "+goodToken, `{}`)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("/mine 有效 token = %d, want 200", resp.StatusCode)
+		t.Fatalf("/mine/start 有效 token = %d, want 200", resp.StatusCode)
 	}
-	if node.lastMineN != 2 {
-		t.Fatalf("lastMineN = %d, want 2", node.lastMineN)
+	if body := readBody(t, resp); !strings.Contains(body, `"accepted":true`) {
+		t.Fatalf("/mine/start 未到达 handler，响应体 = %s", body)
 	}
 
 	// /send：有效 token → 既有行为
@@ -169,7 +174,7 @@ func TestMutationValidTokenReachesHandler(t *testing.T) {
 
 func TestMutationFailClosedWhenNoTokenConfigured(t *testing.T) {
 	_, srv := newAuthServer(t, &fakeNode{}, "", 0)
-	for _, path := range []string{"/send", "/mine", "/stop"} {
+	for _, path := range []string{"/send", "/mine/start", "/mine/stop", "/stop"} {
 		resp := rawPost(t, srv.URL+path, "Bearer "+goodToken, `{}`)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("%s 未配置 token = %d, want 401（fail-closed）", path, resp.StatusCode)
@@ -184,7 +189,7 @@ func TestAuthFailureFixedDelay(t *testing.T) {
 	_, srv := newAuthServer(t, &fakeNode{}, goodToken, delay)
 
 	start := time.Now()
-	resp := rawPost(t, srv.URL+"/mine", "Bearer "+invalidForm, `{"count":1}`)
+	resp := rawPost(t, srv.URL+"/mine/start", "Bearer "+invalidForm, `{}`)
 	elapsed := time.Since(start)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("状态码 = %d, want 401", resp.StatusCode)

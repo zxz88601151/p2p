@@ -100,14 +100,9 @@ func (c *Client) BlockHex(height int) (string, error) {
 	return out.Encoded, nil
 }
 
-// Mine 按需立即挖出 count 个区块（测试网用）。
-func (c *Client) Mine(count int) (*MineResponse, error) {
-	var out MineResponse
-	if err := c.post("/mine", MineRequest{Count: count}, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
+// 注：原 `Mine(count)` 客户端方法（POST /mine，按需出块）已随端点一并下线。
+// 需要让节点出块的调用方改走持续挖矿生命周期：POST /mine/start 启动、
+// POST /mine/stop 停止（本包未提供这两个端点的客户端封装，调用方直接 POST）。
 
 // Stop 请求节点优雅停止（PHASE PRODUCT-DEV-1B）。
 //

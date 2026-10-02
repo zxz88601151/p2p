@@ -8,14 +8,16 @@
 //
 // 本文件把「运行状态」与「失败原因」显式化：
 //
-//	STOPPED  未挖矿（未开启 / 已停止 / 已达出块上限）
-//	STARTING 已启动，首个模板尚未完成预校验
-//	RUNNING  正在对【已通过预校验的】模板求解 PoW（或刚出块，链推进正常）
-//	STALLED  政策终态：当前不存在合法候选区块（补贴耗尽且无手续费交易）
-//	FAILED   结构性错误：模板不满足共识要求，挖矿已终止（需修复后重启）
-//	STOPPING 已收到停止请求，正在取消 worker
+//	STOPPED     未挖矿（未开启 / 已停止 / 已达出块上限）
+//	STARTING    已启动，首个模板尚未完成预校验
+//	RUNNING     正在对【已通过预校验的】模板求解 PoW（或刚出块，链推进正常）
+//	WAITING_SYNC 已启用挖矿，但本地明显落后于网络，暂停自动挖矿（MINING-SYNC-GATE）
+//	STALLED     政策终态：当前不存在合法候选区块（补贴耗尽且无手续费交易）
+//	FAILED      结构性错误：模板不满足共识要求，挖矿已终止（需修复后重启）
+//	STOPPING    已收到停止请求，正在取消 worker
 //
 // 关键区别：**STALLED 不是缺陷，FAILED 是**。二者在修复前都被误报为「运行中」。
+// 同理 WAITING_SYNC 也不是缺陷：它表示「等追上网络再挖」，追上即自动恢复。
 package main
 
 import "p2pchain/internal/blockchain"
@@ -30,6 +32,11 @@ const (
 	MiningStarting miningState = "STARTING"
 	// MiningRunning 正在对已通过预校验的模板求解 PoW。
 	MiningRunning miningState = "RUNNING"
+	// MiningWaitingSync 已启用挖矿，但因本地明显落后于网络而暂停自动挖矿
+	// （MINING-SYNC-GATE）。**不是缺陷**：追上后循环会在下一次复查时自动恢复；
+	// 若对端条目 TTL 失效或对端不再是「更重」的一方，同样会自动恢复。
+	// 该状态不执行任何 PoW，与 STALLED 的区别在于原因（落后于网络 vs 无合法候选）。
+	MiningWaitingSync miningState = "WAITING_SYNC"
 	// MiningStalled 政策终态：不存在合法候选区块（不执行 PoW，亦非缺陷）。
 	MiningStalled miningState = "STALLED"
 	// MiningFailed 结构性错误：挖矿已终止（需修复后重启节点）。

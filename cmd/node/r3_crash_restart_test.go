@@ -4,7 +4,7 @@ package main
 // REORG-1J-R3 · LEGACY-PREFIX CRASH MATRIX —— 真实进程级崩溃 / 重启证据
 //
 // 目的：补全 internal/storage/r3_crash_matrix_test.go 的**字节级**注入之外的
-// **进程级**证据：用真实 node 二进制、真实 P2P TCP、真实按需出块构造一条
+// **进程级**证据：用真实 node 二进制、真实 P2P TCP、**字节级写入的区块镜像**构造一条
 // 「legacy 前缀共享、自前缀内部高度分叉」的场景，然后在 5 个不同时刻强制杀死
 // （Process.Kill，等价于 SIGKILL）正在同步/reorg 的节点进程，随后重启并断言：
 //

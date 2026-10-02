@@ -86,13 +86,22 @@ func TestParallelMiningProducesValidBlock(t *testing.T) {
 		t.Fatalf("miners 配置未生效: %d", rt.svc.miners)
 	}
 
-	client := authedClient(rt.ctl.Addr())
-	resp, err := client.Mine(6)
-	if err != nil {
-		t.Fatalf("按需出块失败: %v", err)
+	// 出块改走持续挖矿生命周期（原 POST /mine 按需出块已下线）。
+	// 用 maxBlocks=6 精确控制产出数量：runMiner 挖满即转入全节点模式并停手，
+	// 不会像「启动后轮询再停」那样因停止异步而多出 1 块 —— 本用例逐块校验
+	// 高度 0..6，数量必须精确。
+	if err := rt.svc.minerLife.Load().start(6); err != nil {
+		t.Fatalf("启动持续挖矿失败: %v", err)
 	}
-	if resp.Mined != 6 || resp.Height != 6 {
-		t.Fatalf("出块结果 = %+v, want mined=6 height=6", resp)
+	// Close() 不负责停挖，必须显式收尾，避免存储关闭与在途写入并发。
+	t.Cleanup(func() { rt.svc.minerLife.Load().beginShutdown() })
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) && rt.chain.Height() < 6 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if h := rt.chain.Height(); h != 6 {
+		t.Fatalf("并行挖矿产出高度 = %d, want 6", h)
 	}
 
 	// 逐块校验：PoW 有效 + 链式结构正确（并行挖矿最容易在这里出错）

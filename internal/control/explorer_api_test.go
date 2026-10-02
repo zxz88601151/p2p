@@ -254,15 +254,19 @@ func TestBlockLegacyHeightContractUnchanged(t *testing.T) {
 	}
 }
 
-// TestMineContractUnchanged 回归：/mine 契约不变（详见 server_test.go TestMineEndpoint）。
-func TestMineContractUnchanged(t *testing.T) {
+// TestMineContractRemoved 回归：/mine 端点已整体下线（详见 server_test.go
+// TestMineEndpointRemoved 与 console_mine_auth_test.go）。
+//
+// 历史：本用例原名 TestMineContractUnchanged，锁定「POST /mine {count:2} → 200
+// 且调用 Node.Mine(2)」的契约。按需出块全量下线后该契约不再存在，改为锁定
+// 「路由不存在」这一更强的边界：即便携带有效 token 也必须 404。
+func TestMineContractRemoved(t *testing.T) {
 	node := &fakeNode{}
 	_, srv := newTestPair(t, node)
-	// /mine 为 mutation 端点，PHASE CONTROL-AUTH-1 起需携带 token（postAuth 已带）。
 	resp := postAuth(t, srv.URL+"/mine", `{"count":2}`)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || node.lastMineN != 2 {
-		t.Fatalf("/mine 契约回归: code=%d lastMineN=%d", resp.StatusCode, node.lastMineN)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("/mine 已下线，应 404：code=%d", resp.StatusCode)
 	}
 }
 

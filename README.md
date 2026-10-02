@@ -20,7 +20,8 @@ Developer Node
 ```
 
 即：一个开发者在本机运行和调试的确定性节点 —— 自带完整 UTXO 与密码学交易校验、
-按需出块、每次启动自动把整条链重新校验一遍、并对自己的数据目录拥有独占所有权。
+可控持续挖矿（启动期 `-mine`，可用 `-maxblocks` 限定出块数；**追上网络前自动暂停出块**）、
+每次启动自动把整条链重新校验一遍、并对自己的数据目录拥有独占所有权。
 
 **它不是**（这些尚未达到产品门槛，不在当前范围内）：
 
@@ -50,8 +51,8 @@ Verification Runtime · Verifiable Work Runtime · Contribution Network
 - **内存池（Mempool）**：TxID 去重、组合视图验证（链 UTXO + 池内交易叠加）、出块后重验剔除失效交易
 - **持久化**：`blocks.dat` 追加写 + 启动全量回放重建 UTXO；重启不丢链
 - **P2P 网络**：TCP + 换行分隔 JSON；握手（交换高度与已知节点）、区块/交易真实传播与中继、追赶同步（分批拉取）、**种子节点断线自动重连**（防孤岛链）
-- **控制接口**：localhost JSON API（`/status /balance /utxos /send /mine /block`）
-- **CLI 子命令**：`ui / node / status / balance / utxos / send / mine / wallet / printchain / verify / help`
+- **控制接口**：localhost JSON API（`/status /balance /utxos /send /mine/start /mine/stop /block`）
+- **CLI 子命令**：`ui / node / status / balance / utxos / send / stop / wallet / printchain / verify / help`
 - **分叉处理与链重组（reorg）**：`internal/blocktree` 累积工作量（`CumulativeWork = Σ 2^bits`）+ fork-choice（工作量大者胜，平局按 tip 哈希确定性 tie-break）；`blockchain.executeReorg` 实现 disconnect→apply→persist 链切换；孤儿队列（父未知时暂存、父到达即入链）
 - **孤儿块持久化与启动恢复**：`<datadir>/orphan_waiting.bin` 检查点（原子写 `temp+fsync+rename` + SHA-256 校验，fail-closed）；启动加载缺失父键集，握手后复用 by-hash 分支拉取（`requestBranch`）重连缺失分支
 - **端到端恢复校验**：`ORPHAN-DURABILITY-E2E-RECOVERY-1` 以真实网络/磁盘/进程边界验证「孤儿产生 → 检查点落盘 → 崩溃重启 → 恢复加载 → 握手消费 → 分支请求 → 父块到达 → 孤儿消解 → 链一致」全链路
@@ -91,7 +92,10 @@ go build -o node ./cmd/node
 ./node balance                         # 节点钱包余额（-address 可查任意地址）
 ./node utxos                           # 未花费输出列表
 ./node send -to <地址> -amount 100      # 转账（最小单位整数）
-./node mine -count 6                    # 按需出块（开发/测试用）
+./node stop                            # 优雅停止节点（释放数据目录锁）
+
+# 出块：仅由启动期开关驱动（按需出块 POST /mine 与 `node mine` 已全量下线）
+./node -mine -maxblocks 6              # 启动即挖矿，挖满 6 块后转为全节点模式
 
 # 离线命令
 ./node wallet -datadir ./data-a         # 查看或创建本地钱包
@@ -129,25 +133,35 @@ $ ./node verify -datadir ./data-a
 ## 控制台（Console）
 
 `node ui` 会在启动节点后打开内嵌的 Developer Console。
-它是**轻量节点观测面**（状态、链尾、网络、日志 + 按需出块），
+它是**轻量节点观测面**（状态、链尾、网络、日志），
 **不是**区块浏览器、交易构建器或钱包管理器 —— 这些能力请使用上面的 CLI。
 
-节点启动选项：`-listen`（P2P 监听）、`-rpc`（控制接口，仅本机回环）、`-seed`（种子地址，逗号分隔）、`-datadir`（数据目录）、`-mine`（启用挖矿）、`-maxblocks`（出块上限）、`-miners`（并行 worker 数）。
+节点启动选项：`-listen`（P2P 监听）、`-rpc`（控制接口，仅本机回环）、`-seed`（种子地址，逗号分隔）、`-datadir`（数据目录）、`-mine`（启用挖矿）、`-maxblocks`（出块上限）、`-miners`（并行 worker 数）、`-wallet-password-file`（钱包口令文件，必填）。
 
 完整说明运行 `./node help`。
 
 ## 控制接口（JSON over HTTP，仅本机）
 
-| 端点 | 方法 | 说明 |
-|---|---|---|
-| `/status` | GET | 节点状态（高度/链尾/对等/池/挖矿中） |
-| `/balance?address=` | GET | 余额（可花费与含未成熟两个口径） |
-| `/utxos?address=` | GET | 未花费输出列表 |
-| `/send` | POST | 用节点钱包转账 |
-| `/mine` | POST | 按需出块 `{"count": N}` |
-| `/block?height=N` | GET | 区块十六进制内容 |
+| 端点 | 方法 | 鉴权 | 说明 |
+|---|---|---|---|
+| `/status` | GET | 无 | 节点状态（高度/链尾/对等/池/挖矿语义状态） |
+| `/balance?address=` | GET | 无 | 余额（可花费与含未成熟两个口径） |
+| `/utxos?address=` | GET | 无 | 未花费输出列表 |
+| `/block?height=N` | GET | 无 | 区块十六进制内容 |
+| `/blocks?from=&count=` | GET | 无 | 区块分页 |
+| `/logs?tail=` | GET | 无 | 运行日志 |
+| `/`（`/console`） | GET | 无 | Developer Console 页面 |
+| `/send` | POST | **Bearer** | 用节点钱包转账 |
+| `/mine/start` | POST | **Bearer** | 启动持续挖矿 |
+| `/mine/stop` | POST | **Bearer** | 停止挖矿（**绝不停节点**） |
+| `/stop` | POST | **Bearer** | 优雅停止节点 |
 
-默认监听 `127.0.0.1:6689`，无鉴权——**切勿暴露到不可信网络**（启动时监听到非回环地址会打警告）。
+按需出块（`POST /mine`、`POST /console/mine`）**已全量下线**，调用恒 `404`；
+出块只能由启动期 `-mine` 或 `POST /mine/start` 驱动。
+
+默认监听 `127.0.0.1:6689`。只读端点无鉴权，mutation 端点强制 Bearer Token
+（未配置令牌时 **fail-closed 一律 401**）——**切勿暴露到不可信网络**（启动时监听到非回环地址会打警告）。
+完整契约见 `docs/CANONICAL-RPC-SPEC.md`。
 
 ## P2P 协议
 

@@ -345,9 +345,8 @@ func TestStopPreservesChainAndWallet(t *testing.T) {
 	dir := t.TempDir()
 	n := startRealNode(t, dir)
 
-	if _, err := authedClient(n.rpc).Mine(3); err != nil {
-		t.Fatalf("挖矿失败: %v", err)
-	}
+	// 原走按需出块（POST /mine）；该端点下线后改走持续挖矿生命周期。
+	mineViaRPC(t, n.rpc, 3)
 	before := map[string][]byte{}
 	// P0-4：钱包路径已迁至 <datadir>/secrets/wallet.json
 	for _, name := range []string{"blocks.dat", filepath.Join(wallet.WalletSecretsDir, wallet.WalletFileName)} {
@@ -381,8 +380,14 @@ func TestStopPreservesChainAndWallet(t *testing.T) {
 func TestStopThenRestartNeedsNoForce(t *testing.T) {
 	dir := t.TempDir()
 	n1 := startRealNode(t, dir)
-	if _, err := authedClient(n1.rpc).Mine(2); err != nil {
-		t.Fatalf("挖矿失败: %v", err)
+	mineViaRPC(t, n1.rpc, 2)
+
+	// 记录停止前的高度作为断言基准：持续挖矿的停止是异步的，实际高度可能
+	// 比请求的 2 略多，因此不能用硬编码常量，而应以「重启前后一致」为准 ——
+	// 这比原来的固定值断言更强（它同时覆盖了任意高度下的持久化正确性）。
+	before, err := n1.status()
+	if err != nil {
+		t.Fatalf("停止前取状态失败: %v", err)
 	}
 	if code, out := n1.stopViaCLI(); code != 0 {
 		t.Fatalf("stop 失败: %s", out)
@@ -398,8 +403,9 @@ func TestStopThenRestartNeedsNoForce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("STOP-INV-03 违反：重启后无法查询状态: %v", err)
 	}
-	if st.Height != 2 {
-		t.Fatalf("重启后应保留高度 2，实际 %d", st.Height)
+	if st.Height != before.Height || st.TipHash != before.TipHash {
+		t.Fatalf("重启后链状态不一致：before=(h=%d,tip=%s) after=(h=%d,tip=%s)",
+			before.Height, before.TipHash, st.Height, st.TipHash)
 	}
 }
 
@@ -407,9 +413,7 @@ func TestStopThenRestartNeedsNoForce(t *testing.T) {
 func TestStopThenVerifyConsistent(t *testing.T) {
 	dir := t.TempDir()
 	n1 := startRealNode(t, dir)
-	if _, err := authedClient(n1.rpc).Mine(5); err != nil {
-		t.Fatalf("挖矿失败: %v", err)
-	}
+	mineViaRPC(t, n1.rpc, 5)
 	st1, err := n1.status()
 	if err != nil {
 		t.Fatalf("取状态失败: %v", err)
@@ -473,9 +477,7 @@ func TestStopWhileMining(t *testing.T) {
 func TestStopAfterTransaction(t *testing.T) {
 	dir := t.TempDir()
 	n := startRealNode(t, dir)
-	if _, err := authedClient(n.rpc).Mine(12); err != nil {
-		t.Fatalf("挖矿失败: %v", err)
-	}
+	mineViaRPC(t, n.rpc, 12)
 	st, err := n.status()
 	if err != nil {
 		t.Fatalf("取状态失败: %v", err)
@@ -485,9 +487,8 @@ func TestStopAfterTransaction(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("发送交易失败: %v", err)
 	}
-	if _, err := authedClient(n.rpc).Mine(1); err != nil {
-		t.Fatalf("打包失败: %v", err)
-	}
+	// 再挖一轮把待打包交易收进区块（持续挖矿生命周期，替代原按需出块）。
+	mineViaRPC(t, n.rpc, 1)
 
 	if code, out := n.stopViaCLI(); code != 0 {
 		t.Fatalf("stop 失败: %s", out)
@@ -560,9 +561,7 @@ func TestResetAfterGracefulStopNeedsNoForce(t *testing.T) {
 		t.Fatalf("取状态失败: %v", err)
 	}
 	genesisBefore := st0.TipHash // 高度 0 时链尾即创世
-	if _, err := authedClient(n.rpc).Mine(4); err != nil {
-		t.Fatalf("挖矿失败: %v", err)
-	}
+	mineViaRPC(t, n.rpc, 4)
 	if code, out := n.stopViaCLI(); code != 0 {
 		t.Fatalf("stop 失败: %s", out)
 	}

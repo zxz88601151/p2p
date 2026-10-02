@@ -8,7 +8,6 @@ package main
 
 import (
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -284,44 +283,10 @@ func blockToExplorerJSON(b *block.Block, height *int, canonical bool) control.Bl
 	return bj
 }
 
-// Mine 按需立即挖出 count 个区块（测试网/开发便利功能）。
-//
-// 与持续挖矿循环（-mine）互斥：若正在持续挖矿则直接拒绝，
-// 否则两个挖矿路径会各自组装候选区块、互相作废，白烧 CPU 且日志混乱。
-//
-// 退出条件（PHASE MINING-REMEDIATION-1）：只要本轮不是「成功出块」
-// （链尾变化 / 政策终态 / 结构性错误 / 可重试失败）即停止本轮，
-// 不再把「被拒绝」误当作「被链尾变化中断」。
-func (s *nodeService) Mine(count int) (control.MineResponse, error) {
-	if s.mining.Load() {
-		return control.MineResponse{}, errors.New("节点正在持续挖矿（-mine），请先停用持续挖矿再使用按需出块")
-	}
-	if count <= 0 {
-		return control.MineResponse{}, fmt.Errorf("挖矿数量必须大于 0，实际 %d", count)
-	}
-
-	s.setMineState(MiningStarting, "on-demand")
-	mined := 0
-	last := mineOutcomeStop
-	for i := 0; i < count; i++ {
-		last = mineOnce(s, nil)
-		if last != mineOutcomeMined {
-			break
-		}
-		mined++
-	}
-	// 终态：结构性错误与政策终态保留其状态（便于 /status 直接暴露原因），
-	// 其余情形回到 STOPPED（按需出块已结束）。
-	switch last {
-	case mineOutcomeStructFail:
-		// 保留 FAILED
-	case mineOutcomeStalled:
-		// 保留 STALLED
-	default:
-		s.setMineState(MiningStopped, "on-demand-done")
-	}
-	return control.MineResponse{Mined: mined, Height: s.chain.Height()}, nil
-}
+// 注：`nodeService.Mine(count)`（按需出块的服务层实现）已随 POST /mine 端点整体下线。
+// 出块现在只有一条路径 —— 持续挖矿生命周期（minerLifecycle → runMiner），
+// 由 `-mine` 启动或 POST /mine/start 触发、POST /mine/stop 停止。
+// 这样也消除了「两条挖矿路径各自组装候选区块、互相作废」的整类问题。
 
 // sortUTXOs 按高度、OutPoint 排序，使接口输出稳定（便于人工核对与脚本处理）。
 func sortUTXOs(list []control.UTXOInfo) {

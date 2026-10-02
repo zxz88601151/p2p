@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,17 +24,11 @@ import (
 
 // ── 辅助 ────────────────────────────────────────────────────────────────
 
-// mineRealNode 通过真实控制接口让子进程挖 count 个区块（按需出块，非挖矿循环）。
-func mineRealNode(t *testing.T, n *realNode, count int) {
-	t.Helper()
-	resp, err := authedClient(n.rpc).Mine(count)
-	if err != nil {
-		t.Fatalf("按需出块失败: %v\n节点输出:\n%s", err, n.output.String())
-	}
-	if resp.Mined != count {
-		t.Fatalf("出块数 = %d, want %d", resp.Mined, count)
-	}
-}
+// 注：原 mineRealNode（经 POST /mine 按需出块让子进程挖固定块数）已删除。
+// 按需出块整体下线后，「精确挖 N 块」只能由 `-mine -maxblocks N` 表达：
+// runMiner 挖满 N 块即转入全节点模式停手，数量精确；
+// 而「启动持续挖矿后轮询再停」因停止异步，可能多出 1 块，不适用于
+// 需要精确高度的场景（见 runOffline）。
 
 // waitRealHeight 等待子进程链高达到 want（用于「离线准备历史」这类同步前断言）。
 func waitRealHeight(t *testing.T, n *realNode, want int, timeout time.Duration) {
@@ -112,7 +107,13 @@ func extendChainOffline(t *testing.T, history []byte, extra int) []byte {
 	return runOffline(t, history, extra)
 }
 
-// runOffline 启动一个一次性节点（可带初始历史），按需出块后优雅停止并返回 blocks.dat。
+// runOffline 启动一个一次性节点（可带初始历史），精确挖出 mine 个区块后
+// 优雅停止并返回 blocks.dat。
+//
+// 出块方式：`-mine -maxblocks mine`。原实现走按需出块（POST /mine），
+// 该端点已整体下线；改用 maxblocks 而非「启动持续挖矿后轮询再停」，
+// 是因为后者停止是异步的、可能多出 1 块，而本函数产出的历史被
+// 调用方按固定高度索引（blocksA[L-1] 等），数量必须精确。
 func runOffline(t *testing.T, history []byte, mine int) []byte {
 	t.Helper()
 	dir := t.TempDir()
@@ -125,10 +126,9 @@ func runOffline(t *testing.T, history []byte, mine int) []byte {
 	if history != nil {
 		want = initialHeightFromLegacy(t, history) + mine
 	}
-	n := startRealNode(t, dir)
+	n := startRealNode(t, dir, "-mine", "-maxblocks", strconv.Itoa(mine))
 	waitRealHeight(t, n, want-mine, 30*time.Second) // 先确认历史已加载（无历史时为 0）
-	mineRealNode(t, n, mine)
-	waitRealHeight(t, n, want, 60*time.Second)
+	waitRealHeight(t, n, want, 60*time.Second)      // 挖满 maxblocks 后高度精确落在 want
 	if code, out := n.stopViaCLI(); code != 0 {
 		t.Fatalf("停止离线节点失败: code=%d 输出=%s\n节点输出:\n%s", code, out, n.output.String())
 	}

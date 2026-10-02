@@ -43,7 +43,6 @@ const usageText = `p2pchain 节点与钱包工具
   balance       查询地址余额（默认查询节点钱包自身地址）
   utxos         列出地址的未花费输出（UTXO）
   send          用节点钱包向指定地址转账
-  mine          按需立即挖出区块（开发/测试用，对标 bitcoind 的 generatetoaddress）
   stop          请求运行中的节点优雅停止（释放数据目录锁后退出）
   init          显式初始化新数据目录并创建 canonical Genesis
   wallet        查看/创建本地加密钱包（离线；wallet encrypt 做 v1 明文迁移）
@@ -71,9 +70,6 @@ send 选项:
   -amount <整数>               转账金额（必填，最小单位）
   -fee    <整数>               手续费（默认 0）
 
-mine 选项:
-  -count  <整数>               立即挖出的区块数量（默认 1）
-
 离线命令选项:
   -datadir <目录>              数据目录（默认 ~/.p2pchain）
   -limit   <整数>              （printchain）只打印最高 N 个区块，0 表示全部
@@ -93,7 +89,7 @@ mine 选项:
   node status
   node balance
   node send -to 1AbC... -amount 10 -fee 1
-  node mine -count 11        # 立即出块，使首笔 coinbase 成熟
+  node -mine -maxblocks 101 -datadir ./data-a   # 持续挖矿至 101 块，使首笔 coinbase 成熟
   node stop                  # 优雅停止节点（等价于终端里按 Ctrl+C）
   node printchain -limit 5 -tx
   node verify -datadir ./data-a        # 只读校验本地链（退出码 0=通过 / 1=不通过）
@@ -111,7 +107,6 @@ var cliCommands = map[string]cmdFunc{
 	"balance":    cmdBalance,
 	"utxos":      cmdUTXOs,
 	"send":       cmdSend,
-	"mine":       cmdMine,
 	"stop":       cmdStop,
 	"init":       cmdInit,
 	"wallet":     cmdWallet,
@@ -257,7 +252,8 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	// 仅在异常状态（停滞/失败）时补充原因：这正是开发者区分
 	// 「政策终态（补贴耗尽，不是故障）」与「结构性错误（需要修复）」所需的最小信息。
 	// 正常状态下不额外输出，保持既有输出格式不变。
-	if st.MiningState == string(MiningStalled) || st.MiningState == string(MiningFailed) {
+	if st.MiningState == string(MiningStalled) || st.MiningState == string(MiningFailed) ||
+		st.MiningState == string(MiningWaitingSync) {
 		fmt.Fprintf(stdout, "挖矿原因: %s\n", st.MiningReason)
 	}
 	return 0
@@ -277,6 +273,8 @@ func miningStateText(st control.StatusInfo) string {
 		return "运行中"
 	case string(MiningStarting):
 		return "启动中"
+	case string(MiningWaitingSync):
+		return "等待同步（本地落后于网络，暂停自动挖矿）"
 	case string(MiningStalled):
 		return "已停滞（不存在合法候选区块，未执行 PoW）"
 	case string(MiningFailed):
@@ -394,31 +392,9 @@ func cmdSend(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func cmdMine(args []string, stdout, stderr io.Writer) int {
-	fs := newFlagSet("mine", stderr)
-	rpc := fs.String("rpc", control.DefaultAddr, "节点控制接口地址")
-	count := fs.Int("count", 1, "立即挖出的区块数量")
-	tokenFile := fs.String("token-file", "secrets/control-token", "mutation token 文件（0600；相对工作目录）")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *count <= 0 {
-		return fail(stderr, "-count 必须大于 0，实际 %d", *count)
-	}
-	tok, err := control.LoadTokenFile(*tokenFile)
-	if err != nil {
-		return fail(stderr, "%v", err)
-	}
-
-	client := control.NewClient(*rpc)
-	client.SetToken(tok)
-	resp, err := client.Mine(*count)
-	if err != nil {
-		return fail(stderr, "%v\n（提示：请先用 `node` 启动节点，且不要在 -mine 持续挖矿模式下调用）", err)
-	}
-	fmt.Fprintf(stdout, "已挖出 %d 个区块，当前高度 %d\n", resp.Mined, resp.Height)
-	return 0
-}
+// 注：`node mine` 子命令（按需出块 CLI 入口）已随 POST /mine 端点整体下线。
+// 需要让节点出块的场景改用持续挖矿：`node -mine -maxblocks <N>`（启动即挖、挖满退出），
+// 或对运行中的节点 `POST /mine/start` + 轮询 + `POST /mine/stop`。
 
 // stopWaitTimeout 发出停止请求后，等待节点真正退出的最长时限。
 // 覆盖「挖矿节点需要放弃当前候选区块后再退出」的正常耗时，

@@ -1,10 +1,14 @@
 package main
 
-// PHASE CONTROL-AUTH-1：CLI mutation 子命令（send/mine/stop）的 token 行为测试。
+// PHASE CONTROL-AUTH-1：CLI mutation 子命令（send/stop）的 token 行为测试。
 //
 // 覆盖矩阵：missing / unreadable / invalid / valid token-file。
 // 有效路径通过 httptest 挂载真实 control.Server（含 token 校验）做端到端验证，
 // 不使用生产节点、不接触生产环境。
+//
+// 变更说明：原矩阵以 `node mine` 子命令承载（cmdMine）。按需出块整体下线后
+// cmdMine 被删除，该矩阵改由 `node stop` 承载 —— 二者走完全相同的
+// control.LoadTokenFile 路径与失败语义，覆盖强度不变。
 
 import (
 	"bytes"
@@ -41,9 +45,6 @@ func (cliFakeNode) BlocksPage(int, int) (control.BlocksPageResult, error) {
 func (cliFakeNode) BlockJSONByHash([32]byte) (control.BlockJSON, error) {
 	return control.BlockJSON{}, nil
 }
-func (cliFakeNode) Mine(count int) (control.MineResponse, error) {
-	return control.MineResponse{Mined: count, Height: count}, nil
-}
 func (cliFakeNode) StartMining() (control.MineStartResponse, error) {
 	return control.MineStartResponse{Accepted: true, State: "STARTING"}, nil
 }
@@ -62,11 +63,13 @@ func newAuthedTestServer(t *testing.T) string {
 	return strings.TrimPrefix(srv.URL, "http://")
 }
 
-func TestCLIMineMissingTokenFile(t *testing.T) {
+// TestCLIStopTokenFileMissing 承接原 `node mine` 的「缺失 token 文件」用例：
+// 错误必须说明是 token 问题，且**绝不回显 token 内容**。
+func TestCLIStopTokenFileMissing(t *testing.T) {
 	rpc := newAuthedTestServer(t)
 	missing := filepath.Join(t.TempDir(), "no-such-token")
 	var out, errBuf bytes.Buffer
-	code := cmdMine([]string{"-rpc", rpc, "-count", "1", "-token-file", missing}, &out, &errBuf)
+	code := cmdStop([]string{"-rpc", rpc, "-token-file", missing}, &out, &errBuf)
 	if code == 0 {
 		t.Fatalf("缺失 token 文件应失败，实际 code=0，输出: %s%s", out.String(), errBuf.String())
 	}
@@ -79,20 +82,22 @@ func TestCLIMineMissingTokenFile(t *testing.T) {
 	}
 }
 
-func TestCLIMineInvalidTokenFile(t *testing.T) {
+// TestCLIStopTokenFileInvalid 承接原 `node mine` 的「无效 token 文件」用例。
+func TestCLIStopTokenFileInvalid(t *testing.T) {
 	rpc := newAuthedTestServer(t)
 	p := filepath.Join(t.TempDir(), "short-token")
 	if err := os.WriteFile(p, []byte("short\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var out, errBuf bytes.Buffer
-	code := cmdMine([]string{"-rpc", rpc, "-count", "1", "-token-file", p}, &out, &errBuf)
+	code := cmdStop([]string{"-rpc", rpc, "-token-file", p}, &out, &errBuf)
 	if code == 0 {
 		t.Fatalf("无效 token 文件应失败，实际 code=0")
 	}
 }
 
-func TestCLIMineUnreadableTokenFileUnix(t *testing.T) {
+// TestCLIStopTokenFileUnreadableUnix 承接原 `node mine` 的「不可读 token 文件」用例。
+func TestCLIStopTokenFileUnreadableUnix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 文件系统不表达 POSIX 读权限位，跳过")
 	}
@@ -102,26 +107,20 @@ func TestCLIMineUnreadableTokenFileUnix(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errBuf bytes.Buffer
-	code := cmdMine([]string{"-rpc", rpc, "-count", "1", "-token-file", p}, &out, &errBuf)
+	code := cmdStop([]string{"-rpc", rpc, "-token-file", p}, &out, &errBuf)
 	if code == 0 {
 		t.Fatalf("不可读 token 文件应失败，实际 code=0")
 	}
 }
 
-func TestCLIMineValidTokenFile(t *testing.T) {
-	rpc := newAuthedTestServer(t)
-	p := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(p, []byte(testToken+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+// TestCLIMineSubcommandRemoved 锁定「按需出块 CLI 入口已下线」这一契约：
+// `node mine` 必须不再被识别为子命令（runCLI 返回 ok=false），
+// 且不得退化成「启动节点」等其它语义。
+func TestCLIMineSubcommandRemoved(t *testing.T) {
 	var out, errBuf bytes.Buffer
-	code := cmdMine([]string{"-rpc", rpc, "-count", "2", "-token-file", p}, &out, &errBuf)
-	if code != 0 {
-		t.Fatalf("有效 token 应成功: code=%d out=%q err=%q", code, out.String(), errBuf.String())
-	}
-	// stdout/stderr 不得出现 token
-	if strings.Contains(out.String()+errBuf.String(), testToken) {
-		t.Fatalf("CLI 输出不得包含 token: %q", out.String()+errBuf.String())
+	code, ok := runCLI("mine", []string{"-count", "1"}, &out, &errBuf)
+	if ok {
+		t.Fatalf("`node mine` 应已下线（不应被识别为子命令），实际 ok=true code=%d", code)
 	}
 }
 
