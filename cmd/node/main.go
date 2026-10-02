@@ -142,6 +142,14 @@ func newNodeRuntime(cfg nodeConfig) (*nodeRuntime, error) {
 		svc.miners = 1
 	}
 
+	// §4-B1.5 D1：生产激活孤儿等待检查点生命周期。
+	// 必须在 P2P 监听/首个握手之前完成，保证 OnHandshake 触发前 restorePending 已加载就绪。
+	orphanCP := newOrphanCheckpoint(cfg.DataDir)
+	orphanCP.CleanupTmp() // 清除崩溃遗留的 .tmp（半写残留）
+	svc.orphanCP = orphanCP
+	svc.prepareOrphanRestore(orphanCP) // 启动加载：缺失文件/corrupt 均 fail-closed（仅填 restorePending）
+	log.Printf("[node] 孤儿等待检查点已启用: %s", orphanCP.Path())
+
 	genesis, err := chain.BlockByHeight(0)
 	if err != nil {
 		_ = store.Close()
@@ -269,6 +277,14 @@ func (rt *nodeRuntime) Close() {
 		if rt.svc != nil {
 			// 先停同步调度器，再停 P2P：避免关停路径上还在发起新的同步请求。
 			rt.svc.stopSyncScheduler()
+			// §4-B1.5 D2：关机边界落盘（best-effort，nil-safe）。
+			// 在 store 关闭前执行：干净关机时孤儿等待检查点随节点持久化；
+			// 崩溃（未走本路径）则丢失最近未落盘状态，符合 SPEC「失败只影响孤儿可用性」。
+			if rt.svc.orphanCP != nil {
+				if _, err := rt.svc.orphanCP.FlushIfDirty(0); err != nil {
+					log.Printf("[node] 警告：孤儿等待检查点关机落盘失败（仅影响孤儿可用性）: %v", err)
+				}
+			}
 		}
 		if rt.ctl != nil {
 			_ = rt.ctl.Stop()

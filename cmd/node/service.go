@@ -195,6 +195,14 @@ type nodeService struct {
 	// 并在 takeWaiting 释放时同步删除，使同一区块之后仍可再次入队。
 	parkedHashes map[[32]byte]struct{}
 	rounds       map[[32]byte]int // 按哈希请求 → 已回溯轮次（有界追溯）
+	// orphanCP 孤儿等待检查点（ORPHAN-DURABILITY-IMPLEMENTATION-1，纯持久化投影）。
+	// 仅被 deferOrphan（入队）/ takeWaiting（删除）两个挂钩访问；不参与任何共识判断。
+	// nil 表示未启用（单元测试/最小装配），此时持久化挂钩为 no-op。
+	orphanCP *orphanCheckpoint
+	// restorePending 是启动恢复的「待恢复父键集」（内存态，§4-B1）。
+	// 由 prepareOrphanRestore 从检查点加载而来；仅存父哈希，不存块指针、不重建 waiting。
+	// 由后续阶段（§4-B2，OnHandshake）消费以触发 requestBranch；本阶段只填充，不消费。
+	restorePending map[[32]byte]struct{}
 	// syncResume 记录「批量同步因缺父转入分支拉取」时的对端地址；
 	// 分支补齐后由 resumeSync 恢复下一批 GetBlocks，避免 syncing 永久卡死。
 	syncResume string
@@ -323,6 +331,11 @@ func (s *nodeService) OnHandshake(peerAddr string, payload p2p.HandshakePayload)
 		workAtLeast(payload.ChainWork, payload.ChainHeight, localWork, localHeight) {
 		s.requestBranch(peerAddr, tip)
 	}
+
+	// (3) §4-B2 启动恢复：消费 restorePending（待恢复父键集）。
+	//     复用既有 requestBranch 重新拉取缺失分支；幂等、可跨多次握手推进；
+	//     已知父即时 drain，未知父保留待下一握手重试。
+	s.consumeRestorePending(peerAddr)
 }
 
 // shouldSyncFrom 判断是否应向对端发起批量追赶。
@@ -717,6 +730,13 @@ func (s *nodeService) deferOrphan(peerAddr string, b *block.Block) {
 	s.parkedHashes[hash] = struct{}{}
 	s.mu.Unlock()
 
+	// ORPHAN-DURABILITY-IMPLEMENTATION-1：入队成功 → 记录持久投影（延迟落盘）。
+	// 锁纪律：在 s.mu.Unlock() 之后调用，orphanCheckpoint 内部自锁（独立锁），
+	// 不与 nodeService.mu 嵌套（SPEC §5.3 R3）。nil 检查保证最小装配/单测无副作用。
+	if s.orphanCP != nil {
+		s.orphanCP.MarkDirty(parent, hash)
+	}
+
 	// I0/§3+§7：登记成功 → 具备恢复资格；同时记录 waiting-add 观测点。
 	obs.Emit("RECOVERY_ELIGIBLE", "orphan", hashHex, "parent", hashHex32(parent),
 		"waiting_children", existing+1, "peer", peerAddr)
@@ -1006,8 +1026,95 @@ func (s *nodeService) takeWaiting(parentHash [32]byte) []*block.Block {
 		delete(s.parkedHashes, b.Header.Hash())
 	}
 	s.mu.Unlock()
+	// ORPHAN-DURABILITY-IMPLEMENTATION-1：父到达取走即删 → 删除持久投影（延迟落盘）。
+	// 锁纪律：同 deferOrphan，在 s.mu.Unlock() 之后调用。
+	if s.orphanCP != nil {
+		s.orphanCP.Remove(parentHash)
+	}
 	s.emitWaitingState("release")
 	return out
+}
+
+// prepareOrphanRestore 从检查点加载孤儿等待投影，构建待恢复父键集 restorePending（§4-B1）。
+//
+// 语义（对齐 STARTUP-RECOVERY-PLAN-1 §2）：
+//   - 只从 cp 加载「父哈希 → 子哈希」引用，**不**重建 s.waiting、**不**伪造块指针；
+//   - 对每个父键做去重（map 天然去重）；
+//   - 跳过「本节点已知」的父（HasBlockHash 覆盖 canonical + 已落盘 detached），
+//     因为父已知则其分支可经正常 sync 到达，无需恢复拉取；
+//   - fail-closed：cp 为 nil 或 Load 失败（损坏/版本不兼容/读错误）→ restorePending 置空，
+//     退化为 memory-only，**绝不 panic、绝不反向影响 canonical**。
+//
+// 本阶段只**填充** restorePending，不消费（消费属 §4-B2，OnHandshake 触发 requestBranch）。
+func (s *nodeService) prepareOrphanRestore(cp *orphanCheckpoint) {
+	s.restorePending = make(map[[32]byte]struct{})
+	if cp == nil {
+		return
+	}
+	entries, err := cp.Load()
+	if err != nil {
+		// fail-closed：检查点损坏/不兼容 → 空恢复，退化 memory-only（SPEC §3.2）。
+		log.Printf("[node] 孤儿等待检查点不可用（%v），跳过恢复（退化为内存态）", err)
+		return
+	}
+	for _, e := range entries {
+		if s.chain.HasBlockHash(e.parentHash) {
+			// §4-B1.5 D1：父已知（canonical 或 detached）→ 无需恢复拉取，且不在 waiting，
+			// 从持久投影剪枝，避免 checkpoint 累积陈旧条目（下次 flush 即剔除）。
+			cp.Remove(e.parentHash)
+			continue
+		}
+		s.restorePending[e.parentHash] = struct{}{} // map 去重
+	}
+}
+
+// consumeRestorePending 在每次握手末尾消费启动恢复集（§4-B2）。
+//
+// 设计契约（对齐 STARTUP-RECOVERY-PLAN-1 §2 与 §4-B2 READINESS AUDIT §2/§4.2）：
+//   - 仅消费 restorePending 中「本节点仍未知」的父哈希，复用既有 requestBranch
+//     （inflight / branchReqTTL / maxBranchRounds 去重限流）重新拉取缺失分支；
+//   - 父一旦已知（HasBlockHash）→ 立即从 restorePending 与 checkpoint 双删（drain）；
+//   - 父未知且已（尝试）请求 → 保留在 restorePending，等待下一轮握手/对端再尝试
+//     （隐式有界重试：inflight/TTL/rounds 压制成环）；
+//   - 绝不伪造块指针、绝不旁路孤儿准入、绝不腐蚀 s.waiting；
+//   - 仅 OnHandshake 调用，幂等、可跨多次握手推进。
+//
+// 锁纪律：restorePending 读写全程 s.mu 保护；chain.HasBlockHash 与 requestBranch
+// 在 s.mu 外调用（requestBranch 内部自锁 s.mu，不可嵌套）；orphanCP 内部自锁。
+func (s *nodeService) consumeRestorePending(peerAddr string) {
+	s.mu.Lock()
+	if len(s.restorePending) == 0 {
+		s.mu.Unlock()
+		return // 快速路径：无待恢复项（含 restorePending 未初始化的最小装配）
+	}
+	// 复制出键集后释放锁：避免在持有 s.mu 时执行网络 I/O，杜绝 s.mu → p2p.Node.mu 锁序嵌套。
+	pending := make([][32]byte, 0, len(s.restorePending))
+	for p := range s.restorePending {
+		pending = append(pending, p)
+	}
+	s.mu.Unlock()
+
+	triggered := 0
+	for _, p := range pending {
+		if s.chain.HasBlockHash(p) {
+			// 父已知（可能经正常 sync / 本次分支到达）→ drain：双删 restorePending + checkpoint。
+			s.mu.Lock()
+			delete(s.restorePending, p)
+			s.mu.Unlock()
+			if s.orphanCP != nil {
+				s.orphanCP.Remove(p) // 幂等；仅在父已知时执行，绝不误删仍存活的 waiting 条目
+			}
+			obs.Emit("ORPHAN_RESTORE_DRAINED", "parent", hashHex32(p), "peer", peerAddr)
+			continue
+		}
+		// 父仍未知 → 复用既有 by-hash 分支拉取（inflight/TTL/rounds 去重限流）。
+		// 不在此处判定终态：成功由「父变为已知」在下一握手 drain；失败保留待重试。
+		s.requestBranch(peerAddr, p)
+		triggered++
+	}
+	if triggered > 0 {
+		obs.Emit("ORPHAN_RESTORE_TRIGGERED", "count", uint64(triggered), "peer", peerAddr)
+	}
 }
 
 // clearInflight 清除一个哈希的在途请求标记（收到块或放弃后调用）。
@@ -1266,6 +1373,17 @@ func (s *nodeService) runSyncSweep(now time.Time) {
 
 	for _, r := range retries {
 		s.retrySync(r, now)
+	}
+
+	// §4-B1.5 D2：孤儿等待检查点周期落盘（best-effort，脏状态 + 节流）。
+	// 复用既有 sync 巡检节拍；仅在脏时写盘，且按 orphanCPFlushInterval 节流，
+	// 文件极小（≤ ~512KB），写放大可忽略。失败仅 warning，不退化、不反向影响 canonical。
+	if s.orphanCP != nil {
+		if wrote, err := s.orphanCP.FlushIfDirty(orphanCPFlushInterval); err != nil {
+			log.Printf("[node] 孤儿等待检查点周期落盘失败（仅影响孤儿可用性）: %v", err)
+		} else if wrote {
+			obs.Emit("ORPHAN_CP_FLUSH", "trigger", "periodic")
+		}
 	}
 }
 
