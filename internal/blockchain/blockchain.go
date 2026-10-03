@@ -358,7 +358,7 @@ func (bc *Blockchain) validateBlock(b *block.Block, skipPoW bool) (*utxo.UTXOSet
 		return nil, err
 	}
 	// 1.6 难度位共识域闸门（F-4 输入加固）：拒绝越界 bits，且**不构造任何目标值**。
-	// 合法区块 bits == 期望难度 ∈ [1, MaxDifficultyBits=32] ⊂ [1,256] ⇒ 接受集合不变。
+	// 合法区块 bits == 期望难度 ∈ [1, MaxDifficultyBits=40] ⊂ [1,256] ⇒ 接受集合不变。
 	if !pow.IsBitsInConsensusDomain(b.Header.Bits) {
 		return nil, fmt.Errorf("%w: 区块难度位 %d 超出共识域（拒绝，未构造目标值；F-4 输入加固）",
 			ErrUnexpectedBits, b.Header.Bits)

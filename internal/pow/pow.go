@@ -43,13 +43,18 @@ const (
 	//
 	// 现经 PHASE DIFFICULTY-CONSENSUS-DESIGN-1 + PRE-IMPLEMENTATION-GATE-1 审计，
 	// 在**固定激活高度硬分叉**（见下方 ActivationHeight）之后解除钉死：难度可按 AdjustBits
-	// 公式在 [1, MaxDifficultyBits] 内真实浮动，上限抬至 32（单块枚举 2^32 次哈希 ≈ 数千秒，
-	// 给难度足够的上行空间，又不至于在一两个周期内失控）。
+	// 公式在 [1, MaxDifficultyBits] 内真实浮动（V2 时代上限 32；V3 经
+	// PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 抬至 40，见下方 MaxDifficultyBits 常量）。
 	//
 	// 硬分叉语义：height < ActivationHeight 仍走「旧规则」（难度钉死 MaxTargetBits=16、
 	// 版本 < NewBlockVersion）；height >= ActivationHeight 才启用本浮动规则。
 	// 因此本常量只影响 post-activation 的链，存量（pre-activation）链行为不变。
-	MaxDifficultyBits = 32
+	//
+	// PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1：上限由 32 → 40（冻结规格
+	// docs/PHASE-P2PCHAIN-V3-CONSENSUS-SPEC-FINAL-1.md）。这是 V3（300s 目标）的
+	// difficulty ceiling：40 提供 1024× 算力头寸（覆盖到 2^40/300 ≈ 3.66 GH/s）。
+	// v2（60s 目标）历史上限 32 的行为由 ruleset 边界保证不变（见 AdjustBits 注释）。
+	MaxDifficultyBits = 40
 )
 
 // ---- 难度共识硬分叉激活参数（PHASE DIFFICULTY-CONSENSUS-IMPLEMENTATION-1） ----
@@ -95,24 +100,36 @@ const (
 
 	// NewRulesetInitialBits 是 ruleset v3 的**初始难度位**（独立参数，MNC-OD-15 §4 拆分）。
 	//
-	// 冻结值 = 27。它与 MaxTargetBits=16 **不是同一个参数**：
+	// 冻结值 = 30（PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 按冻结规格修订；旧 60s 目标
+	// 下的历史值 27 已作废）。它与 MaxTargetBits=16 **不是同一个参数**：
 	//   - MaxTargetBits=16 继续承担 genesis 难度 / v1·v2 AdjustBits 起点 / difficulty floor 三重角色（零改动）；
-	//   - NewRulesetInitialBits=27 只在 h == NewRulesetActivationHeight 处**一次性注入**
-	//     （见 ComputeExpectedBitsAt），用于把 v2（Ceil）漂移造成的 overshoot（~28，OD-08）
-	//     在切换瞬间校正回 Nearest 稳态（OD-10 实证 27 为稳态收敛点）。
+	//   - NewRulesetInitialBits=30 只在 h == NewRulesetActivationHeight 处**一次性注入**
+	//     （见 ComputeExpectedBitsAt）。30 是 V3（300s 目标）的精确平衡点：
+	//     expected block time = 2^30 / hashrate，平衡算力 = 2^30/300 ≈ 3.579 MH/s。
 	//
-	// 关键：**绝不允许把 MaxTargetBits 改成 27**，也**绝不允许**让 27 外溢到 genesis
+	// 关键：**绝不允许把 MaxTargetBits 改成 30**，也**绝不允许**让 30 外溢到 genesis
 	// （genesis 恒 16，由 ComputeExpectedBitsAt 的 height==0 分支保证）。
-	NewRulesetInitialBits uint32 = 27
+	NewRulesetInitialBits uint32 = 30
 
 	// NewRulesetBlockVersion 是 ruleset v3 区块**必须**使用的版本号。
 	//
-	// 冻结值 = 3（常量名源自 OD-15 §191）。版本三态：v1(<2000) / v2([2000,3000)) / v3(>=3000)。
+	// 冻结值 = 4（PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 按冻结规格修订；旧 60s 目标
+	// 下的历史值 3 已作废）。版本三态：v1(<2000) / v2([2000,3000)) / v3(>=3000)。
 	// 旧节点（v2 二进制）对 v3 区块做**双重拒绝**：
-	//   1. VersionForHeight 返回 2 ≠ 3 → ErrInvalidVersion；
+	//   1. VersionForHeight 返回 2 ≠ 4 → ErrInvalidVersion；
 	//   2. 即使版本校验被绕过，旧节点用 Ceil 算出的 expected bits ≠ 新块 Nearest bits → ErrUnexpectedBits。
-	NewRulesetBlockVersion uint32 = 3
+	NewRulesetBlockVersion uint32 = 4
 )
+
+// NewRulesetTargetBlockTimeSeconds 是 ruleset v3 的**目标出块间隔**（秒）。
+//
+// 冻结值 = 300（PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1，见冻结规格
+// docs/PHASE-P2PCHAIN-V3-CONSENSUS-SPEC-FINAL-1.md）。
+//
+// 这是 V3 专用的目标时间，**不改动** TargetBlockTimeSeconds=60（v1/v2 目标时间）：
+// 二者由 ruleset 边界（NewRulesetActivationHeight=3000）严格分离。AdjustBitsNearest
+// 在计算 expected timespan 时使用本常量，AdjustBits 继续使用 TargetBlockTimeSeconds。
+const NewRulesetTargetBlockTimeSeconds = 300
 
 // targetBitWidth 是难度目标的位宽：target = 2^(targetBitWidth-bits)。
 //
@@ -126,8 +143,8 @@ const targetBitWidth = 256
 //   - internal/blocktree：`bits == 0 || bits > 256 → ErrInvalidBits`
 //     （注释原文：「防止移位溢出 / 零工作量」）；
 //   - internal/storage：workOfBits 采用同一域判定（ErrInvalidBits）；
-//   - internal/pow：合法区块的 bits 必须等于期望难度（∈ [1, MaxDifficultyBits=32]），
-//     且 32 ≤ 256 ⇒ **一切合法区块都落在本域内**。
+//   - internal/pow：合法区块的 bits 必须等于期望难度（∈ [1, MaxDifficultyBits=40]），
+//     且 40 ≤ 256 ⇒ **一切合法区块都落在本域内**。
 //
 // 用途：作为区块校验中**先于目标构造与 PoW** 的廉价前置闸门，使对端可控的
 // bits 在进入任何大整数构造之前被拒绝（PHASE F-4-CONSENSUS-INPUT-HARDENING-REMEDIATION）。
@@ -321,10 +338,14 @@ func isCancelled(cancel <-chan struct{}) bool {
 //  2. newTarget = currentTarget × actualTimespan / expected（方向推导，无分支）；
 //  3. floor clamp：newTarget > MaxTarget() 时报告 floorHit（难度低于下限）。
 //
+// targetBlockTimeSeconds 是**期望单块出块间隔**：v1/v2 传 TargetBlockTimeSeconds(60)，
+// v3 传 NewRulesetTargetBlockTimeSeconds(300)。这使 V2/V3 的目标时间由 ruleset 边界
+// 严格分离（PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 §4：V3 的 300s 不得覆盖 V2 的 60s）。
+//
 // 取整（Ceil / Nearest）与 ceiling clamp 由两个入口函数分别完成，避免重复 clamp 逻辑。
 // 返回值：floorHit=true 时 newTarget 为 nil（调用方须直接返回 MaxTargetBits）。
-func adjustTargetCore(currentBits uint32, actualTimespanSeconds int64) (newTarget *big.Int, floorHit bool) {
-	expected := int64(TargetBlockTimeSeconds * DifficultyAdjustmentInterval)
+func adjustTargetCore(currentBits uint32, actualTimespanSeconds int64, targetBlockTimeSeconds int64) (newTarget *big.Int, floorHit bool) {
+	expected := targetBlockTimeSeconds * int64(DifficultyAdjustmentInterval)
 
 	// 限制调整幅度在 [expected/4, expected*4] 之间，防止极端值造成难度失控
 	minTimespan := expected / 4
@@ -373,7 +394,7 @@ func ceilBitsFromTarget(newTarget *big.Int) uint32 {
 // （t ≤ M → b0）。
 //
 // 无溢出/无下溢：floor clamp 在调用前已执行 ⇒ newTarget ≤ 2^240 ⇒ b0 ≥ 16 ⇒ 指数 513-2·b0 ≥ 481 > 0；
-// 共识域内 newTarget ≥ 2^222（currentBits ≤ 32 且 timespan ≥ expected/4）⇒ b0 ≤ 34，指数恒安全。
+// 共识域内 newTarget ≥ 2^216（currentBits ≤ MaxDifficultyBits=40 且 timespan ≥ expected/4）⇒ b0 ≤ 40，指数恒安全。
 // 故 2^(513-2·b0) 用 big.Int.Lsh 精确构造，t² 亦为精确大整数，比较无浮点误差。
 func nearestBitsFromTarget(newTarget *big.Int) uint32 {
 	if newTarget.Sign() <= 0 {
@@ -403,6 +424,7 @@ func nearestBitsFromTarget(newTarget *big.Int) uint32 {
 //
 // **本函数是 ruleset v1/v2 的 Ceil 取整入口**（OD-15-C §6 O-4：保留 Ceil 入口向后兼容，
 // 现有 pow_test.go 的 Ceil 断言逐字节不变）。ruleset v3 使用 AdjustBitsNearest。
+// 本入口使用 TargetBlockTimeSeconds(60) 作为目标时间（v1/v2 语义）。
 //
 // 输出随后经过两层**有意的**钳制（见 MaxDifficultyBits 的说明）：
 //   - 难度下限：target 不得超过 T(MaxTargetBits)，即 bits 不得小于 MaxTargetBits；
@@ -414,7 +436,7 @@ func nearestBitsFromTarget(newTarget *big.Int) uint32 {
 // 钳制只压缩「链上可达的动态范围」，不改变推导本身。该语义由
 // TestAdjustBitsDirection / TestDifficultyAdjustmentBounds 与本包的链级测试共同锁定。
 func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
-	newTarget, floorHit := adjustTargetCore(currentBits, actualTimespanSeconds)
+	newTarget, floorHit := adjustTargetCore(currentBits, actualTimespanSeconds, TargetBlockTimeSeconds)
 	if floorHit {
 		return MaxTargetBits
 	}
@@ -422,7 +444,8 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 	if newBits < 1 {
 		newBits = 1
 	}
-	// 难度上限钳制：post-activation 时本链 MaxDifficultyBits=32，难度可在 [1,32] 内浮动。
+	// 难度上限钳制：post-activation 时本链 MaxDifficultyBits 是 difficulty ceiling，
+	// v2 语义下难度在 [1, MaxDifficultyBits] 内浮动。
 	if newBits > MaxDifficultyBits {
 		newBits = MaxDifficultyBits
 	}
@@ -431,14 +454,15 @@ func AdjustBits(currentBits uint32, actualTimespanSeconds int64) uint32 {
 
 // AdjustBitsNearest 是 ruleset v3（FROZEN CONSENSUS，h >= NewRulesetActivationHeight）的
 // **Nearest** 取整入口：与 AdjustBits 共享同一 core（幅度 clamp + newTarget + floor clamp），
-// 仅取整步骤不同（Nearest 作用于 b_cont，见 nearestBitsFromTarget）。
+// 但使用 V3 目标时间 NewRulesetTargetBlockTimeSeconds(300)，取整步骤也不同
+// （Nearest 作用于 b_cont，见 nearestBitsFromTarget）。
 //
 // 动机（OD-08/OD-10）：Ceil 对小幅扰动系统性 +1（overshoot），Nearest 抑制该偏差。
 // 预期行为差异（非冲突）：newTarget ∈ (2^239.5, 2^240.5) 时 Ceil 给 17、Nearest 给 16。
 //
 // 执行顺序与 AdjustBits 一致（冻结）：① floor clamp → ② Nearest → ③ ceiling clamp。
 func AdjustBitsNearest(currentBits uint32, actualTimespanSeconds int64) uint32 {
-	newTarget, floorHit := adjustTargetCore(currentBits, actualTimespanSeconds)
+	newTarget, floorHit := adjustTargetCore(currentBits, actualTimespanSeconds, NewRulesetTargetBlockTimeSeconds)
 	if floorHit {
 		return MaxTargetBits
 	}
@@ -479,7 +503,7 @@ func WorkOfBits(bits uint32) *big.Int {
 	w := big.NewInt(1)
 	if bits >= 256 {
 		// bits>=256 ⇒ target>=2^0=1 ⇒ 任何哈希都满足；赋予极大值代表「零难度」，
-		// 但本链 MaxDifficultyBits=32，正常路径不会到达；此处仅防御除零/越界。
+		// 但本链 MaxDifficultyBits=40，正常路径不会到达；此处仅防御除零/越界。
 		w.Lsh(w, 255)
 		return w
 	}
@@ -507,14 +531,15 @@ func IsNewRulesetActive(height int) bool {
 	return height >= NewRulesetActivationHeight && height > 0
 }
 
-// VersionForHeight 返回给定高度区块**必须**使用的版本号（三态，OD-15 §7 冻结）。
+// VersionForHeight 返回给定高度区块**必须**使用的版本号（三态，OD-15 §7 冻结，
+// 版本号经 PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 修订为 v3=4）。
 //
 //	height <  activationHeight              → LegacyBlockVersion    (v1)
 //	activationHeight <= height < 3000       → NewBlockVersion       (v2)
-//	height >= 3000（且已激活）               → NewRulesetBlockVersion (v3)
+//	height >= 3000（且已激活）               → NewRulesetBlockVersion (v3=4)
 //
 // 版本互斥构成结构性硬分叉（DESIGN-1 已证软分叉不可行）：旧节点（v2 二进制）对 v3 区块
-// 返回 2 ≠ 3 → ErrInvalidVersion 确定性拒绝。
+// 返回 2 ≠ 4 → ErrInvalidVersion 确定性拒绝。
 func VersionForHeight(height, activationHeight int) uint32 {
 	if IsActivationActive(height, activationHeight) {
 		if IsNewRulesetActive(height) {
@@ -528,16 +553,17 @@ func VersionForHeight(height, activationHeight int) uint32 {
 // ComputeExpectedBitsAt 按共识规则独立计算「高度 height 的区块应当使用的难度位」，
 // 完全基于 view 提供的候选链自身祖先（绝不依赖外部活动链尾 / canonical tip）。
 //
-// 规则（三态，冻结于 DESIGN-1 / GATE-1 / MNC-OD-14 / MNC-OD-15-D）：
-//   - height == 0：创世，固定 MaxTargetBits(16)。（**genesis 恒 16，注入 27 绝不外溢**）
+// 规则（三态，冻结于 DESIGN-1 / GATE-1 / MNC-OD-14 / MNC-OD-15-D，参数经
+// PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 按冻结规格修订为 300s/30/40/4）：
+//   - height == 0：创世，固定 MaxTargetBits(16)。（**genesis 恒 16，注入 30 绝不外溢**）
 //   - 0 < height < ActivationHeight（ruleset v1，LEGACY）：难度沿用父块 bits
 //     （有效链上恒为 MaxTargetBits=16，由创世归纳保证），即旧链「难度不浮动」语义的精确等价。
-//   - ActivationHeight <= height < 3000（ruleset v2，Ceil 浮动）：
-//     非周期边界沿用父块 bits；周期边界 AdjustBits（**Ceil**）钳制在 [16,32]。
-//   - height == 3000（ruleset v3 起点）：**无条件**返回 NewRulesetInitialBits(27)
+//   - ActivationHeight <= height < 3000（ruleset v2，Ceil 浮动，60s 目标）：
+//     非周期边界沿用父块 bits；周期边界 AdjustBits（**Ceil**）钳制在 [16,MaxDifficultyBits]。
+//   - height == 3000（ruleset v3 起点）：**无条件**返回 NewRulesetInitialBits(30)
 //     （一次性注入，先于周期边界判断）——把 v2 的 Ceil overshoot 校正回 Nearest 稳态。
-//   - height > 3000（ruleset v3，Nearest 浮动）：
-//     非周期边界沿用父块 bits；周期边界 AdjustBitsNearest（**Nearest**）钳制在 [16,32]。
+//   - height > 3000（ruleset v3，Nearest 浮动，300s 目标）：
+//     非周期边界沿用父块 bits；周期边界 AdjustBitsNearest（**Nearest**）钳制在 [16,MaxDifficultyBits]。
 //
 // 高度锚定：ruleset 完全由 height 唯一确定，与 canonical tip 无关 ⇒ 历史块回放 / 跨分支
 // 校验 / 新节点同步逐高度使用正确 ruleset，**无 retroactive reinterpretation**。
@@ -626,7 +652,7 @@ func MedianTimePastAt(view ChainView, h, activationHeight int) int64 {
 // ChainCumulativeWork 返回从创世（高度 0）累积到 height（含）的总**期望工作量**，
 // 即 fork-choice 的链工作量度量：CumulativeWork = Σ_{i=0}^{height} WorkOfBits(bits_i)。
 //
-// 使用 *big.Int 累加，跨数千块不会溢出（单个 2^bits 在 bits=32 时为 2^32 ≈ 4e9，
+// 使用 *big.Int 累加，跨数千块不会溢出（单个 2^bits 在 bits=40 时为 2^40 ≈ 1.1e12，
 // 仍落 uint64，但 Σ 必然越界，故全程 big.Int）。本函数是 reorg 时「最大累积工作量」
 // 判据的权威数据源（与 BlockTree.CumulativeWork 同源，DESIGN-1 §FC-004 闭环）。
 func ChainCumulativeWork(view ChainView, height int) (*big.Int, error) {

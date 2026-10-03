@@ -27,7 +27,8 @@ func TestF4BitsToTargetDomain(t *testing.T) {
 		{1, 256},
 		{15, 242},
 		{16, 241}, // MaxTargetBits
-		{32, 225}, // MaxDifficultyBits
+		{32, 225}, // 历史 MaxDifficultyBits（V2 时代）
+		{40, 217}, // MaxDifficultyBits（V3，冻结规格）
 		{255, 2},
 		{256, 1}, // 域上界：target = 1（既有测试以 bits=256 断言 ErrInvalidPoW）
 		// ---- 域外：F-4 加固后必须返回零目标（BitLen 0），绝不做巨量位移 ----

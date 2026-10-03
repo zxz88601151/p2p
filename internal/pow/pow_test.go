@@ -47,7 +47,7 @@ func TestValidateRejectsInvalidPoW(t *testing.T) {
 	}
 }
 
-// TestDifficultyAdjustmentBounds 验证难度调整结果始终落在 [1, MaxDifficultyBits]（现 32，浮动上限）。
+// TestDifficultyAdjustmentBounds 验证难度调整结果始终落在 [1, MaxDifficultyBits]（现 40，浮动上限）。
 func TestDifficultyAdjustmentBounds(t *testing.T) {
 	short := pow.AdjustBits(pow.MaxTargetBits, 1)    // 远快于期望 -> 更难
 	long := pow.AdjustBits(pow.MaxTargetBits, 1<<40) // 远慢于期望 -> 更易
@@ -134,7 +134,7 @@ func TestTargetBitsConservativeRounding(t *testing.T) {
 	}
 }
 
-// TestAdjustBitsDirection 验证调整方向不变量（新阶段：难度真实浮动，上限 MaxDifficultyBits=32）：
+// TestAdjustBitsDirection 验证调整方向不变量（新阶段：难度真实浮动，上限 MaxDifficultyBits=40）：
 //
 //	AdjustBits 输出方向由 newTarget ∝ actualTimespan 决定（先算 target 后取整），
 //	下限 clamp（>= MaxTargetBits 的 target）与上限 clamp（<= MaxDifficultyBits 的 bits）只压缩可达范围，
@@ -167,10 +167,10 @@ func TestAdjustBitsDirection(t *testing.T) {
 
 // TestMaxDifficultyBitsIsTheDesignedCeiling 固化新阶段的设计：
 //
-//	难度在 [1, MaxDifficultyBits] 内**真实浮动**，上限抬至 32（仍 >= 初始最低难度 MaxTargetBits）。
+//	难度在 [1, MaxDifficultyBits] 内**真实浮动**，上限抬至 40（仍 >= 初始最低难度 MaxTargetBits）。
 //
 // 该上限是 AdjustBits 的天花板钳制（见 pow.go 常量注释）：解锁了旧链「钉死 16」的有意限制，
-// 但仍保证链上可达 bits 不超过 32（避免单周期难度爆炸）。本用例守护「上限语义不被破坏」：
+// 但仍保证链上可达 bits 不超过 40（避免单周期难度爆炸）。本用例守护「上限语义不被破坏」：
 // AdjustBits 产出永不超过 MaxDifficultyBits，且 MaxDifficultyBits 必须 >= 初始最低难度。
 func TestMaxDifficultyBitsIsTheDesignedCeiling(t *testing.T) {
 	if pow.MaxDifficultyBits < pow.MaxTargetBits {
@@ -192,7 +192,7 @@ func TestMaxDifficultyBitsIsTheDesignedCeiling(t *testing.T) {
 // × 各类时间跨度（含 0、负数、极小、均衡、极大、极端），断言输出恒落在 [1, MaxDifficultyBits]。
 //
 // 这是「难度浮动但不超过设计上限」的**代数级**保证：不论算力多强、时间跨度多极端，
-// 链上可达 bits 都不会越过天花板 MaxDifficultyBits（现 32），也不会低于 1。
+// 链上可达 bits 都不会越过天花板 MaxDifficultyBits（现 40），也不会低于 1。
 func TestAdjustBitsNeverExceedsDesignedCeiling(t *testing.T) {
 	expected := int64(pow.TargetBlockTimeSeconds) * int64(pow.DifficultyAdjustmentInterval)
 	spans := []int64{

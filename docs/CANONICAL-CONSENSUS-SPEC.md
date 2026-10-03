@@ -121,7 +121,7 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 | 哈希函数 | 双 SHA-256 | `block.go:68` |
 | 目标值 | `target = 2^(256 - bits)` | `pow.BitsToTarget`（`internal/pow/pow.go:147`） |
 | 有效性判据 | `hash < target`（**严格小于**） | `pow.Validate`（`pow.go:162`） |
-| bits 域 | 合法区块 bits ∈ `[1, 32]`（⊂ 共识域 `[1,256]`） | §5 |
+| bits 域 | 合法区块 bits ∈ `[1, 40]`（⊂ 共识域 `[1,256]`） | §5 |
 | bits 越界防护 | `bits > 256` ⇒ 返回**零目标**（PoW 恒失败），**不构造大整数**；bits ≤ 256 时输出与加固前逐字节一致 | `pow.go:147-154`（F-4 输入加固） |
 | 挖矿入口 | `Mine`（串行·确定性）／`MineParallel`（并行·非确定）／`MineCancelable`（可取消） | `pow.go:183/209/220` |
 | 并行切分 | worker `w` 只试 `nonce ∈ {w, w+workers, …}`（等差类，覆盖完整、不重不漏） | `pow.go:242-269` |
@@ -140,7 +140,7 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 | 概念 | 当前状态 | 证据 |
 |---|---|---|
 | **ALGORITHM**（算法是否存在） | **存在**。两套取整入口均已实现：`AdjustBits`（Ceil）、`AdjustBitsNearest`（Nearest），共享 `adjustTargetCore` | `pow.go:416 / 440 / 326` |
-| **PARAMETER**（参数值） | `MaxTargetBits=16`、`MaxDifficultyBits=32`、`DifficultyAdjustmentInterval=20`、`TargetBlockTimeSeconds=60` | `pow.go:29/52/37/33` |
+| **PARAMETER**（参数值） | `MaxTargetBits=16`、`MaxDifficultyBits=40`、`DifficultyAdjustmentInterval=20`、`TargetBlockTimeSeconds=60`（V1/V2）／`NewRulesetTargetBlockTimeSeconds=300`（V3） | `pow.go:29/52/37/33/132` |
 | **ACTIVATION**（是否已激活） | **v2 未激活**（生产链高度 2026-10-02 实测约 137 < 2000）；**v3 未激活**（< 3000）。二者均为 **FROZEN + IMPLEMENTED + ACTIVATED=NO** | `pow.go:81-82` |
 | **CURRENT CHAIN STATE**（当前链上实测） | 生产链高度约 **137**（2026-10-02 实测）< 2000 ⇒ **当前链上难度恒为 16** | 生产现态 |
 
@@ -153,13 +153,14 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 | 常量 | 值 | 角色 |
 |---|---|---|
 | `MaxTargetBits` | **16** | 创世难度 / v1·v2 的 AdjustBits 起点 / **难度下限（floor）** —— 三重角色 |
-| `MaxDifficultyBits` | **32** | 难度浮动**上限**（ceiling） |
-| `TargetBlockTimeSeconds` | 60 | 期望出块间隔 |
+| `MaxDifficultyBits` | **40** | 难度浮动**上限**（ceiling） |
+| `TargetBlockTimeSeconds` | 60 | 期望出块间隔（V1/V2） |
+| `NewRulesetTargetBlockTimeSeconds` | **300** | 期望出块间隔（V3） |
 | `DifficultyAdjustmentInterval` | 20 | 调整周期（块数） |
 | `ActivationHeight` | **2000** | v2 边界（难度浮动 + MTP 时间戳 + 版本 v2） |
-| `NewRulesetActivationHeight` | **3000** | v3 边界（Nearest 取整 + 版本 v3） |
-| `NewRulesetInitialBits` | **27** | v3 起点一次性注入值 |
-| `LegacyBlockVersion` / `NewBlockVersion` / `NewRulesetBlockVersion` | 1 / 2 / 3 | 区块版本三态 |
+| `NewRulesetActivationHeight` | **3000** | v3 边界（Nearest 取整 + 版本 v4） |
+| `NewRulesetInitialBits` | **30** | v3 起点一次性注入值 |
+| `LegacyBlockVersion` / `NewBlockVersion` / `NewRulesetBlockVersion` | 1 / 2 / 4 | 区块版本三态 |
 
 ### 4.3 三态规则（`pow.ComputeExpectedBitsAt`，`pow.go:546`）
 
@@ -167,11 +168,11 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 
 | 高度区间 | 规则集 | bits 计算 | 版本 |
 |---|---|---|---|
-| `h == 0` | genesis | **固定 `MaxTargetBits`(16)**（注入 27 **绝不外溢**） | v1 |
+| `h == 0` | genesis | **固定 `MaxTargetBits`(16)**（注入 30 **绝不外溢**） | v1 |
 | `0 < h < 2000` | **v1（LEGACY）** | **钉死父块 bits**（父块恒 16 ⇒ 恒 16） | v1 (=1) |
-| `2000 ≤ h < 3000` | **v2** | 非周期边界沿用父块 bits；周期边界 `AdjustBits`（**Ceil**），钳制 `[16, 32]` | v2 (=2) |
-| `h == 3000` | **v3 起点** | **无条件返回 27**（一次性注入，先于周期边界判断） | v3 (=3) |
-| `h > 3000` | **v3** | 非周期边界沿用父块 bits；周期边界 `AdjustBitsNearest`（**Nearest**），钳制 `[16, 32]` | v3 (=3) |
+| `2000 ≤ h < 3000` | **v2** | 非周期边界沿用父块 bits；周期边界 `AdjustBits`（**Ceil**，target 60s），钳制 `[16, 40]` | v2 (=2) |
+| `h == 3000` | **v3 起点** | **无条件返回 30**（一次性注入，先于周期边界判断） | v3 (=4) |
+| `h > 3000` | **v3** | 非周期边界沿用父块 bits；周期边界 `AdjustBitsNearest`（**Nearest**，target 300s），钳制 `[16, 40]` | v3 (=4) |
 
 **周期边界**：`h % DifficultyAdjustmentInterval == 0`。
 
@@ -179,7 +180,7 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 
 `adjustTargetCore`（`pow.go:326`）执行与取整无关的三步：
 
-1. **幅度 clamp**：`actualTimespan ← clamp(actualTimespan, expected/4, expected*4)`，其中 `expected = 60 × 20 = 1200` 秒；
+1. **幅度 clamp**：`actualTimespan ← clamp(actualTimespan, expected/4, expected*4)`，其中 `expected = targetBlockTime × 20`（V2：`60 × 20 = 1200` 秒；V3：`300 × 20 = 6000` 秒，由参数化 `adjustTargetCore` 传入）；
 2. **方向推导**：`newTarget = currentTarget × actualTimespan / expected`（无分支，整数运算）；
 3. **floor clamp**：`newTarget > MaxTarget()` ⇒ `floorHit`，直接返回 `MaxTargetBits`。
 
@@ -188,7 +189,7 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 - **Ceil（v2）**：`b0 = 257 - BitLen(newTarget)`（= `ceil(256 - log2(newTarget))`，偏难取整）；
 - **Nearest（v3）**：`b0 = 257 - BitLen(t)`；判据 `t² ≤ 2^(513-2·b0)` ⇒ 取 `b0`，否则取 `b0-1`。**全程整数运算、无浮点**；相邻 bits 的几何中点是无理数而 `t` 恒为整数 ⇒ **tie 不可达**（完备性取 round-half-up）。
 
-最后 **ceiling clamp**：`newBits > MaxDifficultyBits ⇒ 32`。
+最后 **ceiling clamp**：`newBits > MaxDifficultyBits ⇒ 40`。
 
 **执行顺序（冻结，不可换位）**：① floor clamp（target）→ ② 取整（bits）→ ③ ceiling clamp（bits）。
 
@@ -200,7 +201,7 @@ block bytes = SerializeHeader() ‖ u32LE(len(Txs)) ‖ encodeTx(tx)*
 ### 4.6 难度参数禁令（写死，不得违反）
 
 1. **禁止**把 `MaxTargetBits` 改成 27（它承担创世难度 / v1·v2 起点 / floor 三重角色）；
-2. **禁止**让 `NewRulesetInitialBits=27` 外溢到 genesis（genesis 恒 16，由 `ComputeExpectedBitsAt` 的 `h==0` 分支保证）；
+2. **禁止**让 `NewRulesetInitialBits=30` 外溢到 genesis（genesis 恒 16，由 `ComputeExpectedBitsAt` 的 `h==0` 分支保证）；
 3. 改动任何难度参数 ⇒ **共识真值变更** ⇒ 旧节点拒绝新块 ⇒ 属独立授权阶段。
 
 ---
@@ -431,14 +432,14 @@ CompareWork(candidate) == 0 → tie-break：tip hash 大端较大者胜（bytes.
 | 初始奖励 | 5 | `utxo/apply.go:22` |
 | 减半间隔 | 5,250,000 | `utxo/apply.go:27` |
 | 难度下限 / 创世难度 | bits 16 | `pow.go:29` |
-| 难度上限 | bits 32 | `pow.go:52` |
-| 目标出块间隔 | 60 s | `pow.go:33` |
+| 难度上限 | bits 40 | `pow.go:52` |
+| 目标出块间隔 | 60 s（V1/V2）／300 s（V3） | `pow.go:33/132` |
 | 调整周期 | 20 块 | `pow.go:37` |
 | 幅度 clamp | [1/4×, 4×] | `pow.go:330-337` |
 | v2 激活高度 | 2000 | `pow.go:67` |
 | v3 激活高度 | 3000 | `pow.go:94` |
-| v3 注入 bits | 27 | `pow.go:106` |
-| 区块版本 | 1 / 2 / 3 | `pow.go:70/73/114` |
+| v3 注入 bits | 30 | `pow.go:106` |
+| 区块版本 | 1 / 2 / 4 | `pow.go:70/73/114` |
 | MTP 窗口 | `[max(0,h-10), h]` | `pow.go:606` |
 | post-activation 时间戳上界 | MTP(h-1) + 7200 | `consensus.go` |
 | 地址版本字节 | 0x35 | `wallet/base58.go:16` |
@@ -451,6 +452,6 @@ CompareWork(candidate) == 0 → tie-break：tip hash 大端较大者胜（bytes.
 | 旧声明 | 本文真值 | DRIFT |
 |---|---|---|
 | 奖励 `50 >> (h/210)` | `5 >> (h/5,250,000)` | **RESOLVED**（R-01，已于 GOVERNANCE CLOSURE-1 修正 README.md:165） |
-| `MaxDifficultyBits = 16`、难度固定不浮动 | `MaxTargetBits=16` / `MaxDifficultyBits=32` + 三态规则集，未激活 | **CONFLICT**（R-02/R-03） |
+| `MaxDifficultyBits = 16`、难度固定不浮动 | `MaxTargetBits=16` / `MaxDifficultyBits=40` + 三态规则集，未激活 | **CONFLICT**（R-02/R-03） |
 | 未实现 reorg / 单链追加式 | blocktree + ShouldReorg + executeReorg + orphan 保留 | **CONFLICT**（R-04） |
 | `internal/blockchain/blockchain.go:9` 包注释"reorg 仍为单链追加实现" | 同文件 `executeReorg` 已实现 | **RESOLVED**（R-20，已于 GOVERNANCE CLOSURE-1 修正 blockchain.go 包注释） |

@@ -97,10 +97,11 @@ func (bc *Blockchain) medianTimePastView(view pow.ChainView, parentHeight int) i
 	return pow.MedianTimePastAt(view, parentHeight, bc.activationHeight)
 }
 
-// validateVersion 强制硬分叉版本规则（三态，OD-15 §7 冻结）：
+// validateVersion 强制硬分叉版本规则（三态，OD-15 §7 冻结，版本号经
+// PHASE-P2PCHAIN-V3-CONSENSUS-IMPLEMENTATION-1 修订）：
 //   - height < activationHeight：LegacyBlockVersion(1)
 //   - activationHeight <= height < 3000：NewBlockVersion(2)
-//   - height >= 3000：NewRulesetBlockVersion(3)
+//   - height >= 3000：NewRulesetBlockVersion(4)
 func (bc *Blockchain) validateVersion(b *block.Block, height int) error {
 	want := pow.VersionForHeight(height, bc.activationHeight)
 	if b.Header.Version != want {

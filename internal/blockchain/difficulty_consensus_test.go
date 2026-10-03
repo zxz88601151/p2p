@@ -167,10 +167,10 @@ func TestMTPSecurityNonDecreasing(t *testing.T) {
 
 // ---- 测试 3：retarget 单周期 |Δbits| ≤ 2 穷举证明（GATE-1 §retarget math） ----
 
-// 注意：链上**可达**的难度区间为 [MaxTargetBits(16), MaxDifficultyBits(32)]——
+// 注意：链上**可达**的难度区间为 [MaxTargetBits(16), MaxDifficultyBits(40)]——
 // 起点即为 16，且下限钳制（target 不得越过 MaxTarget=2^240）把任何更「易」的结果拉回 16，
 // 因此 cur < 16 在真实链上不可达（AdjustBits 对其返回 16 属地板钳制，非周期漂移）。
-// 本测试仅对可达区间 [16,32] 穷举证明单周期 |Δbits| ≤ 2（端点处由天花板/地板钳制兜底）。
+// 本测试仅对可达区间 [16,40] 穷举证明单周期 |Δbits| ≤ 2（端点处由天花板/地板钳制兜底）。
 func TestRetargetAbsDeltaAtMostTwo(t *testing.T) {
 	expected := int64(pow.TargetBlockTimeSeconds) * int64(pow.DifficultyAdjustmentInterval)
 	for cur := uint32(pow.MaxTargetBits); cur <= uint32(pow.MaxDifficultyBits); cur++ {
@@ -208,7 +208,7 @@ func TestRetargetBoundaryTrigger(t *testing.T) {
 	}
 }
 
-// ---- 测试 5：难度天花板钳制在 MaxDifficultyBits（现 32） ----
+// ---- 测试 5：难度天花板钳制在 MaxDifficultyBits（现 40） ----
 
 func TestDifficultyCeilingCappedAt32(t *testing.T) {
 	if got := pow.AdjustBits(pow.MaxDifficultyBits, 1); got != pow.MaxDifficultyBits {

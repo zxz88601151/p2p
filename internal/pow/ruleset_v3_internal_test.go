@@ -107,7 +107,7 @@ func TestNearestBelowAtAboveHalf(t *testing.T) {
 		{"just above T(17) → below half → b0", new(big.Int).Add(BitsToTarget(17), big.NewInt(1)), 17},
 		{"just below T(16) → above half → b0-1", new(big.Int).Sub(BitsToTarget(16), big.NewInt(1)), 16},
 		{"exact T(16)", BitsToTarget(16), 16},
-		{"exact T(27)", BitsToTarget(27), 27},
+		{"exact T(30)", BitsToTarget(30), 30},
 		{"exact T(32)", BitsToTarget(32), 32},
 		{"6*2^237 (frac>0.5 → b0-1)", new(big.Int).Mul(big.NewInt(6), new(big.Int).Lsh(big.NewInt(1), 237)), 16},
 	}
@@ -151,8 +151,9 @@ func TestNearestMatchesIndependentOracles(t *testing.T) {
 }
 
 // TestAdjustBitsNearestClampsAndEquilibrium 覆盖 floor / ceiling / 均衡态。
+// V3 目标时间 = NewRulesetTargetBlockTimeSeconds(300)，expected = 300*20 = 6000。
 func TestAdjustBitsNearestClampsAndEquilibrium(t *testing.T) {
-	expected := int64(TargetBlockTimeSeconds * DifficultyAdjustmentInterval) // 1200
+	expected := int64(NewRulesetTargetBlockTimeSeconds * DifficultyAdjustmentInterval) // 6000
 
 	// floor：极长跨度 → target 越过 MaxTarget → 钳回 MaxTargetBits。
 	if got := AdjustBitsNearest(MaxTargetBits, expected*4); got != MaxTargetBits {
@@ -182,15 +183,22 @@ func TestAdjustBitsNearestClampsAndEquilibrium(t *testing.T) {
 	}
 }
 
-// TestNearestDiffersFromCeilAsDesigned 锁定「Nearest 抑制 Ceil overshoot」的预期差异：
-// span=960（= expected*4/5）⇒ newTarget = 0.8·2^240 ∈ (2^239.5, 2^240)：Ceil=17，Nearest=16。
+// TestNearestDiffersFromCeilAsDesigned 锁定「Nearest 抑制 Ceil overshoot」的预期差异，
+// 在**同一目标时间下**（用 V2 的 60s，expected=1200）验证：span=960（=expected*4/5）
+// ⇒ newTarget = 0.8·2^240 ∈ (2^239.5, 2^240)：Ceil=17，Nearest=16。
+//
+// 注意：本测试用 AdjustBitsNearest 时，其内部 expected=6000（300s），故不能直接用
+// span=960 与 AdjustBits 对比。改为直接测 nearestBitsFromTarget 与 ceilBitsFromTarget
+// 在同一 newTarget 上的差异（二者只差取整方式，与目标时间无关）。
 func TestNearestDiffersFromCeilAsDesigned(t *testing.T) {
-	expected := int64(TargetBlockTimeSeconds * DifficultyAdjustmentInterval)
-	span := expected * 4 / 5 // 960
-	if got := AdjustBits(MaxTargetBits, span); got != 17 {
-		t.Fatalf("AdjustBits(Ceil)(%d, %d) = %d, want 17", MaxTargetBits, span, got)
+	// newTarget = 0.8·2^240 = 2^240·4/5 ∈ (2^239.5, 2^240)，BitLen=241（因为 0.8·2^240 = 2^240·4/5
+	// 仍 > 2^239，最高位在 2^240 位 ⇒ BitLen=241）。
+	newTarget := new(big.Int).Div(new(big.Int).Mul(BitsToTarget(16), big.NewInt(4)), big.NewInt(5))
+	// 更精确：0.8·T(16) = T(16)*4/5。
+	if got := ceilBitsFromTarget(newTarget); got != 17 {
+		t.Fatalf("ceilBitsFromTarget(0.8·T(16)) = %d, want 17", got)
 	}
-	if got := AdjustBitsNearest(MaxTargetBits, span); got != 16 {
-		t.Fatalf("AdjustBitsNearest(%d, %d) = %d, want 16", MaxTargetBits, span, got)
+	if got := nearestBitsFromTarget(newTarget); got != 16 {
+		t.Fatalf("nearestBitsFromTarget(0.8·T(16)) = %d, want 16", got)
 	}
 }
