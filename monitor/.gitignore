@@ -1,0 +1,11 @@
+# P2PChain V3 transition monitor — evidence 运行时产物（不入库）
+
+# 运行时产生的采集证据与告警（真实生产只读采集，非 release artifact）
+evidence/snapshots/
+evidence/history/
+evidence/alerts/
+evidence/transition/
+
+# Python 编译缓存
+__pycache__/
+*.pyc
